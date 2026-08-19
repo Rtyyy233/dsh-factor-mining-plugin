@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../../../.tmp/factor-mining-python-tests"
+  },
+  "include": ["."],
+  "references": []
+}
