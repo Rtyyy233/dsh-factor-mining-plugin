@@ -41,6 +41,7 @@ from .discipline import (
 from .factor import audit as audit_mod
 from .factor.causality import check_causality
 from .factor.evaluate import (
+    _dsr_p_from_stats,
     evaluate,
     evaluate_batch,
     evaluate_composite,
@@ -165,6 +166,41 @@ class Bridge:
         except Exception:
             return None
 
+    def _landscape_fingerprint_status(self, landscape, env_id: str) -> str:
+        """null 地形指纹比对：'match' | 'mismatch' | 'legacy_no_field'。
+
+        指纹硬门（2026-08-19）的统一判据：地形写盘时绑定的 env_fingerprint
+        必须等于当前环境指纹（数据文件+口径+引擎版本三元组，纯复用
+        _env_full_fingerprint——trail_engine 条目一直在用）。旧版地形无
+        字段 → legacy_no_field，与 mismatch 同判无效（宁可保守：重跑一次
+        null 校准，几分钟，换永久绑定；否则换数据集的洞一直开着）。
+        """
+        if not isinstance(landscape, dict):
+            return "mismatch"
+        fp = landscape.get("env_fingerprint")
+        if fp is None:
+            return "legacy_no_field"
+        try:
+            cur = self._env_full_fingerprint(self._resolve_env_id(env_id))
+        except Exception:
+            cur = self._env_full_fingerprint(env_id)
+        return "match" if fp == cur else "mismatch"
+
+    def _landscape_pool_std(self, landscape, env_id: str) -> float | None:
+        """null 地形 → pool_std 估计（含指纹硬门）。无效地形 → None。
+
+        返回 None 时 evaluate 路径不注入 pool_std → N>1 的 deflated p 拒绝
+        给出（D7 链路自然引导重校准），而不是拿错基线给不可信数字。"""
+        if not isinstance(landscape, dict) or not landscape.get("ic_ir"):
+            return None
+        if self._landscape_fingerprint_status(landscape, env_id) != "match":
+            return None
+        q = landscape["ic_ir"]
+        p10, p90 = q.get("p10"), q.get("p90")
+        if p10 is None or p90 is None:
+            return None
+        return (p90 - p10) / 2.5631
+
     def _progress(self, label: str, done: int, total: int):
         if self._on_progress is not None:
             try:
@@ -203,25 +239,47 @@ class Bridge:
                              result: dict[str, Any], suspects: dict[str, Any] | None):
         """引擎层强制 trail（evaluate 自动记录硬事实，按 source_hash+stage 去重更新）。
         agent 的叙事层 trail（record_trail）与此分文件存储，trail_summary 合并。"""
+        self._append_engine_trail_batch(env_id, [(source_hash, stage, result, suspects)])
+
+    def _append_engine_trail_batch(self, env_id: str, items: list[tuple]):
+        """批量写 trail_engine（2026-08-19 A1）：evaluate_batch 的 M 个成员一次落盘。
+
+        单条版逐成员调用 = 每成员整文件重写（O(M²) IO）；批量版读一次、
+        过滤+追加 M 条、原子写一次。items: [(source_hash, stage, result, suspects)]。
+        sketch 处理（A2）：result 里的 ic_series_train 摘出存 entry（trail 级
+        N_eff 聚类用），不进 agent 可见 schema 的其余部分由调用方 pop。"""
         try:
             p = Path(self.state_root) / "trail_engine.json"
             entries = []
             if p.exists():
                 entries = json.loads(p.read_text(encoding="utf-8"))
-            entry = {
-                "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
-                "envId": env_id, "source_hash": source_hash, "stage": stage,
-                "fingerprint": self._env_full_fingerprint(env_id),
-                "engine_version": __version__,
-                "ic_ir": result.get("ic_ir_train", result.get("ic_ir")),
-                "ic_mean": result.get("ic_mean_train", result.get("ic_mean")),
-                "verdict": result.get("verdict"),
-                "red_flags": result.get("red_flags", []),
-                "suspects": suspects,
-            }
-            entries = [e for e in entries
-                       if not (e.get("source_hash") == source_hash and e.get("stage") == stage)]
-            entries.append(entry)
+            fp = self._env_full_fingerprint(env_id)
+            for source_hash, stage, result, suspects in items:
+                sketch = None
+                if isinstance(result, dict):
+                    s = result.get("ic_series_train")
+                    if isinstance(s, (list, tuple)) and len(s) > 0:
+                        # 截尾 256 点（均匀采样）：防御性上限，正常 train IC 序列
+                        # 远小于此；round 4 位足够聚类相关计算
+                        if len(s) > 256:
+                            idx = np.linspace(0, len(s) - 1, 256).astype(int)
+                            s = [s[i] for i in idx]
+                        sketch = [round(float(x), 4) for x in s]
+                entry = {
+                    "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                    "envId": env_id, "source_hash": source_hash, "stage": stage,
+                    "fingerprint": fp,
+                    "engine_version": __version__,
+                    "ic_ir": result.get("ic_ir_train", result.get("ic_ir")) if isinstance(result, dict) else None,
+                    "ic_mean": result.get("ic_mean_train", result.get("ic_mean")) if isinstance(result, dict) else None,
+                    "verdict": result.get("verdict") if isinstance(result, dict) else None,
+                    "red_flags": result.get("red_flags", []) if isinstance(result, dict) else [],
+                    "suspects": suspects,
+                    "ic_series_sketch": sketch,
+                }
+                entries = [e for e in entries
+                           if not (e.get("source_hash") == source_hash and e.get("stage") == stage)]
+                entries.append(entry)
             # 原子写（tmp + os.replace）：中途崩溃不留半截 JSON
             tmp = p.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -279,6 +337,9 @@ class Bridge:
             # 对表/入池失败不阻断评估主结果，但必须可见——静默吞错曾酿成真实事故
             result["_pool_error"] = f"{type(e).__name__}: {e}"[:200]
         self._append_engine_trail(env_id, source_hash, stage, result, suspects)
+        # A2：sketch 已由 _append_engine_trail 摘出存 trail；agent 可见
+        # schema 保持不变（ic_series_train 不外泄，registry 不膨胀）
+        result.pop("ic_series_train", None)
         return result
 
     # ---- config 文件即事实源 ----
@@ -792,38 +853,156 @@ class Bridge:
             self._causality_cache[self._causality_cache_key(source, env_id)] = result
         return result
 
-    def _trial_stats(self, source_hash: str | None) -> tuple[int, float | None]:
-        """多重检验的引擎侧硬统计（2026-08-18 生产审计修正）。
+    @staticmethod
+    def _n_eff_from_entries(entries: list[dict], source_hash: str | None) -> float:
+        """trail 级 N_eff（2026-08-19 A2）：簇聚类 + 簇内线性修正。
+
+        口径：探索过程中**所有计算过的因子**（trail_engine 全体——评估成功
+        即写，verdict=fail 也算；选择偏差发生在评估时刻，不是注册时刻）。
+
+        算法：
+        - 成员 = unique source_hash（dev/batch 双写同 hash 只计一次）+ 本因子
+          （未评估过则按单例追加）；每个成员带 ic_series_sketch（train IC 序列）
+        - 两两 |pearson ρ| >= 0.7 连边（与库内 curate_strong_subset 阈值一致，
+          不引 scipy）→ union-find 聚簇：同族参数变体归一簇
+        - N_eff = Σ_簇 [1 + (m_c-1)·(1-ρ̄_c)]：纯簇数对簇内宽度失明（50 个
+          高相关变体只算 1），纯计数对相关性失明（50 个变体算 50）；线性
+          修正各取所长——ρ̄_c→1 时簇退化为 1，ρ̄_c→0 时簇退化为 m_c
+        - 无 sketch 旧条目 / 长度不齐 / 零方差：按单例计（保守——N_eff 只高不低）
+
+        退化兼容：全体无 sketch（旧版 trail）→ 纯计数，等于旧口径
+        unique hash 数，行为不变。
+
+        生产审核修正（2026-08-19）：
+        - 畸形条目（None/非 dict/坏类型字段）直接跳过不崩（审核 R1）
+        - 相关矩阵按 sketch 长度分组向量化（np.corrcoef 整组一次）——
+          M=400 时逐对 Python 循环 >3s 且每次 evaluate 都要付；向量化后
+          毫秒级（审核 R3）
+        """
+        by_hash: dict[str, list | None] = {}
+        for e in entries:
+            if not isinstance(e, dict):
+                continue  # 生产审核 R1：畸形条目（null/字符串等）跳过
+            h = e.get("source_hash")
+            if not h or h in by_hash:
+                continue
+            s = e.get("ic_series_sketch")
+            by_hash[h] = s if isinstance(s, list) and len(s) >= 5 else None
+        if source_hash and source_hash not in by_hash:
+            by_hash[source_hash] = None  # 本因子未评估过：单例计（不重复计已评估的）
+
+        hashes = list(by_hash)
+        sketches = [by_hash[h] for h in hashes]
+        M = len(hashes)
+        if M <= 1:
+            return 1.0
+
+        parent = list(range(M))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        # 按长度分组向量化相关（R3）：同长度组内 np.corrcoef 一次算完；
+        # 跨长度 / 无 sketch 无法算相关 → 不连边（各归各的簇）
+        corr: dict[tuple[int, int], float] = {}
+        groups: dict[int, list[int]] = {}
+        for i, s in enumerate(sketches):
+            if s is not None:
+                groups.setdefault(len(s), []).append(i)
+        for idxs in groups.values():
+            if len(idxs) < 2:
+                continue
+            mat = np.asarray([sketches[i] for i in idxs], dtype=np.float64)
+            if mat.ndim != 2:
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                cm = np.corrcoef(mat)
+            cm = np.atleast_2d(cm)
+            for a in range(len(idxs)):
+                for b in range(a + 1, len(idxs)):
+                    c = cm[a, b]
+                    if np.isfinite(c):
+                        corr[(idxs[a], idxs[b])] = abs(float(c))
+        for (i, j), c in corr.items():
+            if c >= 0.7:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+        clusters: dict[int, list[int]] = {}
+        for i in range(M):
+            clusters.setdefault(find(i), []).append(i)
+
+        n_eff = 0.0
+        for members in clusters.values():
+            m = len(members)
+            if m == 1:
+                n_eff += 1.0
+                continue
+            rhos = [corr[(min(a, b), max(a, b))]
+                    for x, a in enumerate(members) for b in members[x + 1:]
+                    if (min(a, b), max(a, b)) in corr]
+            rho_bar = float(np.mean(rhos)) if rhos else 0.0
+            n_eff += 1.0 + (m - 1) * (1.0 - rho_bar)
+        return float(n_eff)
+
+    def _resolve_pool_std(self, env_id: str, trail_pool_std: float | None) -> float | None:
+        """pool_std 保守合并（2026-08-19 生产审核 ADV-11）。
+
+        攻击面：评估 10 个同族变体（IC_IR 几乎相同）→ trail IC_IR std≈0 →
+        sr0≈0（多重检验惩罚全灭），同时簇聚类又把 N_eff 压小——双重中和门控。
+        修复：trail 实测 std 与指纹门后的 null 地形估计取 **max**——池尺度
+        估计不得低于随机算子空间的宽度（宁可保守）。trail 覆盖面广于
+        随机地形时（正常探索），max 自然取 trail——「trail 优先」语义保留。
+        """
+        from .factor import random_gen
+        land_std = self._landscape_pool_std(
+            random_gen.read_null_landscape(self.state_root), env_id)
+        cands = [s for s in (trail_pool_std, land_std) if s is not None and s > 0]
+        return max(cands) if cands else None
+
+    def _trial_stats(self, source_hash: str | None) -> tuple[float, float | None]:
+        """多重检验的引擎侧硬统计（2026-08-18 生产审计修正；2026-08-19 A2 N_eff 口径）。
 
         旧实现用 mining_state.round+1 计数——但 agent 走 factor_record_trail
         （append_trail）从不调 record_round，round 恒 0 → n_trials 恒 1，
-        多重检验校正从未生效。真实计数在 trail_engine.json（evaluate 自动
-        记录的硬事实）：unique source_hash 数。
+        多重检验校正从未生效。真实计数在 trail_engine.json（evaluate/batch
+        自动记录的硬事实）。
 
-        返回 (n_trials, pool_std)：
-        - n_trials = |{trail_engine unique source_hash} ∪ {本因子 hash}|（本因子
-          未评估过则 +1，重复评估不重复计数）
-        - pool_std = 已试假设 IC_IR 分布的 std（≥10 个样本才用；否则 None——
-          evaluate 会拒绝给 N>1 的 deflated p 而不是给不可信数字）
+        返回 (n_eff, pool_std)：
+        - n_eff = 簇聚类口径的有效假设数（见 _n_eff_from_entries；A1 落地后
+          batch 成员与单因子同等入 trail，走 batch 通道不再漏计）
+        - pool_std = trail 实测 IC_IR std（≥10 样本；调用方经 _resolve_pool_std
+          与 null 地形保守合并）。trail 损坏 → 按空 trail 处理（N_eff 保守
+          放行）但 **stderr 可见**——静默 N 重置是不可审计的事故温床（审核 ADV-12）。
         """
         entries = []
         p = Path(self.state_root) / "trail_engine.json"
         if p.exists():
             try:
                 entries = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception as e:
                 entries = []
-        hashes = {e.get("source_hash") for e in entries if e.get("source_hash")}
-        if source_hash:
-            hashes.add(source_hash)
-        n_trials = max(1, len(hashes))
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[trail_engine] 读取失败（按空 trail 处理，N_eff 将低估）: "
+                        f"{type(e).__name__}: {e}\n")
+                except Exception:
+                    pass
+        n_eff = self._n_eff_from_entries(entries, source_hash)
         irs = [e.get("ic_ir") for e in entries
-               if isinstance(e.get("ic_ir"), (int, float))]
+               if isinstance(e, dict) and isinstance(e.get("ic_ir"), (int, float))]
         pool_std = None
         if len(irs) >= 10:
             import numpy as _np
             pool_std = float(_np.std(irs, ddof=1))
-        return n_trials, pool_std
+        return n_eff, pool_std
 
     def _factor_evaluate(self, params):
         env_id = params.get("envId", "primary")
@@ -854,15 +1033,8 @@ class Bridge:
         source_hash = source_fingerprint(source)
         if stage == "development":
             trials, pool_std = self._trial_stats(source_hash)
-            if pool_std is None:
-                # trail_engine 样本不足时退回 null 地形分位数估（p90-p10 ≈ 2.563σ）
-                from .factor import random_gen
-                landscape = random_gen.read_null_landscape(self.state_root)
-                if landscape and landscape.get("ic_ir"):
-                    q = landscape["ic_ir"]
-                    p10, p90 = q.get("p10"), q.get("p90")
-                    if p10 is not None and p90 is not None:
-                        pool_std = (p90 - p10) / 2.5631
+            # pool_std 保守合并（ADV-11）：trail 实测与指纹门后 null 地形取 max
+            pool_std = self._resolve_pool_std(env_id, pool_std)
         else:
             trials, pool_std = 1, None
         params = {**params, "n_trials": trials, "pool_std": pool_std,
@@ -883,20 +1055,38 @@ class Bridge:
     def _factor_evaluate_batch(self, params):
         env_id = params.get("envId", "primary")
         env = self._require_panel_env(env_id)
+        sources = params.get("sources") or {}
         if params.get("sources") is not None:
-            params = {**params, "sources": _as_dict(params["sources"], "sources")}
+            sources = _as_dict(params["sources"], "sources")
+            params = {**params, "sources": sources}
         # 批次内每个因子也要过因果（缓存命中时零成本）
-        for name, src in (params.get("sources") or {}).items():
+        for name, src in sources.items():
             self._enforce_causality(str(src), env, env_id)
-        params = {**params, "n_trials": max(len(params.get("sources") or {}), 1)}
+        params = {**params, "n_trials": max(len(sources), 1)}
         result = self._run_factor("factor.evaluate_batch", params.get("source", ""), params, env)
         # 批次结果逐因子附指纹/对表（轻量：只附 _meta 不重复对表）
         if isinstance(result, dict) and isinstance(result.get("factors"), dict):
             fp = self._env_full_fingerprint(env_id)
+            trail_items = []
+            for name, diag in result["factors"].items():
+                if not isinstance(diag, dict) or diag.get("error"):
+                    continue
+                diag["_meta"] = {"fingerprint": fp, "engine_version": __version__,
+                                 "receipt": self._make_receipt(diag)}
+                diag["_receipt"] = diag["_meta"]["receipt"]
+                # A1（2026-08-19 堵 batch 绕过）：批次成员与单因子 evaluate 同等
+                # 写入 trail_engine——N_eff 计数不因走 batch 通道而漏计。此前
+                # batch 成员不写 trail → N 恒不涨 → deflated p 按 N=1 给出，
+                # 拿 batch 诊断直接 submit 即绕过 D7 门控（实验证实）。
+                src = str(sources.get(name, ""))
+                if src:
+                    trail_items.append((source_fingerprint(src), "batch", diag, None))
+            if trail_items:
+                self._append_engine_trail_batch(env_id, trail_items)
+            # A2：sketch 已存 trail；agent 可见 schema 保持不变（不留 ic_series_train）
             for name, diag in result["factors"].items():
                 if isinstance(diag, dict):
-                    diag["_meta"] = {"fingerprint": fp, "engine_version": __version__,
-                                     "receipt": self._make_receipt(diag)}
+                    diag.pop("ic_series_train", None)
         return result
 
     def _factor_walk_forward(self, params):
@@ -951,10 +1141,17 @@ class Bridge:
         opset = random_gen.effective_operator_set(self.state_root)
 
         if mode == "null-calibration":
-            env = self._require_panel_env(params.get("envId", "primary"))
+            env_id = params.get("envId", "primary")
+            env = self._require_panel_env(env_id)
             seed = int(params.get("seed", 42))
+            # 指纹硬门（2026-08-19）：写盘时绑定环境三元组指纹，evaluate 读时校验
+            try:
+                fp_env = self._resolve_env_id(env_id)
+            except Exception:
+                fp_env = env_id
             return random_gen.run_null_calibration(
                 env, self.state_root, n=n, seed=seed, opset=opset,
+                env_fingerprint=self._env_full_fingerprint(fp_env),
                 on_progress=lambda done, total: self._progress(
                     "null-calibration", done, total))
 
@@ -1026,13 +1223,27 @@ class Bridge:
         return random_gen.effective_operator_set(self.state_root)
 
     def _factor_null_landscape(self, params):
-        """查询已持久化的 null 地形（无则 None + 提示先生成）。"""
+        """查询已持久化的 null 地形（无则 None + 提示先生成）。
+
+        指纹硬门（2026-08-19）：fingerprint_match 报告地形与当前环境的绑定
+        状态。mismatch / legacy_no_field 的地形已判无效——pool_std 回退不再
+        使用它（deflated p 会拒绝给出），需重跑 null-calibration 覆盖写。
+        """
         from .factor import random_gen
         landscape = random_gen.read_null_landscape(self.state_root)
         if landscape is None:
             return {"calibrated": False,
                     "hint": "尚未校准。调 factor.random_generate(mode='null-calibration', n=50) 生成经验 null 分布"}
-        return {"calibrated": True, **landscape}
+        env_id = params.get("envId", "primary")
+        status = self._landscape_fingerprint_status(landscape, env_id)
+        out = {"calibrated": True, "fingerprint_match": status, **landscape}
+        if status != "match":
+            reason = ("旧版地形无指纹字段" if status == "legacy_no_field"
+                      else "地形指纹与当前环境不匹配（数据/口径/引擎已变更）")
+            out["hint"] = (f"{reason}——该地形已判无效，pool_std 估计不再使用。"
+                           "重跑 factor.random_generate(mode='null-calibration') "
+                           "覆盖写新地形（几分钟）。")
+        return out
 
     # ---- library / paths / registry / state ----
     def _library_query(self, params):
@@ -1278,6 +1489,42 @@ class Bridge:
                 f"名字「{name}」已被另一个因子占用（源码不同）。"
                 f"若这是新变体请换一个名字重新 submit；若只是想修正「{name}」的描述，"
                 "用 factor_registry_update——改源码换汤不换药的重复登记会被拒绝。")
+        # A3（2026-08-19 堵冻结诊断绕过）：提交时刻以**当前 trail 的 N_eff**
+        # 重算 deflated p——诊断生成后到提交之间的新试验（含 batch 通道、
+        # 其他因子的 evaluate）全部计入。此前 submit 直接用诊断里冻结的
+        # deflated_train.p：batch 成员不写 trail → N 恒 1 → 拿 batch 诊断
+        # 直接 submit 即绕过 D7 门控（实验证实：dev 路径 p=0.674 拒、
+        # batch 路径 p=0.0003 过，同一因子同一数据）。
+        # 充分统计量 (sr_hat/skew/kurt/n_obs) 来自诊断本身——纯算术重算，
+        # 不 require env / 不编译 / 不重评估（submit 去耦合设计不破）。
+        #
+        # 生产审核硬化（2026-08-19，ADV-2/3/4）：
+        # - deflated_train 必须是非空 dict（删字段提交 = 拒）——evaluate 产出的
+        #   诊断永远带它，缺失即删改痕迹
+        # - 带 p 但缺 sr_hat 充分统计量 = 拒（伪造 p 无法重算验证）
+        # - 无 source/_meta 的诊断也重算（N_eff 按当前 trail，本因子不计入）：
+        #   伪造诊断不得因缺 hash 而逃脱 trail 口径
+        dp = diagnosis.get("deflated_train")
+        if not isinstance(dp, dict) or not dp:
+            raise BridgeError(-32602,
+                              "diagnosis 缺 deflated_train——诊断必须原样来自 "
+                              "factor.evaluate，不得删改后提交")
+        if dp.get("sr_hat") is None and dp.get("p") is not None:
+            raise BridgeError(-32602,
+                              "deflated_train 带 p 但缺 sr_hat 充分统计量——无法做"
+                              "提交时刻重算（防伪造 p）。诊断必须原样提交")
+        if dp.get("sr_hat") is not None:
+            src_hash_dp = source_hash or (diagnosis.get("_meta") or {}).get("source_hash")
+            n_eff, trail_std = self._trial_stats(
+                str(src_hash_dp) if src_hash_dp else None)
+            pool_std = self._resolve_pool_std(
+                params.get("envId", "primary"), trail_std)
+            p_new = _dsr_p_from_stats(dp.get("sr_hat"), dp.get("skew"), dp.get("kurt"),
+                                      dp.get("n_obs"), n_eff, pool_std)
+            diagnosis["deflated_train"] = {**dp, "p": p_new,
+                                           "n_trials": float(n_eff), "n_eff": float(n_eff),
+                                           "pool_std": pool_std,
+                                           "recomputed_at_submit": True}
         accepted, reason = _passes_acceptance(diagnosis)
         if diagnosis.get("red_flags"):
             accepted = False
@@ -1400,6 +1647,11 @@ class Bridge:
             lines.append(f"- Null-landscape p95 (random baseline): {p95}"
                          + ("  → **above p95**" if isinstance(latest.get("ic_ir"), (int, float))
                             and isinstance(p95, (int, float)) and latest["ic_ir"] > p95 else ""))
+            fp_status = self._landscape_fingerprint_status(
+                landscape, params.get("envId", "primary"))
+            if fp_status != "match":
+                lines.append(f"- ⚠ Null-landscape fingerprint: {fp_status}"
+                             "（地形已判无效，重跑 null-calibration 覆盖写）")
         if pool_stats:
             lines += ["", "## Memory pool",
                       f"- active: {pool_stats['active']}/{pool_stats['capacity']['active']}",

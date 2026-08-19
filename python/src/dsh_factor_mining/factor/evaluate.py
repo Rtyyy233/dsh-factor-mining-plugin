@@ -367,12 +367,53 @@ def _norm_ppf(q: float) -> float:
     return NormalDist().inv_cdf(q)
 
 
-def _deflated_sharpe_p(ic_series, n_trials: int = 1, pool_std: float | None = None) -> dict:
+def _dsr_sr0(n_trials: float, pool_std: float | None) -> tuple[float | None, str]:
+    """B-LP 期望最大 null SR：SR0 = √V·[(1-γ)Z(1-1/N)+γZ(1-1/(N·e))]。
+
+    公式单一来源（2026-08-19 A3）：_deflated_sharpe_p 与 submit 时重算共用。
+    返回 (sr0, scale_note)；N>1 且缺 pool_std → (None, 拒绝原因)。"""
+    if n_trials <= 1:
+        return 0.0, "N=1 无多重检验惩罚"
+    if pool_std is not None and pool_std > 0:
+        gamma = 0.5772156649015329  # Euler-Mascheroni
+        z1 = _norm_ppf(1.0 - 1.0 / n_trials)
+        z2 = _norm_ppf(1.0 - 1.0 / (n_trials * math.e))
+        sr0 = pool_std * ((1.0 - gamma) * z1 + gamma * z2)
+        return sr0, f"pool_std={pool_std:.4f}（N_eff={n_trials:.2f} 次有效试验的池分布缩放）"
+    return None, ("N>1 但缺 pool_std（池内 SR 分布尺度）——deflated p 不可信，拒绝给出。"
+                  "需 trail_engine 实测 IC_IR 分布或 null 地形校准。")
+
+
+def _dsr_p_from_stats(sr, g3, g4, n, n_trials: float, pool_std: float | None) -> float | None:
+    """充分统计量 → DSR p（A3：registry_submit 提交时重算）。
+
+    单因子 deflated p 完全由 (sr_hat, skew, kurt, n_obs) 与 (n_trials, pool_std)
+    决定——这四项充分统计量都在 deflated_train 里带着，submit 重算无需 IC
+    序列/env/重评估（纯算术，去耦合设计不破）。样本不足或缺 pool_std → None。"""
+    try:
+        sr, g3, g4, n = float(sr), float(g3), float(g4), int(n)
+    except (TypeError, ValueError):
+        return None
+    if n < 5:
+        return None
+    denom = 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr * sr
+    denom = max(denom, 1e-8)
+    sr0, _ = _dsr_sr0(n_trials, pool_std)
+    if sr0 is None:
+        return None
+    t_stat = (abs(sr) - sr0) * (n - 1) ** 0.5 / denom ** 0.5
+    return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
+
+
+def _deflated_sharpe_p(ic_series, n_trials: float = 1, pool_std: float | None = None) -> dict:
     """Deflated Sharpe Ratio 单因子 p（Bailey & López de Prado 2014，H.L.Z 精神）。
 
     对 IC 序列做偏度/峰度校正的 t 统计，并按「已试过 n_trials 个假设」的
     期望最大 null Sharpe 折减——同一因子试得越多，门槛自动越高。
     n_trials=1 时无多重检验惩罚（退化为校正 t 检验）。
+
+    n_trials 接受浮点（2026-08-19 A2）：bridge 传入簇聚类口径的 N_eff
+    （Σ_簇 [1+(m_c-1)(1-ρ̄_c)]），不再是整数计数。
 
     2026-08-18 生产审计修正（尺度 bug）：sr0 = √(2 ln N) 与 IC_IR（per-obs
     Sharpe）不同尺度——直接比较导致 N>1 时惩罚全灭（p=1.0）、N=1 时零惩罚。
@@ -383,31 +424,20 @@ def _deflated_sharpe_p(ic_series, n_trials: int = 1, pool_std: float | None = No
     ic = ic_series.dropna()
     n = len(ic)
     if n < 5 or ic.std(ddof=1) == 0:
-        return {"p": None, "n_trials": int(n_trials), "n_obs": n, "note": "样本不足"}
+        return {"p": None, "n_trials": float(n_trials), "n_obs": n, "note": "样本不足"}
     sr = float(ic.mean() / ic.std(ddof=1))
     g3 = float(((ic - ic.mean()) ** 3).mean() / max(ic.std(ddof=1) ** 3, 1e-18))
     g4 = float(((ic - ic.mean()) ** 4).mean() / max(ic.std(ddof=1) ** 4, 1e-18))
-    denom = 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr * sr
-    denom = max(denom, 1e-8)
-    # 期望最大 null SR（N 次独立试验，B-LP 2014 式 4）：SR0 = √V · [(1-γ)Z(1-1/N)+γZ(1-1/(Ne))]
+    # 期望最大 null SR（N 次独立试验，B-LP 2014 式 4）：公式见 _dsr_sr0
     # N=1 无惩罚；N>1 必须有 pool_std（池内 SR 分布尺度）——无尺度则拒绝给 p。
-    if n_trials <= 1:
-        sr0 = 0.0
-        scale_note = "N=1 无多重检验惩罚"
-    elif pool_std is not None and pool_std > 0:
-        gamma = 0.5772156649015329  # Euler-Mascheroni
-        z1 = _norm_ppf(1.0 - 1.0 / n_trials)
-        z2 = _norm_ppf(1.0 - 1.0 / (n_trials * math.e))
-        sr0 = pool_std * ((1.0 - gamma) * z1 + gamma * z2)
-        scale_note = f"pool_std={pool_std:.4f}（N={n_trials} 次试验的池分布缩放）"
-    else:
-        return {"p": None, "n_trials": int(n_trials), "n_obs": n, "sr_hat": sr,
+    sr0, scale_note = _dsr_sr0(n_trials, pool_std)
+    if sr0 is None:
+        return {"p": None, "n_trials": float(n_trials), "n_obs": n, "sr_hat": sr,
                 "skew": g3, "kurt": g4, "sr0": None,
-                "note": "N>1 但缺 pool_std（池内 SR 分布尺度）——deflated p 不可信，拒绝给出。"
-                        "需 trail_engine 实测 IC_IR 分布或 null 地形校准。"}
-    t_stat = (abs(sr) - sr0) * (n - 1) ** 0.5 / denom ** 0.5
-    p = 0.5 * math.erfc(t_stat / math.sqrt(2.0))  # 单尾 P(Z>t)：DSR 关心的是超出门槛的方向
-    return {"p": float(p), "n_trials": int(n_trials), "n_obs": n,
+                "note": scale_note}
+    p = _dsr_p_from_stats(sr, g3, g4, n, n_trials, pool_std)
+    return {"p": p, "n_trials": float(n_trials), "n_eff": float(n_trials),
+            "n_obs": n,
             "sr_hat": sr, "sr0": sr0, "skew": g3, "kurt": g4,
             "pool_std": float(pool_std) if pool_std else None,
             "scale_note": scale_note}
@@ -498,6 +528,10 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: int = 1,
     from ..discipline import red_flags_and_verdict
     result["deflated_train"] = _deflated_sharpe_p(train_sig, n_trials=n_trials,
                                                   pool_std=pool_std)
+    # A2（2026-08-19 trail 级 N_eff）：train 区 IC 序列挂到结果——bridge 摘出
+    # 存 trail_engine 的 ic_series_sketch（同族参数变体的 IC 序列高度相关，
+    # 是簇聚类的好代理），不进 agent 可见返回 / registry。
+    result["ic_series_train"] = [round(float(x), 4) for x in train_sig.tolist()]
     result["train_sensitivity"] = _train_sensitivity(ic_sig, env)
     gv = red_flags_and_verdict(result, region="train")
     result["verdict"] = gv["verdict"]
