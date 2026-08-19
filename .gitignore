@@ -1,0 +1,22 @@
+# Never commit user data, factor libraries, mining state, or machine config.
+*.parquet
+*.pkl
+*.csv
+*.npz
+.factor-mining/
+factor-mining.config.json
+factor-mining.config.yml
+test_lock.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Node / DeepSeek Harness prototype
+node_modules/
+lib/
+tsconfig.tsbuildinfo

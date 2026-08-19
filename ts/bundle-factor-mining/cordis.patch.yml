@@ -1,0 +1,17 @@
+# Optional factor-mining bundle.  It inserts two rows over the current
+# profile and stays patchable: a later layer may override any whole row.
+#
+# No data path, factor library, or mining result is shipped here.  Users
+# configure their own data through the factor_data_probe /
+# factor_config_write tools or by patching stateRoot/dataConfigPath.
+
+- insert:
+    - id: factor-mining
+      name: '@deepseek-ai/dsh-factor-mining-python'
+      config:
+        pythonExecutable: python
+
+    - id: tool-factor-mining
+      name: '@deepseek-ai/dsh-tool-factor-mining'
+      config:
+        enableArxivSearch: true

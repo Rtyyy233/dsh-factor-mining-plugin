@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "stateRoot": "",
+  "environments": {
+    "primary": {
+      "label": "主挖掘池",
+      "kind": "panel",
+      "source": {
+        "type": "parquet",
+        "path": "REPLACE_WITH_YOUR_DATA_FILE",
+        "options": {}
+      },
+      "layout": "long",
+      "mapping": {
+        "symbol": "symbol",
+        "date": "eob",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume",
+        "amount": "amount",
+        "listed": null,
+        "extra": {}
+      },
+      "dateFormat": "auto",
+      "frequency": "auto",
+      "constraints": {
+        "minSymbols": 20,
+        "minDates": 200,
+        "requireFiniteOhlcv": true,
+        "allowZeroVolume": true
+      }
+    }
+  },
+  "library": {
+    "type": "none",
+    "path": null
+  }
+}

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dsh-factor-mining"
+version = "0.1.0"
+description = "Portable factor-mining engine and JSON-RPC bridge for the DeepSeek Harness factor-mining plugin."
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["../LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "dsh-factor-mining contributors" }]
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "pyarrow>=14.0",
+]
+
+[project.scripts]
+dsh-factor-mining-bridge = "dsh_factor_mining.bridge:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dsh_factor_mining"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

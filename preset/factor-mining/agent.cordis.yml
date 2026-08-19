@@ -1,0 +1,18 @@
+# Factor-mining agent preset.  It composes the Python provider and the
+# model-facing mining tools for a dedicated session.  No data, factor
+# library, or mining state ships here: users provide those through
+# factor_data_probe / factor_config_write.
+
+- id: factor-mining
+  name: '@deepseek-ai/dsh-factor-mining-python'
+  isolate:
+    factorMining: true
+  config:
+    pythonExecutable: python
+    stateRoot: !!js process.cwd() + '/.factor-mining'
+    requestTimeoutMs: 360000
+
+- id: factor-mining-tools
+  name: '@deepseek-ai/dsh-tool-factor-mining'
+  config:
+    enableArxivSearch: true

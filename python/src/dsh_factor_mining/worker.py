@@ -1,0 +1,151 @@
+# coding=utf-8
+"""Isolated worker for user factor code.
+
+The bridge is the protocol host and never executes user Python factor code
+when executionMode=worker.  Instead it asks this module, in a fresh
+subprocess, to run exactly one check/evaluate request against a serialized
+environment.  User data remains read-only; the worker only writes its own
+result file.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from .factor.audit import audit
+from .factor.causality import check_causality
+from .factor.env import FactorEnv
+from .factor.evaluate import (
+    evaluate,
+    evaluate_batch,
+    evaluate_composite,
+    evaluate_selection,
+    evaluate_test,
+    evaluate_walk_forward,
+)
+
+
+def write_env_npz(path, env: FactorEnv) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    from dataclasses import asdict
+
+    meta = {"dates": [str(d) for d in env.dates], "symbols": list(env.symbols),
+            "calibration": asdict(env.calibration)}
+    arrays = {"o": env.o, "h": env.h, "l": env.l, "c": env.c, "v": env.v}
+    if env.amount is not None:
+        arrays["amount"] = env.amount
+    if env.listed is not None:
+        arrays["listed"] = env.listed.astype(bool)
+    np.savez_compressed(p, **arrays)
+    p.with_suffix(p.suffix + ".meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
+def load_env_npz(path) -> FactorEnv:
+    p = Path(path)
+    meta_path = p.with_suffix(p.suffix + ".meta.json")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    with np.load(p, allow_pickle=False) as data:
+        o = data["o"]; h = data["h"]; l = data["l"]; c = data["c"]; v = data["v"]
+        amount = data["amount"] if "amount" in data else None
+        listed = data["listed"] if "listed" in data else None
+    dates = pd.to_datetime(meta["dates"])
+    calibration = None
+    if meta.get("calibration"):
+        from .factor.env import Calibration
+
+        known = {f for f in Calibration.__dataclass_fields__}
+        calibration = Calibration(**{k: v for k, v in meta["calibration"].items()
+                                     if k in known})
+    return FactorEnv(o, h, l, c, v, dates, meta["symbols"], listed=listed,
+                     amount=amount, calibration=calibration)
+
+
+def _compile(source: str):
+    ns = {"__name__": "dsh_factor_mining_worker_factor"}
+    exec(compile(source, "<factor_source>", "exec"), ns)
+    if "factor" not in ns or not callable(ns["factor"]):
+        raise ValueError(
+            "source 中缺少可调用的 factor(env)——函数名必须是 factor"
+            "（random_generate 返回的 source 原样可用；手写因子请命名 factor）")
+    return ns["factor"]
+
+
+def run_request(req: dict) -> dict:
+    env = load_env_npz(req["npzPath"])
+    method = req["method"]
+    # evaluate_batch 是多 source 方法（sources dict），无单个 source——
+    # 入口编译跳过，由其分支自行编译每个 source（2026-08-18 修复：
+    # 此前无条件编译空串导致 batch 从未成功过）
+    fn = _compile(req["source"]) if (req.get("source") and method != "factor.evaluate_batch") else None
+    params = req.get("params") or {}
+    state_root = params.get("state_root")
+    if method == "factor.check_causality":
+        return check_causality(fn, env)
+    if method == "factor.evaluate":
+        stage = params.get("stage", "development")
+        F = fn(env)
+        n_trials = int(params.get("n_trials", 1))
+        pool_std = params.get("pool_std")
+        pool_std = float(pool_std) if isinstance(pool_std, (int, float)) else None
+        if stage == "development":
+            return evaluate(F, env, n_trials=n_trials, pool_std=pool_std)
+        if stage == "selection":
+            return evaluate_selection(F, env)
+        if stage == "test":
+            # test 是消耗品：锁写在用户 state_root，worker 子进程写同一文件，跨调用可见
+            return evaluate_test(F, env, state_root=state_root,
+                                 source_hash=params.get("source_hash"))
+        raise ValueError(f"worker 不支持的 stage: {stage}")
+    if method == "factor.evaluate_composite":
+        parts = {}
+        for name, src in (params.get("ingredients") or {}).items():
+            parts[name] = _compile(src)(env)
+        return evaluate_composite(fn(env), parts, env)
+    if method == "factor.evaluate_batch":
+        F_dict = {}
+        for name, src in (params.get("sources") or {}).items():
+            F_dict[name] = _compile(src)(env)
+        return evaluate_batch(F_dict, env)
+    if method == "factor.walk_forward":
+        return evaluate_walk_forward(fn(env), env, n_folds=int(params.get("n_folds", 5)),
+                                     t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
+    if method == "factor.audit":
+        return audit(fn, env)
+    raise ValueError(f"worker 不支持的方法: {method}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--request")
+    parser.add_argument("--result")
+    parser.add_argument("--ping", action="store_true",
+                        help="启动自检：import 全链（pathlib/numpy/pandas/全部 evaluate 模块）"
+                             "通过即打印 ok 退出——bridge 用它在冷启动暴露环境问题")
+    args = parser.parse_args(argv)
+    if args.ping:
+        print(json.dumps({"ok": True, "worker": "ready",
+                          "python": sys.version.split()[0]}))
+        return 0
+    if not args.request:
+        parser.error("需要 --request（或 --ping 做启动自检）")
+    req = json.loads(Path(args.request).read_text(encoding="utf-8"))
+    try:
+        out = run_request(req)
+        result = {"ok": True, "result": out}
+    except Exception as e:  # noqa: BLE001 — 转成结构化错误，让 bridge 映射为 JSON-RPC 错误
+        result = {"ok": False, "error": {"message": str(e), "type": type(e).__name__}}
+    result_path = Path(args.result) if args.result else Path(args.request + ".out.json")
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
