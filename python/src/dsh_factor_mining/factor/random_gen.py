@@ -301,12 +301,18 @@ def _null_landscape_path(state_root):
     return os.path.join(state_root, "null_landscape.json")
 
 
-def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress=None):
+def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress=None,
+                         env_fingerprint=None):
     """null 地形：n 个随机因子的 IC_IR 经验分布，持久化。
 
     返回 dict：分位数 + 元信息。后续因子诊断可引用
     "相对随机基线 p95 的分位"（bridge 的 factor.null_landscape 查询）。
     on_progress(done, total)：进度回调（长任务防静默，批次1a）。
+
+    env_fingerprint（2026-08-19 指纹硬门）：调用方（bridge）传入的环境三元组
+    指纹（数据文件+口径+引擎版本）。evaluate 读地形做 pool_std 估计时校验
+    指纹——不匹配视为无效（换数据集后旧地形不得继续当基线）。旧版文件无
+    此字段同样判不匹配（宁可保守：重跑一次校准，几分钟）。
     """
     opset = opset or effective_operator_set(state_root)
     leaves = ["o", "h", "l", "c", "v"] + (["amount"] if getattr(env, "amount", None) is not None else [])
@@ -335,6 +341,7 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
 
     result = {
         "n_generated": n, "n_valid": int(len(irs)), "seed": seed,
+        "env_fingerprint": env_fingerprint,
         "ic_ir": {
             "p10": _q(10), "p25": _q(25), "p50": _q(50),
             "p75": _q(75), "p90": _q(90), "p95": _q(95), "p99": _q(99),

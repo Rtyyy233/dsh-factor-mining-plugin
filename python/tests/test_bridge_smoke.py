@@ -160,12 +160,19 @@ def test_bridge_in_process_mode():
 
 
 def test_registry_submit_decoupled():
-    """pytest 入口：registry_submit 不执行 factor/环境，只收诊断对象落盘。"""
+    """pytest 入口：registry_submit 不执行 factor/环境，只收诊断对象落盘。
+
+    2026-08-19 A3 起 submit 是 deflated 门控执行点：诊断须带完整
+    deflated_train 充分统计量（sr_hat/skew/kurt/n_obs）供提交时刻重算。
+    本测试的去耦合语义不变：不 require env、不编译、不评估。"""
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         bridge, _ = _make_bridge(root)
         diagnosis = {"ic_ir_train": 0.25, "column_perm_train": {"z": 4.0, "p": 0.0001},
-                     "beta_exposure": 0.1, "ic_n_train": 50}
+                     "beta_exposure": 0.1, "ic_n_train": 50,
+                     "deflated_train": {"p": 0.001, "n_trials": 1,
+                                        "sr_hat": 0.5, "skew": 0.0, "kurt": 3.0,
+                                        "n_obs": 60}}
         res = bridge.dispatch("registry.submit", {
             "name": "candidate_a", "signal": "momentum20",
             "diagnosis": diagnosis, "source": BASELINE_SOURCE,

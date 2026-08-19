@@ -116,7 +116,11 @@ def test_receipt_verified_is_bool(tmp_path):
     b.dispatch("data.load", {"envId": "etf"})
     fake = {"ic_ir_train": 0.9, "ic_n_train": 100, "column_perm_train": {"z": 9.0},
             "beta_exposure": 0.0,
-            "deflated_train": {"p": 0.001, "n_trials": 1}}  # 无 _receipt 全编造
+            # 无 _receipt 全编造；deflated_train 带充分统计量（A3 提交时刻
+            # 重算要求——重算本身不依赖 receipt，verified 仍须 False）
+            "deflated_train": {"p": 0.001, "n_trials": 1,
+                               "sr_hat": 0.9, "skew": 0.0, "kurt": 3.0,
+                               "n_obs": 100}}
     sub = b.dispatch("registry.submit", {"envId": "etf", "name": "fake",
                                          "source": F, "signal": "x", "diagnosis": fake})
     assert sub["receipt_verified"] is False, sub["receipt_verified"]
