@@ -1084,9 +1084,41 @@ class Bridge:
             if trail_items:
                 self._append_engine_trail_batch(env_id, trail_items)
             # A2：sketch 已存 trail；agent 可见 schema 保持不变（不留 ic_series_train）
+            # 就地重算（2026-08-20 会话轨迹审计修复）：evaluate() 对每个成员
+            # 单独算 deflated 时 n_trials=1（evaluate_batch 的 n_trials 参数对
+            # 内部 evaluate 不生效）——batch 视图里的 p 是单检验口径，系统性
+            # 偏乐观，Agent 挑深挖对象时被误导，直到 submit 才被 A3 纠正。
+            # 现在成员入 trail 后立即用当前 trail 的 N_eff（含本批）重算——
+            # 与 submit 重算同一公式（_dsr_p_from_stats），决策支持一致。
+            trail_std = None
+            _tp = Path(self.state_root) / "trail_engine.json"
+            if _tp.exists():
+                try:
+                    _entries = json.loads(_tp.read_text(encoding="utf-8"))
+                    irs = [e.get("ic_ir") for e in _entries
+                           if isinstance(e, dict) and isinstance(e.get("ic_ir"), (int, float))]
+                    if len(irs) >= 10:
+                        trail_std = float(np.std(irs, ddof=1))
+                except Exception:
+                    pass
+            pool_std_b = self._resolve_pool_std(env_id, trail_std)
             for name, diag in result["factors"].items():
-                if isinstance(diag, dict):
-                    diag.pop("ic_series_train", None)
+                if not isinstance(diag, dict) or diag.get("error"):
+                    continue
+                diag.pop("ic_series_train", None)
+                dp = diag.get("deflated_train")
+                if isinstance(dp, dict) and dp.get("sr_hat") is not None:
+                    h = source_fingerprint(str(sources.get(name, ""))) \
+                        if sources.get(name) else None
+                    n_eff, _ = self._trial_stats(h)
+                    p_new = _dsr_p_from_stats(dp.get("sr_hat"), dp.get("skew"),
+                                              dp.get("kurt"), dp.get("n_obs"),
+                                              n_eff, pool_std_b)
+                    diag["deflated_train"] = {**dp, "p": p_new,
+                                              "n_trials": float(n_eff),
+                                              "n_eff": float(n_eff),
+                                              "pool_std": pool_std_b,
+                                              "recomputed_at_batch": True}
         return result
 
     def _factor_walk_forward(self, params):
