@@ -485,8 +485,33 @@ def _train_sensitivity(ic_sig, env) -> dict:
             "note": "只扰动 dev_end；sel_end/test 绝不进入扰动扫描"}
 
 
-def evaluate(F, env, train_end=None, verbose=False, n_trials: int = 1,
-             pool_std: float | None = None):
+def _env_horizon_view(env, horizon):
+    """per-call horizon 视图（v2 2026-08-20 申报制）：共享数据数组、仅口径覆盖。
+
+    horizon=None 或等于主 horizon → 原样返回。视图的 ic_sample_every 同步
+    放大至 max(原值, h)：per-call horizon 放大时保持 IC 不重叠铁律（D5）——
+    原值 0（=horizon）随视图 horizon 自适应；原值 >0 且 < h 时抬到 h。
+    """
+    if horizon is None:
+        return env
+    h = int(horizon)
+    if h == env.calibration.horizon:
+        return env
+    from dataclasses import replace as _replace
+    cal = env.calibration
+    ise = int(cal.ic_sample_every or 0)
+    if 0 < ise < h:
+        ise = h
+    new_cal = _replace(cal, horizon=h, ic_sample_every=ise)
+    view = object.__new__(type(env))
+    view.__dict__.update(env.__dict__)
+    view.calibration = new_cal
+    return view
+
+
+def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
+             pool_std: float | None = None, horizon=None):
+    env = _env_horizon_view(env, horizon)
     F = np.asarray(F, dtype=np.float64)
     if F.shape != (env.T, env.N):
         raise ValueError(f"factor 输出形状 {F.shape} != (T,N) {(env.T, env.N)}")
@@ -508,6 +533,9 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: int = 1,
 
     result = {
         "signal": None,
+        # 实际生效赌注（v2 申报制）：trail 按 (source_hash, horizon) 计账的 key、
+        # submit 重算按 horizon 取 per-horizon pool_std 基线
+        "horizon": env.calibration.horizon,
         "ic_mean_train": train_sig_stats["mean"],
         "ic_ir_train": train_sig_stats["ir"],
         "ic_n_train": train_sig_stats["n"],
@@ -719,14 +747,16 @@ def _sample_signal_days(F_dict, env):
     return out
 
 
-def evaluate_batch(F_dict, env, train_end=None):
+def evaluate_batch(F_dict, env, train_end=None, horizon=None):
     train_end = train_end or env.calibration.dev_end
     names = list(F_dict.keys())
     M = len(names)
     if M == 0:
         return {"factors": {}, "batch": {"M": 0}}
 
-    factors = {n: evaluate(F_dict[n], env, train_end=train_end) for n in names}
+    # v2 申报制：整批同一声明 horizon（不同 horizon 的成本/口径不同，混批无意义）
+    factors = {n: evaluate(F_dict[n], env, train_end=train_end, horizon=horizon)
+               for n in names}
     p_single = {}
     for n in names:
         cp = factors[n].get("column_perm_train") or {}

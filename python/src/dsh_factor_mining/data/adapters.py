@@ -96,8 +96,8 @@ CALIBRATION_PROFILES: dict[str, dict[str, Any]] = {
                         "annualization": 48 * 252},
 }
 
-ALLOWED_CAL_KEYS = {"frequency", "horizon", "cost_bps", "execution", "dev_end",
-                    "sel_end", "annualization", "limit_up_down_mask",
+ALLOWED_CAL_KEYS = {"frequency", "horizon", "horizons", "cost_bps", "execution",
+                    "dev_end", "sel_end", "annualization", "limit_up_down_mask",
                     "ic_sample_every", "top_n", "bars_per_day"}
 
 
@@ -144,6 +144,29 @@ def _validate_calibration_domain(merged: dict[str, Any], raw: dict[str, Any]) ->
             raise DataError(f"calibration.horizon 必须是正整数（收到 {merged['horizon']!r}）")
         if h <= 0:
             raise DataError(f"calibration.horizon 必须 > 0（收到 {h}）")
+    if "horizons" in merged and merged["horizons"] is not None:
+        # v2（2026-08-20）horizon 菜单：申报制评估的合法赌注集。
+        # 约束：正整数、去重、1~6 个（菜单宽度 = 允许的假设维度，防爆炸）、
+        # 必须包含主 horizon（主 horizon 是缺省申报）。
+        raw_menu = merged["horizons"]
+        if not isinstance(raw_menu, (list, tuple)):
+            raise DataError(f"calibration.horizons 必须是正整数数组（收到 {raw_menu!r}）")
+        try:
+            menu = [int(x) for x in raw_menu]
+        except (TypeError, ValueError):
+            raise DataError(f"calibration.horizons 必须是正整数数组（收到 {raw_menu!r}）")
+        if not menu or any(x <= 0 for x in menu):
+            raise DataError(f"calibration.horizons 必须非空且全为正整数（收到 {menu}）")
+        if len(set(menu)) != len(menu):
+            raise DataError(f"calibration.horizons 不得重复（收到 {menu}）")
+        if len(menu) > 6:
+            raise DataError(f"calibration.horizons 菜单最多 6 个（收到 {len(menu)} 个：{menu}）"
+                            "——菜单宽度 = 允许的假设维度，宽菜单 = 宽选择偏差")
+        main_h = int(merged.get("horizon") or 20)
+        if main_h not in menu:
+            raise DataError(
+                f"calibration.horizons 必须包含主 horizon {main_h}（收到 {menu}）"
+                "——主 horizon 是缺省申报，不在菜单内 = 自相矛盾配置")
     if "cost_bps" in merged and merged["cost_bps"] is not None:
         try:
             c = float(merged["cost_bps"])

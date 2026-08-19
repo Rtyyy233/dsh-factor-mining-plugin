@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,14 +128,19 @@ def test_evaluate_auto_n_trials_from_trail_engine(tmp_path):
     assert r1["deflated_train"]["n_trials"] == 1
     r2 = b.dispatch("factor.evaluate", {"envId": "primary", "source": VARIANT,
                                         "stage": "development"})
-    assert r2["deflated_train"]["n_trials"] == 2, "第二个假设应计 2 次试验"
+    # v2（2026-08-20）谱口径：第二试验必须计入，同族（动量变体）按实测相关
+    # 折减 → n_eff ∈ (1, 2]。意图不变：引擎自动从 trail 统计、不依赖 agent。
+    assert 1.0 < r2["deflated_train"]["n_trials"] <= 2.0, \
+        "第二个假设必须计入有效试验数"
     r3 = b.dispatch("factor.evaluate", {"envId": "primary", "source": ANOTHER,
                                         "stage": "development"})
-    assert r3["deflated_train"]["n_trials"] == 3
+    assert r3["deflated_train"]["n_trials"] > r2["deflated_train"]["n_trials"], \
+        "新维度试验继续抬 N_eff（单调不减）"
     # 重复评估不重复计数
     r2b = b.dispatch("factor.evaluate", {"envId": "primary", "source": VARIANT,
                                          "stage": "development"})
-    assert r2b["deflated_train"]["n_trials"] == 3
+    assert r2b["deflated_train"]["n_trials"] == pytest.approx(
+        r3["deflated_train"]["n_trials"]), "重复评估不得重复计数"
     # N>1 且池样本 <10 且未校准 null → 拒绝给 p（不给不可信数字）
     assert r2b["deflated_train"].get("p") is None
     assert "pool_std" in r2b["deflated_train"].get("note", "")

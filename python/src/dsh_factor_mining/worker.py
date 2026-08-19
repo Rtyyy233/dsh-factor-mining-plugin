@@ -91,11 +91,20 @@ def run_request(req: dict) -> dict:
     if method == "factor.evaluate":
         stage = params.get("stage", "development")
         F = fn(env)
-        n_trials = int(params.get("n_trials", 1))
+        # v2：n_trials 为浮点谱 N_eff（不得 int 截断）
+        n_trials = params.get("n_trials", 1)
+        n_trials = float(n_trials) if isinstance(n_trials, (int, float)) else 1.0
         pool_std = params.get("pool_std")
         pool_std = float(pool_std) if isinstance(pool_std, (int, float)) else None
+        # v2 申报制：per-call horizon（bridge 已校验 ∈ 菜单并归一为 int）
+        horizon = params.get("horizon")
+        try:
+            horizon = int(horizon) if horizon not in (None, "") else None
+        except (TypeError, ValueError):
+            horizon = None
         if stage == "development":
-            return evaluate(F, env, n_trials=n_trials, pool_std=pool_std)
+            return evaluate(F, env, n_trials=n_trials, pool_std=pool_std,
+                            horizon=horizon)
         if stage == "selection":
             return evaluate_selection(F, env)
         if stage == "test":
@@ -112,7 +121,12 @@ def run_request(req: dict) -> dict:
         F_dict = {}
         for name, src in (params.get("sources") or {}).items():
             F_dict[name] = _compile(src)(env)
-        return evaluate_batch(F_dict, env)
+        horizon = params.get("horizon")
+        try:
+            horizon = int(horizon) if horizon not in (None, "") else None
+        except (TypeError, ValueError):
+            horizon = None
+        return evaluate_batch(F_dict, env, horizon=horizon)
     if method == "factor.walk_forward":
         return evaluate_walk_forward(fn(env), env, n_folds=int(params.get("n_folds", 5)),
                                      t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))

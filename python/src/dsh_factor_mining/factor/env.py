@@ -29,6 +29,11 @@ class Calibration:
 
     frequency: str = "daily"           # daily | minute（minute: T 单位 = bar）
     horizon: int = 20                  # forward bars（daily=交易日, minute=bar）
+    # horizon 菜单（v2 2026-08-20 申报制）：允许评估的赌注集合。None = [horizon]
+    # （不配置菜单 = 行为与旧版逐字节一致）。因子评估可声明菜单内任一 horizon
+    # （不同 horizon = 不同经济赌注 = 不同试验，trail 按 (hash, horizon) 计账）；
+    # 配置菜单会改变环境指纹 → null 校准自动要求重跑（per-horizon 基线）。
+    horizons: list[int] | None = None
     cost_bps: float = 10.0             # 单边成本
     execution: str = "t1"              # t1: T+1 开盘执行 | t0: 信号 bar 收盘执行
     # 三区分界（train/selection/test）：由用户显式选择，无隐式默认——
@@ -52,6 +57,13 @@ class Calibration:
     @property
     def sample_step(self) -> int:
         return self.ic_sample_every or self.horizon
+
+    @property
+    def horizon_menu(self) -> list[int]:
+        """horizon 菜单（申报制评估的合法赌注集）；未配置 = [horizon]。"""
+        if self.horizons:
+            return [int(h) for h in self.horizons]
+        return [self.horizon]
 
 
 class FactorEnv:

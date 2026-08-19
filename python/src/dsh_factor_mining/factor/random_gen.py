@@ -301,8 +301,32 @@ def _null_landscape_path(state_root):
     return os.path.join(state_root, "null_landscape.json")
 
 
+def _bucket_corr(s1, s2):
+    """跨 horizon IC 序列相关（v2 null 校准）：位置分桶对齐后 Pearson。
+
+    序列长度 n ≈ train_days/h 不同（h=5 → 152 点 vs h=20 → 38 点）；两条序列
+    都按非重叠步长升序采样——把点多的按点少的网格分桶取均值，近似同一时间
+    尺度后算相关。粗但对（作 ρ_h 先验足够，缺先验的下游按独立保守计）。
+    """
+    a = np.asarray(s1, dtype=np.float64)
+    b = np.asarray(s2, dtype=np.float64)
+    if len(a) < 2 or len(b) < 2:
+        return None
+    if len(a) != len(b):
+        if len(a) < len(b):
+            a, b = b, a
+        k = len(b)
+        idx = np.linspace(0, len(a), k + 1).astype(int)
+        a = np.array([a[idx[j]:idx[j + 1]].mean() if idx[j] < idx[j + 1] else a[idx[j]]
+                      for j in range(k)])
+    if a.std() == 0 or b.std() == 0:
+        return None
+    c = float(np.corrcoef(a, b)[0, 1])
+    return c if np.isfinite(c) else None
+
+
 def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress=None,
-                         env_fingerprint=None):
+                         env_fingerprint=None, horizons=None):
     """null 地形：n 个随机因子的 IC_IR 经验分布，持久化。
 
     返回 dict：分位数 + 元信息。后续因子诊断可引用
@@ -313,11 +337,23 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
     指纹（数据文件+口径+引擎版本）。evaluate 读地形做 pool_std 估计时校验
     指纹——不匹配视为无效（换数据集后旧地形不得继续当基线）。旧版文件无
     此字段同样判不匹配（宁可保守：重跑一次校准，几分钟）。
+
+    horizons（v2 2026-08-20 申报制菜单）：菜单内每个 horizon 各建一份
+    per-horizon IC_IR 分位（pool_std 按 horizon 取基线——短 horizon 的 null
+    天然更窄，防止「短 horizon n 大出小 p」的系统性诱惑白嫖）。同时实测
+    跨 horizon IC 序列相关（cross_horizon_corr）——同因子扫 horizon 的族
+    结构先验（N_eff 谱方法用它连接 (hash, h1)/(hash, h2) 试验）。成本 ×菜单
+    宽度：n=50 × 4 horizon ≈ 单 horizon n=200 的量级。
     """
+    from .evaluate import (_cross_sectional_ic, _env_horizon_view,
+                           _forward_returns, _pit_mask)
     opset = opset or effective_operator_set(state_root)
+    menu = [int(h) for h in horizons] if horizons else [env.calibration.horizon]
     leaves = ["o", "h", "l", "c", "v"] + (["amount"] if getattr(env, "amount", None) is not None else [])
     rng = np.random.default_rng(seed)
-    irs, means = [], []
+    views = {h: _env_horizon_view(env, h) for h in menu}
+    irs_by_h = {h: [] for h in menu}
+    series_by_h = {h: [] for h in menu}
     for _i in range(n):
         if on_progress is not None:
             try:
@@ -325,37 +361,85 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
             except Exception:
                 pass
         tree = generate_tree(rng, opset, leaves=leaves)
-        # 内联执行：直接调 ops 算子（不经源码编译，同数学）
+        # 内联执行：直接调 ops 算子（不经源码编译，同数学）。
+        # asarray 必须有：_eval_tree 返回 DataFrame（symbol 索引），裸传
+        # _cross_sectional_ic 会在 pit[t] & isfinite(F[t]) 的 Series/ndarray
+        # 对齐处静默炸掉（原 light_ic_scan 同样先 asarray）
         try:
-            F = _eval_tree(tree, env)
-            r = light_ic_scan(F, env)
+            F = np.asarray(_eval_tree(tree, env), dtype=np.float64)
         except Exception:
             continue
-        if r["ic_ir"] is not None and np.isfinite(r["ic_ir"]):
-            irs.append(r["ic_ir"])
-            means.append(r["ic_mean"])
-    irs = np.array(irs) if irs else np.array([np.nan])
+        for h in menu:
+            try:
+                v = views[h]
+                ic = _cross_sectional_ic(F, _forward_returns(v), _pit_mask(v),
+                                         v, sig_only=True)
+                dev_end = v.calibration.dev_end
+                if dev_end is None:
+                    dev_end = str(pd.DatetimeIndex(env.dates)[int(env.T * 0.6)].date())
+                ic = ic[ic.index < pd.Timestamp(dev_end)]
+                if len(ic) >= 2 and ic.std(ddof=1) > 0:
+                    ir = float(ic.mean() / ic.std(ddof=1))
+                    if np.isfinite(ir):
+                        irs_by_h[h].append(ir)
+                        series_by_h[h].append(ic.values)
+            except Exception:
+                continue
 
-    def _q(p):
-        return float(np.nanpercentile(irs, p)) if len(irs) else None
+    def _q(arr, p):
+        return float(np.nanpercentile(arr, p)) if len(arr) else None
+
+    ic_ir_out = {}
+    for h in menu:
+        arr = np.array(irs_by_h[h]) if irs_by_h[h] else np.array([np.nan])
+        ic_ir_out[str(h)] = {
+            "p10": _q(arr, 10), "p25": _q(arr, 25), "p50": _q(arr, 50),
+            "p75": _q(arr, 75), "p90": _q(arr, 90), "p95": _q(arr, 95),
+            "p99": _q(arr, 99),
+            "max": float(np.nanmax(arr)) if len(arr) else None,
+            "mean_abs": float(np.nanmean(np.abs(arr))) if len(arr) else None,
+        }
+
+    # 跨 horizon 相关：同批随机因子在 (h1, h2) 的 IC 序列相关，跨因子平均
+    cross_h = {}
+    for i, h1 in enumerate(menu):
+        for h2 in menu[i + 1:]:
+            rhos = []
+            for s1, s2 in zip(series_by_h[h1], series_by_h[h2]):
+                c = _bucket_corr(s1, s2)
+                if c is not None and np.isfinite(c):
+                    rhos.append(c)
+            if rhos:
+                cross_h[f"{min(h1, h2)}|{max(h1, h2)}"] = round(float(np.mean(rhos)), 4)
+
+    # 生产可见性（2026-08-20）：某 horizon 全空 = 该赌注无基线（下游 pool_std
+    # None → D7 拒绝），静默 0-valid 是审计盲区——必须 stderr 可见
+    for h in menu:
+        if len(irs_by_h[h]) == 0:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[null-calibration] horizon={h} 无有效随机因子样本（全部"
+                    "生成/评估失败）——该 horizon 的 pool_std 基线缺失\n")
+            except Exception:
+                pass
 
     result = {
-        "n_generated": n, "n_valid": int(len(irs)), "seed": seed,
+        "n_generated": n, "n_valid": int(len(irs_by_h[menu[0]])), "seed": seed,
         "env_fingerprint": env_fingerprint,
-        "ic_ir": {
-            "p10": _q(10), "p25": _q(25), "p50": _q(50),
-            "p75": _q(75), "p90": _q(90), "p95": _q(95), "p99": _q(99),
-            "max": float(np.nanmax(irs)) if len(irs) else None,
-            "mean_abs": float(np.nanmean(np.abs(irs))) if len(irs) else None,
-        },
+        "horizons": menu,
+        "ic_ir": ic_ir_out,
+        "cross_horizon_corr": cross_h,
         "interpretation": (
-            "经验 null 分布：随机因子的 IC_IR 集中在 p50 附近。"
-            "新因子 IC_IR 超过 p95 才值得认真对待；p99 以上是强信号。"
-            "若 p95 本身已很高，说明该池子极易产生过拟合信号。"
+            "经验 null 分布（per-horizon）：随机因子的 IC_IR 集中在 p50 附近。"
+            "新因子 IC_IR 超过对应 horizon 的 p95 才值得认真对待；p99 以上是强信号。"
+            "短 horizon 的 null 天然更窄（n 大）——显著性更容易是其样本量大的正当结果，"
+            "不是作弊；但成本换手同框看（cost_bps 对短 horizon 惩罚更重）。"
         ),
         "sampling_note": (
-            f"n={n}：p95 的估计误差约 ±10 个百分位，p99 基于不足 1 个期望观测、"
-            "只能当方向参考——需要精确尾部分位时用 n>=200 重跑"
+            f"n={n} × {len(menu)} horizon：p95 的估计误差约 ±10 个百分位，p99 基于"
+            "不足 1 个期望观测、只能当方向参考——需要精确尾部分位时用 n>=200 重跑。"
+            "cross_horizon_corr 是同因子跨 horizon 的族结构先验（N_eff 谱方法用）。"
         ),
     }
     os.makedirs(state_root, exist_ok=True)

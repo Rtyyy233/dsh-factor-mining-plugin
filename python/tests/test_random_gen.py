@@ -110,16 +110,21 @@ def test_operator_override():
 
 
 def test_null_calibration_persists():
-    """null 地形：分位数结构完整 + 持久化 + 可读回。"""
+    """null 地形：分位数结构完整 + 持久化 + 可读回。
+
+    v2（2026-08-20）：ic_ir 按 horizon 分键（菜单制）；单 horizon 环境
+    键 = str(主 horizon)。"""
     env = _synthetic_env()
     with tempfile.TemporaryDirectory() as d:
         r = run_null_calibration(env, d, n=10, seed=42)
         assert r["n_generated"] == 10
         assert r["n_valid"] > 0
+        main = str(env.calibration.horizon)
+        assert r["horizons"] == [env.calibration.horizon]
         for k in ("p50", "p95"):
-            assert r["ic_ir"][k] is not None
+            assert r["ic_ir"][main][k] is not None
         back = read_null_landscape(d)
-        assert back is not None and back["ic_ir"]["p95"] == r["ic_ir"]["p95"]
+        assert back is not None and back["ic_ir"][main]["p95"] == r["ic_ir"][main]["p95"]
 
 
 def test_light_ic_scan_shape():
