@@ -38,13 +38,22 @@ def dict_fingerprint(d: dict[str, Any] | None) -> str:
 
 
 def calibration_fingerprint(calibration) -> str:
-    """Calibration dataclass 或普通 dict → 指纹。"""
+    """Calibration dataclass 或普通 dict → 指纹。
+
+    v2 兼容（2026-08-20）：horizons 菜单未配置（None/缺省）时不参与指纹——
+    不加菜单的既有部署指纹不变，landscape 不失效；一旦配置菜单，指纹变化
+    → null 校准自动要求重跑（per-horizon 基线，设计内保守行为）。
+    """
     if isinstance(calibration, dict):
-        return dict_fingerprint(calibration)
-    try:
-        return dict_fingerprint(asdict(calibration))
-    except TypeError:
-        return dict_fingerprint(dict(vars(calibration)) if not isinstance(calibration, dict) else calibration)
+        d = dict(calibration)
+    else:
+        try:
+            d = asdict(calibration)
+        except TypeError:
+            d = dict(vars(calibration)) if not isinstance(calibration, dict) else dict(calibration)
+    if isinstance(d, dict) and d.get("horizons") is None:
+        d = {k: v for k, v in d.items() if k != "horizons"}
+    return dict_fingerprint(d)
 
 
 def source_fingerprint(source: str) -> str:
