@@ -3,10 +3,15 @@
 *.pkl
 *.csv
 *.npz
+*.npy
 .factor-mining/
 factor-mining.config.json
 factor-mining.config.yml
 test_lock.json
+
+# Session archives (trail/pool/landscape backups) and local run logs
+docs/internal/session-*/
+projrun*.log
 
 # Python
 __pycache__/

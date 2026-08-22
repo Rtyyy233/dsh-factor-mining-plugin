@@ -176,14 +176,17 @@ def main():
     _compare_scalars("composite.corr_vs_best", a["diagnosis"]["corr_vs_best"], b["diagnosis"]["corr_vs_best"], failures)
 
     # 4. batch deflate
+    # v3（2026-08-21）有意变更（不再与参考引擎对账，由 test_selection_luck.py
+    # 的 v3 专项测试覆盖）：
+    # - N_eff：v2 幂校正 1+(M-1)(1-ρ̄) → 谱 M_eff 遥测（尾对齐 R 特征值）
+    # - best_deflated_p：v3 门口径 sr0 = E[max|X|]·pool_std，无 pool_std
+    #   拒给 p（不给不可信数字）；参考引擎的旧 p 无可比性
+    # 仍对账的结构量：M / rho_bar（秩相关实测不变）/ best_name
     a = new_evaluate_batch({"mom": part1, "abs": part2}, new_env)
     b = ref_eval.evaluate_batch({"mom": part1, "abs": part2}, ref_env_obj)
-    for key in ("M", "rho_bar", "N_eff", "best_name"):
+    for key in ("M", "rho_bar", "best_name"):
         checks += 1
         _compare_scalars(f"batch.{key}", a["batch"].get(key), b["batch"].get(key), failures)
-    checks += 1
-    _compare_scalars("batch.best_deflated_p", a["batch"].get("best_deflated_p"),
-                     b["batch"].get("best_deflated_p"), failures)
 
     # 5. walk-forward
     a = new_evaluate_walk_forward(F, new_env, n_folds=5, t0_date="2021-01-01")

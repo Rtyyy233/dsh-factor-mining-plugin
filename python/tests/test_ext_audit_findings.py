@@ -124,3 +124,44 @@ def test_receipt_verified_is_bool(tmp_path):
     sub = b.dispatch("registry.submit", {"envId": "etf", "name": "fake",
                                          "source": F, "signal": "x", "diagnosis": fake})
     assert sub["receipt_verified"] is False, sub["receipt_verified"]
+
+
+def test_submit_incomplete_stats_rejected_with_clear_error(tmp_path):
+    """2026-08-21 tsi_ad 事故回归：agent 手工构造诊断只抄了 sr_hat/n_obs，
+    丢了 skew/kurt → 提交时刻重算 float(None) 静默 None → passes_acceptance
+    误报"缺池分布基线"（基线明明在），把 agent 引去无效的 null 重校准。
+
+    修复：sr_hat 在场但 (skew, kurt, n_obs) 不齐 = 删改痕迹 → -32602
+    明确拒绝并指出缺失字段，不得进入重算。"""
+    data = tmp_path / "panel.parquet"
+    _panel(data)
+    b = Bridge(state_root=str(tmp_path / "state"), execution_mode="in_process")
+    b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
+    b.dispatch("data.load", {"envId": "etf"})
+    b.dispatch("factor.random_generate", {"envId": "etf", "mode": "null-calibration", "n": 5})
+    # 事故现场复刻：sr_hat/n_obs 在场，skew/kurt 缺（agent 摘要式构造）
+    hand_built = {"ic_ir_train": 0.406, "ic_n_train": 58,
+                  "column_perm_train": {"z": 104.0, "p": 0.0001},
+                  "beta_exposure": 0.05,
+                  "deflated_train": {"p": 0.041, "n_trials": 89,
+                                     "sr_hat": 0.406, "n_obs": 58}}
+    try:
+        b.dispatch("registry.submit", {"envId": "etf", "name": "tsi_ad_incident",
+                                       "source": F, "signal": "x",
+                                       "diagnosis": hand_built})
+        raise AssertionError("缺 skew/kurt 的诊断未被拒——静默 p=None 事故复发")
+    except BridgeError as e:
+        assert e.code == -32602, e.code
+        msg = str(e)
+        # 必须点名缺失字段（可操作），且不得误报为缺基线（误导重校准）
+        assert "skew" in msg and "kurt" in msg, msg
+        assert "基线" not in msg, f"错误消息仍在误导（缺基线）：{msg}"
+    # 完整统计量（对照）：同结构 + skew/kurt → 进入重算（p 有值或按门拒绝，不再是 -32602 缺字段）
+    complete = {**hand_built,
+                "deflated_train": {**hand_built["deflated_train"],
+                                   "skew": 0.1, "kurt": 3.2}}
+    sub = b.dispatch("registry.submit", {"envId": "etf", "name": "tsi_ad_complete",
+                                         "source": F, "signal": "x",
+                                         "diagnosis": complete})
+    dp = (sub.get("entry") or {}).get("diagnosis", {}).get("deflated_train", {})
+    assert dp.get("p") is not None, f"完整统计量仍 p=None（重算链路另有问题）：{dp}"
