@@ -94,22 +94,23 @@ def test_dsr_sr0_matches_bailey_lopez_de_prado():
     ic = pd.Series(rng.normal(0.02, 0.1, 120))
     r1 = _deflated_sharpe_p(ic, n_trials=1)
     assert r1["sr0"] == 0.0
-    # 2026-08-18 生产审计二次修正：sr0 需池分布缩放（B-LP 式 4），
-    # √(2 ln N) 与 IC_IR 不同尺度——N>1 无 pool_std 时拒绝给 p
-    r10_nopool = _deflated_sharpe_p(ic, n_trials=10)
-    assert r10_nopool["p"] is None and "pool_std" in r10_nopool["note"]
-    # pool_std 固定时：sr0 = pool_std·[(1-γ)Z(1-1/N)+γZ(1-1/(Ne))]，N 越大越高
-    gamma = 0.5772156649015329
-    from statistics import NormalDist
-    nd = NormalDist()
-    for N in (10, 100):
-        expect = 0.15 * ((1 - gamma) * nd.inv_cdf(1 - 1 / N)
-                         + gamma * nd.inv_cdf(1 - 1 / (N * math.e)))
-        got = _deflated_sharpe_p(ic, n_trials=N, pool_std=0.15)
-        assert abs(got["sr0"] - expect) < 1e-12, got
-        assert got["p"] is not None
-    assert (_deflated_sharpe_p(ic, n_trials=100, pool_std=0.15)["sr0"]
-            > _deflated_sharpe_p(ic, n_trials=10, pool_std=0.15)["sr0"])
+    # v3（2026-08-21）：n_trials 降级为纯遥测（谱 N_eff→B-LP 链条退役，
+    # 三处失真见 _dsr_sr0 docstring）——门参数是 bar_sigma = E[max|X|]。
+    # bar_sigma=None = 直调单检验口径：p 正常给出（无选择折减）
+    r_nopool = _deflated_sharpe_p(ic, n_trials=10)
+    assert r_nopool["p"] is not None and r_nopool["sr0"] == 0.0
+    # bar_sigma>0 而无 pool_std → 拒绝给 p（2026-08-18 审计语义保留：
+    # 折减门槛 sr0 = bar_sigma·pool_std 需池分布尺度，缺基线不给不可信数字）
+    r_bs_nopool = _deflated_sharpe_p(ic, bar_sigma=2.5)
+    assert r_bs_nopool["p"] is None and "pool_std" in r_bs_nopool["note"]
+    # pool_std 固定时：sr0 = bar_sigma·pool_std（E[max|X|] 直算口径），
+    # bar 越高门槛越高
+    got_a = _deflated_sharpe_p(ic, bar_sigma=1.5, pool_std=0.15)
+    got_b = _deflated_sharpe_p(ic, bar_sigma=2.5, pool_std=0.15)
+    assert abs(got_a["sr0"] - 1.5 * 0.15) < 1e-12, got_a
+    assert abs(got_b["sr0"] - 2.5 * 0.15) < 1e-12, got_b
+    assert got_a["p"] is not None and got_b["p"] is not None
+    assert got_b["p"] > got_a["p"]  # 门槛越高 deflated p 越大
 
 
 # ---- P1-2 block bootstrap z ----

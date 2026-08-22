@@ -91,7 +91,9 @@ def run_request(req: dict) -> dict:
     if method == "factor.evaluate":
         stage = params.get("stage", "development")
         F = fn(env)
-        # v2：n_trials 为浮点谱 N_eff（不得 int 截断）
+        # v3：bar_sigma 为门参数（E[max|X|]，σ 单位）；n_trials 纯遥测
+        bar_sigma = params.get("bar_sigma")
+        bar_sigma = float(bar_sigma) if isinstance(bar_sigma, (int, float)) else None
         n_trials = params.get("n_trials", 1)
         n_trials = float(n_trials) if isinstance(n_trials, (int, float)) else 1.0
         pool_std = params.get("pool_std")
@@ -104,7 +106,7 @@ def run_request(req: dict) -> dict:
             horizon = None
         if stage == "development":
             return evaluate(F, env, n_trials=n_trials, pool_std=pool_std,
-                            horizon=horizon)
+                            horizon=horizon, bar_sigma=bar_sigma)
         if stage == "selection":
             return evaluate_selection(F, env)
         if stage == "test":
@@ -126,7 +128,9 @@ def run_request(req: dict) -> dict:
             horizon = int(horizon) if horizon not in (None, "") else None
         except (TypeError, ValueError):
             horizon = None
-        return evaluate_batch(F_dict, env, horizon=horizon)
+        pool_std = params.get("pool_std")
+        pool_std = float(pool_std) if isinstance(pool_std, (int, float)) else None
+        return evaluate_batch(F_dict, env, horizon=horizon, pool_std=pool_std)
     if method == "factor.walk_forward":
         return evaluate_walk_forward(fn(env), env, n_folds=int(params.get("n_folds", 5)),
                                      t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))

@@ -367,29 +367,52 @@ def _norm_ppf(q: float) -> float:
     return NormalDist().inv_cdf(q)
 
 
-def _dsr_sr0(n_trials: float, pool_std: float | None) -> tuple[float | None, str]:
-    """B-LP 期望最大 null SR：SR0 = √V·[(1-γ)Z(1-1/N)+γZ(1-1/(N·e))]。
+def _blp_sigma(n: float) -> float:
+    """B-LP 单侧期望最大值（σ 单位）：(1-γ)Z(1-1/N)+γZ(1-1/(N·e))。
 
-    公式单一来源（2026-08-19 A3）：_deflated_sharpe_p 与 submit 时重算共用。
-    返回 (sr0, scale_note)；N>1 且缺 pool_std → (None, 拒绝原因)。"""
-    if n_trials <= 1:
-        return 0.0, "N=1 无多重检验惩罚"
+    v2（2026-08-20）门公式。v3（2026-08-21）起门改 E[max|X|] 直算
+    （_LuckSampler）——此函数仅用于旧 trail 条目 n_eff_at_write 章的
+    σ 换算（包络跨版本单调）。保留 v2 数值口径：N≤1 → 0。"""
+    if n <= 1:
+        return 0.0
+    gamma = 0.5772156649015329  # Euler-Mascheroni
+    z1 = _norm_ppf(1.0 - 1.0 / n)
+    z2 = _norm_ppf(1.0 - 1.0 / (n * math.e))
+    return (1.0 - gamma) * z1 + gamma * z2
+
+
+def _dsr_sr0(bar_sigma: float | None, pool_std: float | None) -> tuple[float | None, str]:
+    """选择运气 bar（v3 2026-08-21）：sr0 = E[max|X|]·pool_std。
+
+    bar_sigma = 选择统计量（agent 按 |IC| 挑最优，含符号事后翻转——trail
+    实证：volume_decay_30 以 IC_IR=-0.62 入册）在全局零假设下的期望水平，
+    σ 单位，由 _LuckSampler 从试验相关矩阵 R 直算。双侧：max|X|。
+
+    v2 链条（谱 (Σλ)²/Σλ² → B-LP(N_eff) 单侧）退役，三处失真（74 条真实
+    trail 对照实验）：按长度分组只实测 10.2% 对（F1）；有效自由度统计量
+    ≠ 期望最大值预测器，弥散相关下低估 3.4 倍（F2）；单侧 bar 配 |IC|
+    统计量漏计符号选择（F3）。
+
+    bar_sigma=None/0（直调单检验口径）→ 无折减；任何折减（bar_sigma>0）
+    都需 pool_std，缺 → (None, 拒绝原因)——不给不可信数字。"""
+    if not bar_sigma or bar_sigma <= 0:
+        return 0.0, "单检验口径（无选择折减）"
     if pool_std is not None and pool_std > 0:
-        gamma = 0.5772156649015329  # Euler-Mascheroni
-        z1 = _norm_ppf(1.0 - 1.0 / n_trials)
-        z2 = _norm_ppf(1.0 - 1.0 / (n_trials * math.e))
-        sr0 = pool_std * ((1.0 - gamma) * z1 + gamma * z2)
-        return sr0, f"pool_std={pool_std:.4f}（N_eff={n_trials:.2f} 次有效试验的池分布缩放）"
-    return None, ("N>1 但缺 pool_std（池内 SR 分布尺度）——deflated p 不可信，拒绝给出。"
-                  "需 trail_engine 实测 IC_IR 分布或 null 地形校准。")
+        sr0 = bar_sigma * pool_std
+        return sr0, (f"pool_std={pool_std:.4f}（E[max|X|]={bar_sigma:.3f}σ "
+                     "选运 bar 的池分布缩放）")
+    return None, ("选择折减需 pool_std（池内 IC_IR 分布尺度）——deflated p 不可信，"
+                  "拒绝给出。需 trail_engine 实测 IC_IR 分布或 null 地形校准。")
 
 
-def _dsr_p_from_stats(sr, g3, g4, n, n_trials: float, pool_std: float | None) -> float | None:
-    """充分统计量 → DSR p（A3：registry_submit 提交时重算）。
+def _dsr_p_from_stats(sr, g3, g4, n, bar_sigma: float | None,
+                      pool_std: float | None) -> float | None:
+    """充分统计量 → DSR p（A3：registry_submit 提交时重算；v3 bar_sigma 口径）。
 
-    单因子 deflated p 完全由 (sr_hat, skew, kurt, n_obs) 与 (n_trials, pool_std)
-    决定——这四项充分统计量都在 deflated_train 里带着，submit 重算无需 IC
-    序列/env/重评估（纯算术，去耦合设计不破）。样本不足或缺 pool_std → None。"""
+    单因子 deflated p 完全由 (sr_hat, skew, kurt, n_obs) 与 (bar_sigma,
+    pool_std) 决定——这四项充分统计量都在 deflated_train 里带着，submit
+    重算无需 IC 序列/env/重评估（纯算术，去耦合设计不破）。样本不足或
+    缺 pool_std（有折减时）→ None。"""
     try:
         sr, g3, g4, n = float(sr), float(g3), float(g4), int(n)
     except (TypeError, ValueError):
@@ -398,28 +421,258 @@ def _dsr_p_from_stats(sr, g3, g4, n, n_trials: float, pool_std: float | None) ->
         return None
     denom = 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr * sr
     denom = max(denom, 1e-8)
-    sr0, _ = _dsr_sr0(n_trials, pool_std)
+    sr0, _ = _dsr_sr0(bar_sigma, pool_std)
     if sr0 is None:
         return None
     t_stat = (abs(sr) - sr0) * (n - 1) ** 0.5 / denom ** 0.5
     return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
 
 
-def _deflated_sharpe_p(ic_series, n_trials: float = 1, pool_std: float | None = None) -> dict:
-    """Deflated Sharpe Ratio 单因子 p（Bailey & López de Prado 2014，H.L.Z 精神）。
+def _tail_aligned_corr(sa: list | None, sb: list | None,
+                       min_overlap: int = 20) -> float | None:
+    """尾对齐 IC 相关（v3 F1 修复）：可测必测，缺证据才保守。
 
-    对 IC 序列做偏度/峰度校正的 t 统计，并按「已试过 n_trials 个假设」的
-    期望最大 null Sharpe 折减——同一因子试得越多，门槛自动越高。
-    n_trials=1 时无多重检验惩罚（退化为校正 t 检验）。
+    v2 按 sketch **长度**分组测相关——长度=序列长度随回看窗变化（41~85
+    点、18 种长度），2701 对里只实测 275 对（10.2%），2426 对被静默置
+    独立。IC 序列共享同一 train 窗口，尾部天然对齐：取尾部 min(la,lb)
+    重叠段实测。重叠 < min_overlap（短窗口噪声相关不可信）→ None
+    （调用方按独立计——独立是 E[max|X|] 的最贵假设，缺证据=保守）。"""
+    if not isinstance(sa, (list, tuple)) or not isinstance(sb, (list, tuple)):
+        return None
+    k = min(len(sa), len(sb))
+    if k < min_overlap:
+        return None
+    a = np.asarray(sa[-k:], dtype=np.float64)
+    b = np.asarray(sb[-k:], dtype=np.float64)
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return None
+    sa_, sb_ = a.std(ddof=1), b.std(ddof=1)
+    if sa_ <= 0 or sb_ <= 0:
+        return None
+    return float(np.mean((a - a.mean()) * (b - b.mean())) / (sa_ * sb_))
 
-    n_trials 接受浮点（2026-08-19 A2）：bridge 传入簇聚类口径的 N_eff
-    （Σ_簇 [1+(m_c-1)(1-ρ̄_c)]），不再是整数计数。
 
-    2026-08-18 生产审计修正（尺度 bug）：sr0 = √(2 ln N) 与 IC_IR（per-obs
-    Sharpe）不同尺度——直接比较导致 N>1 时惩罚全灭（p=1.0）、N=1 时零惩罚。
-    B-LP 标准式需乘池分布尺度：SR0 = √V[SR] · [(1-γ)Φ⁻¹(1-1/N) + γΦ⁻¹(1-1/(N·e))]。
-    pool_std = 已试假设 SR 分布的 std（bridge 从 trail_engine 实测 IC_IR 或
-    null 地形分位数估计传入）。N>1 且无 pool_std 时拒绝给 p（不给不可信数字）。
+class _LuckSampler:
+    """选择运气采样器（v3 2026-08-21）：E[max|X|] 直算。
+
+    X ~ N(0, R)，R = trail 试验 IC 相关矩阵（尾对齐 |ρ| 全对实测，
+    缺测对 → 跨 horizon 先验 → 0）。bar_sigma = E[max_i |X_i|]（σ 单位）。
+
+    实现：公共随机数（CRN）——Z 列独立固定种子，条件采样增列
+    x_new = X@v + √s·z（v=R⁻¹r，s=1−rᵀv）。旧列不动、加试验只多一个
+    |x| 候选 → E[max|X|] 估计量**天然单调不减**（定理，非补丁：superset
+    的逐点 max ≥ subset）。增量 O(M²)，重启 rebuild O(M³+K·M²)，
+    M≤千级秒级完成（K=2 万抽样亚秒）。
+
+    附带产出（同一份状态，零额外成本）：
+    - p_fw(z) = P(max|X| ≥ z)：精确族错误 p（高斯模型下的诊断字段，
+      不带偏度/峰度校正——主门仍走 t-stat 路径）
+    - nu_telemetry()：νᵢ = 1/diag(R⁻¹)ᵢ（试验 i 的残差方差占比——
+      它的 IC 里有多大比例不能被其余试验解释。「独立试验个数」不是
+      良定义量；ν 是关系属性：同一因子在空 trail 里 ν=1，混在 74 个
+      亲戚中间 ν≈0。中位 ν / ν>0.5 计数是探索多样性的遥测）。
+    """
+
+    K = 20_000
+    SEED = 42
+
+    def __init__(self):
+        self._keys: list = []
+        self._sig: list = []                # 每 key 的 sketch 指纹（None=pending）
+        self._R: np.ndarray | None = None
+        self._Rinv: np.ndarray | None = None
+        self._X: np.ndarray | None = None   # (K, M) 样本
+        self._mx: np.ndarray | None = None  # (K,) 逐样本 max|X|
+
+    # ---- Z 列独立固定种子（可扩展：增列不扰动旧列 → 单调性成立） ----
+    @staticmethod
+    def _z_col(j: int, k: int) -> np.ndarray:
+        return np.random.default_rng(_LuckSampler.SEED + 1000 * (j + 1)).standard_normal(k)
+
+    def _build_R(self, trials: dict, prior_fn=None) -> np.ndarray:
+        """R：对角 1；尾对齐 |ρ| 全对实测；缺测对 → prior_fn(i,j) → 0。"""
+        keys = list(trials)
+        M = len(keys)
+        R = np.eye(M)
+        for i in range(M):
+            for j in range(i + 1, M):
+                c = _tail_aligned_corr(trials[keys[i]], trials[keys[j]])
+                if c is None and prior_fn is not None:
+                    p = prior_fn(keys[i], keys[j])
+                    c = float(p) if isinstance(p, (int, float)) else None
+                if c is not None and np.isfinite(c):
+                    R[i, j] = R[j, i] = abs(c)
+        return R
+
+    @staticmethod
+    def _sig_of(s) -> tuple | None:
+        """sketch 指纹（可哈希）；None/pending → None。"""
+        if not isinstance(s, (list, tuple)):
+            return None
+        return tuple(s)
+
+    def _rebuild(self, trials: dict, prior_fn=None) -> None:
+        """全量重建：PSD 投影（特征值 clip）→ Cholesky → X = Z@Aᵀ。"""
+        keys = list(trials)
+        M = len(keys)
+        self._keys = keys
+        self._sig = [self._sig_of(trials[k]) for k in keys]
+        if M == 0:
+            self._R = self._Rinv = self._X = self._mx = None
+            return
+        R = self._build_R(trials, prior_fn)
+        w, V = np.linalg.eigh(R)
+        w = np.clip(w, 1e-8, None)  # PSD 投影（|ρ| 组装可能非 PD）
+        A = V * np.sqrt(w)
+        Z = np.column_stack([self._z_col(j, self.K) for j in range(M)])
+        self._R = R
+        self._Rinv = (V / w) @ V.T
+        self._X = Z @ A.T
+        self._mx = np.abs(self._X).max(axis=1)
+
+    def _extend(self, new_key, r: np.ndarray, Rinv: np.ndarray,
+                sig: tuple | None = None) -> bool:
+        """条件采样增列（O(M²)）：失败（非 PD 增长）返回 False → 上层 rebuild。"""
+        v = Rinv @ r
+        s = 1.0 - float(r @ v)
+        if s <= 1e-8:
+            return False
+        x_new = self._X @ v + math.sqrt(s) * self._z_col(len(self._keys), self.K)
+        # R⁻¹ 块扩展：[[R⁻¹+vvᵀ/s, −v/s], [−vᵀ/s, 1/s]]
+        M = len(self._keys)
+        Rinv_new = np.empty((M + 1, M + 1))
+        Rinv_new[:M, :M] = Rinv + np.outer(v, v) / s
+        Rinv_new[:M, M] = Rinv_new[M, :M] = -v / s
+        Rinv_new[M, M] = 1.0 / s
+        R_new = np.empty((M + 1, M + 1))
+        R_new[:M, :M] = self._R
+        R_new[:M, M] = R_new[M, :M] = r
+        R_new[M, M] = 1.0
+        self._keys = self._keys + [new_key]
+        self._sig = self._sig + [sig]
+        self._R, self._Rinv = R_new, Rinv_new
+        self._X = np.column_stack([self._X, x_new])
+        self._mx = np.maximum(self._mx, np.abs(x_new))
+        return True
+
+    def _pop_last(self) -> None:
+        """弹出最后一列（O(M²)）：X 截列（高斯边缘分布不变）；
+        Rinv 用 marginal precision 恢复：R11⁻¹ = P11 − p12p12ᵀ/p22。"""
+        M = len(self._keys)
+        if M == 0:
+            return
+        i = M - 1
+        P = self._Rinv
+        p22 = float(P[i, i])
+        if p22 > 1e-12:
+            P11 = P[:i, :i] - np.outer(P[:i, i], P[:i, i]) / p22
+        else:  # 数值兜底（理论不达：对角元 ≥ 1/diag(R) > 0）
+            P11 = np.linalg.inv(self._R[:i, :i]) if i > 0 else np.zeros((0, 0))
+        self._keys = self._keys[:-1]
+        self._sig = self._sig[:-1]
+        self._R = self._R[:i, :i] if i > 0 else None
+        self._Rinv = P11 if i > 0 else None
+        self._X = self._X[:, :i] if i > 0 else None
+        if self._X is not None and self._X.shape[1] > 0:
+            self._mx = np.abs(self._X).max(axis=1)
+        else:
+            self._mx = None
+
+    def sync(self, trials: dict, prior_fn=None) -> None:
+        """对齐试验集（增量优先，分歧全量重建）。
+
+        实际调用模式两类（都不触发重建）：
+        - 单因子循环：provisional（尾部 +1 pending）→ 写盘转正（尾部 pop
+          后按实测相关重新条件采样）
+        - batch：M 个新 key 一次性追加（逐个条件采样）
+        分歧（key 重排/删除/中间 sketch 变化）或非 PD 增长 → 全量重建。
+        """
+        keys = list(trials)
+        if not keys:
+            self._keys, self._sig = [], []
+            self._R = self._Rinv = self._X = self._mx = None
+            return
+        if self._X is None or not self._keys:
+            self._rebuild(trials, prior_fn)
+            return
+        if keys[:len(self._keys)] != self._keys:
+            self._rebuild(trials, prior_fn)
+            return
+        new_sig = [self._sig_of(trials[k]) for k in keys]
+        # 尾部 pending 转正：旧尾部 sig=None 的列弹出后按新状态重加
+        n_old = len(self._keys)
+        while (n_old > 0 and self._sig[n_old - 1] is None
+               and n_old <= len(keys) and keys[n_old - 1] == self._keys[n_old - 1]):
+            self._pop_last()
+            n_old -= 1
+        if keys[:n_old] != self._keys or new_sig[:n_old] != self._sig:
+            self._rebuild(trials, prior_fn)
+            return
+        # pending 全弹出后状态为空（首条 trail：唯一旧列即 pending）→
+        # 追加循环拿 None Rinv 会崩（盖章 try/except 吞掉 → 首条静默无章）。
+        if not self._keys:
+            self._rebuild(trials, prior_fn)
+            return
+        # 纯追加：新 keys 逐个条件采样（r 用尾对齐实测 + 先验兜底）
+        for j in range(n_old, len(keys)):
+            r = np.zeros(len(self._keys))
+            for i, k in enumerate(self._keys):
+                c = _tail_aligned_corr(trials[k], trials[keys[j]])
+                if c is None and prior_fn is not None:
+                    p = prior_fn(k, keys[j])
+                    c = float(p) if isinstance(p, (int, float)) else None
+                if c is not None and np.isfinite(c):
+                    r[i] = abs(c)
+            if not self._extend(keys[j], r, self._Rinv, sig=new_sig[j]):
+                self._rebuild(trials, prior_fn)
+                return
+
+    def bar_sigma(self) -> float:
+        """E[max|X|]（σ 单位）。M=0 → 0；M=1 → E|Z|=√(2/π)≈0.798
+        （连符号都是选出来的——冷启动即有选运底价）。"""
+        if self._mx is None or len(self._mx) == 0:
+            return 0.0
+        return float(self._mx.mean())
+
+    def p_fw(self, z: float) -> float | None:
+        """精确族错误 p：P(max|X| ≥ z)（诊断字段，非门）。"""
+        if self._mx is None or len(self._mx) == 0:
+            return None
+        try:
+            z = float(z)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(z):
+            return None
+        return float((self._mx >= z).mean())
+
+    def nu_telemetry(self) -> dict | None:
+        """ν 遥测：每试验残差方差占比 νᵢ=1/diag(R⁻¹)ᵢ。"""
+        if self._Rinv is None or self._Rinv.shape[0] == 0:
+            return None
+        d = np.clip(np.diag(self._Rinv), 1.0, None)
+        nu = 1.0 / d
+        return {"min": float(nu.min()), "median": float(np.median(nu)),
+                "high_count": int((nu > 0.5).sum()), "M": int(nu.shape[0])}
+
+
+def _deflated_sharpe_p(ic_series, bar_sigma: float | None = None,
+                       pool_std: float | None = None,
+                       n_trials: float = 1) -> dict:
+    """Deflated Sharpe Ratio 单因子 p（v3 2026-08-21：bar_sigma 口径）。
+
+    对 IC 序列做偏度/峰度校正的 t 统计，并按「选择运气 bar」折减——
+    sr0 = bar_sigma·pool_std（E[max|X|]，见 _LuckSampler）。同一批假设
+    试得越多、族内越独立，bar 越高，门槛自动越高。
+
+    - bar_sigma（门参数）：bridge 从 trail_engine 的试验相关矩阵直算注入；
+      None/0 = 直调单检验口径（无选择折减——选择折减是 bridge 层职责，
+      引擎侧硬统计，不依赖 agent 自觉）。
+    - n_trials：纯遥测（试验计数 M），不参与门——v2 的谱 N_eff→B-LP 链条
+      退役（三处失真见 _dsr_sr0 docstring）。
+    - pool_std：已试假设 IC_IR 分布的 std（bridge 从 trail_engine 实测或
+      null 地形分位数估计传入）。bar_sigma>0 而无 pool_std → 拒绝给 p
+      （不给不可信数字）。
     """
     ic = ic_series.dropna()
     n = len(ic)
@@ -428,16 +681,14 @@ def _deflated_sharpe_p(ic_series, n_trials: float = 1, pool_std: float | None = 
     sr = float(ic.mean() / ic.std(ddof=1))
     g3 = float(((ic - ic.mean()) ** 3).mean() / max(ic.std(ddof=1) ** 3, 1e-18))
     g4 = float(((ic - ic.mean()) ** 4).mean() / max(ic.std(ddof=1) ** 4, 1e-18))
-    # 期望最大 null SR（N 次独立试验，B-LP 2014 式 4）：公式见 _dsr_sr0
-    # N=1 无惩罚；N>1 必须有 pool_std（池内 SR 分布尺度）——无尺度则拒绝给 p。
-    sr0, scale_note = _dsr_sr0(n_trials, pool_std)
+    sr0, scale_note = _dsr_sr0(bar_sigma, pool_std)
     if sr0 is None:
         return {"p": None, "n_trials": float(n_trials), "n_obs": n, "sr_hat": sr,
                 "skew": g3, "kurt": g4, "sr0": None,
                 "note": scale_note}
-    p = _dsr_p_from_stats(sr, g3, g4, n, n_trials, pool_std)
+    p = _dsr_p_from_stats(sr, g3, g4, n, bar_sigma, pool_std)
     return {"p": p, "n_trials": float(n_trials), "n_eff": float(n_trials),
-            "n_obs": n,
+            "n_obs": n, "bar_sigma": float(bar_sigma) if bar_sigma else 0.0,
             "sr_hat": sr, "sr0": sr0, "skew": g3, "kurt": g4,
             "pool_std": float(pool_std) if pool_std else None,
             "scale_note": scale_note}
@@ -510,7 +761,8 @@ def _env_horizon_view(env, horizon):
 
 
 def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
-             pool_std: float | None = None, horizon=None):
+             pool_std: float | None = None, horizon=None,
+             bar_sigma: float | None = None):
     env = _env_horizon_view(env, horizon)
     F = np.asarray(F, dtype=np.float64)
     if F.shape != (env.T, env.N):
@@ -554,8 +806,9 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
 
     # 纪律层（discipline）：deflated p + 分界敏感性 + RED_FLAG + 结构化 verdict
     from ..discipline import red_flags_and_verdict
-    result["deflated_train"] = _deflated_sharpe_p(train_sig, n_trials=n_trials,
-                                                  pool_std=pool_std)
+    result["deflated_train"] = _deflated_sharpe_p(train_sig, bar_sigma=bar_sigma,
+                                                  pool_std=pool_std,
+                                                  n_trials=n_trials)
     # A2（2026-08-19 trail 级 N_eff）：train 区 IC 序列挂到结果——bridge 摘出
     # 存 trail_engine 的 ic_series_sketch（同族参数变体的 IC 序列高度相关，
     # 是簇聚类的好代理），不进 agent 可见返回 / registry。
@@ -747,7 +1000,7 @@ def _sample_signal_days(F_dict, env):
     return out
 
 
-def evaluate_batch(F_dict, env, train_end=None, horizon=None):
+def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
     train_end = train_end or env.calibration.dev_end
     names = list(F_dict.keys())
     M = len(names)
@@ -774,16 +1027,42 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None):
     else:
         rho_bar = 0.0
 
-    N_eff = 1.0 + (M - 1) * (1.0 - rho_bar) if M >= 2 else 1.0
+    # v3（2026-08-21）批内族口径统一 E[max|X|]：批成员的 train IC 序列
+    # 尾对齐构建 R（与 trail 门控同一数学、同一采样器）——替代
+    # N_eff=1+(M-1)(1-ρ̄) 幂校正。同族变体（|ρ|≈0.9 的参数扫描）的
+    # 族内选择运气由 max|X| 直接计价，不再经"有效个数"中转。
+    sketches = {}
+    for n in names:
+        s = factors[n].get("ic_series_train")
+        if isinstance(s, (list, tuple)) and len(s) >= 5:
+            sketches[n] = s
+    sampler = _LuckSampler()
+    sampler.sync(sketches)
+    bar_sigma_b = sampler.bar_sigma()
+    # 谱 M_eff 保留为遥测（v2 字段语义：批内有效假设数的量级感）
+    if M >= 2 and sampler._R is not None:
+        w = np.linalg.eigvalsh(sampler._R)
+        w = np.clip(w, 0.0, None)
+        m_eff = float(w.sum() ** 2 / max((w ** 2).sum(), 1e-18))
+    else:
+        m_eff = float(M)
 
     deflated = {}
     for n in names:
         p = p_single[n]
-        if np.isfinite(p):
-            dp = 1.0 - (1.0 - p) ** N_eff
-            deflated[n] = {"p_single": float(p), "deflated_p": float(dp), "survives": bool(dp < 0.05)}
-        else:
-            deflated[n] = {"p_single": None, "deflated_p": None, "survives": False}
+        dp_stats = factors[n].get("deflated_train") or {}
+        dp = None
+        if dp_stats.get("sr_hat") is not None:
+            dp = _dsr_p_from_stats(dp_stats.get("sr_hat"), dp_stats.get("skew"),
+                                   dp_stats.get("kurt"), dp_stats.get("n_obs"),
+                                   bar_sigma_b, pool_std)
+        if dp is not None:
+            factors[n]["deflated_train"] = {**dp_stats, "p": dp,
+                                            "bar_sigma": bar_sigma_b,
+                                            "pool_std": pool_std,
+                                            "recomputed_at_batch_family": True}
+        deflated[n] = {"p_single": float(p) if np.isfinite(p) else None,
+                       "deflated_p": dp, "survives": bool(dp is not None and dp < 0.05)}
 
     best_name = None
     best_ic_ir = -np.inf
@@ -798,7 +1077,8 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None):
         "batch": {
             "M": M,
             "rho_bar": rho_bar,
-            "N_eff": N_eff,
+            "N_eff": m_eff,
+            "bar_sigma": bar_sigma_b,
             "deflated": deflated,
             "best_name": best_name,
             "best_ic_ir": float(best_ic_ir) if np.isfinite(best_ic_ir) else None,
@@ -823,11 +1103,13 @@ def passes_acceptance(result, z_threshold=3.0, beta_threshold=0.3, min_n=20, alp
         return False, f"样本不足 n={ic_n} < {min_n}"
     # 多重检验门控（2026-08-18 复核补全）：deflated p 是入册硬门——
     # 不显著 = 选择运气不可排除。此前 z≥3 的不显著因子照样 accepted=True。
+    # v3（2026-08-21）：bar_sigma>0（含 M=1 的 E|Z| 底价）都需 pool_std——
+    # p=None 一律拒绝，N=1 豁免取消（符号选择也是选择，trail 实证）。
     dp = result.get("deflated_train") or {}
     p, n_trials = dp.get("p"), dp.get("n_trials") or 1
-    if p is None and isinstance(n_trials, (int, float)) and n_trials > 1:
-        return False, (f"N={n_trials:.0f} 缺池分布基线（trail<10 且未 null 校准），"
-                       "deflated p 不可算——先跑 null-calibration")
+    if p is None:
+        return False, ("deflated p 不可算（缺池分布基线或样本不足）——"
+                       "先跑 null-calibration 建 pool_std 基线")
     if isinstance(p, (int, float)) and p > alpha:
         return False, (f"deflated p={p:.4f} > {alpha}（{n_trials:.0f} 次已试假设的"
                        "多重检验校正下不显著——选择运气不可排除）")

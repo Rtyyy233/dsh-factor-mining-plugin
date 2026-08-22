@@ -168,6 +168,12 @@ def test_registry_submit_decoupled():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         bridge, _ = _make_bridge(root)
+        # v3（2026-08-21）：冷启动即有选运底价（M=1 → E|Z|≈0.798），deflated
+        # 门需 pool_std 基线——先跑 null 校准供基线。submit 本身仍不执行
+        # factor/不编译/不评估（去耦合语义不变）。
+        bridge.dispatch("data.load", {"envId": "primary"})
+        bridge.dispatch("factor.random_generate",
+                        {"envId": "primary", "mode": "null-calibration", "n": 5})
         diagnosis = {"ic_ir_train": 0.25, "column_perm_train": {"z": 4.0, "p": 0.0001},
                      "beta_exposure": 0.1, "ic_n_train": 50,
                      "deflated_train": {"p": 0.001, "n_trials": 1,
