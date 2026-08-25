@@ -62,6 +62,51 @@ export interface DataConfigReport extends JsonRecord {
   environments?: string[]
 }
 
+/** Overfitting hard-gate request: factor on synthetic random-noise worlds. */
+export interface NoiseTestRequest {
+  envId?: string
+  source: string
+  m?: number
+  seed?: number
+}
+
+/** Noise-world IC_IR distribution + artifact verdict (Python owns details). */
+export interface NoiseTestResult extends JsonRecord {
+  m?: number
+  n_valid?: number
+  mean?: number
+  std?: number
+  z?: number
+  artifact?: boolean
+  gate?: string
+  seed?: number
+}
+
+/** Day-permutation null request: exact temporal-alignment null on real data. */
+export interface DayPermTestRequest {
+  envId?: string
+  source: string
+  m?: number
+  seed?: number
+}
+
+/** Day-permutation null distribution + alignment_dependent annotation
+ *  (report-only; gate direction calibrated later — Python owns details). */
+export interface DayPermTestResult extends JsonRecord {
+  m?: number
+  n_valid?: number
+  observed?: number
+  null_mean?: number
+  null_std?: number
+  obs_percentile?: number
+  p_upper?: number
+  p_lower?: number
+  p_two?: number
+  alignment_dependent?: boolean
+  gate?: string
+  seed?: number
+}
+
 /** Result of writing a user data configuration. */
 export interface DataConfigWriteResult extends JsonRecord {
   ok?: boolean
@@ -250,6 +295,10 @@ export interface RegistrySubmitRequest extends FactorSourceRequest {
    * iron-rule duplicate check and red_flags gate all run against it. Pass the evaluate
    * result verbatim — fabricated numbers are downgraded to verified:false. */
   diagnosis?: JsonRecord
+  /** Parameter declaration for the submit-time flatness check:
+   * [{name, value, step}] — every tunable numeric literal of the source.
+   * A declared value not present in the source aborts the transaction. */
+  flatness_params?: unknown
 }
 
 /** Registry update request — descriptive fields only (signal/note).
@@ -272,6 +321,8 @@ export interface ArxivSearchRequest {
   query: string
   max_results?: number
   category?: string
+  /** Pagination offset for deep walks of the same query. */
+  start?: number
 }
 
 /** Random-factor generation request (seed generator). */

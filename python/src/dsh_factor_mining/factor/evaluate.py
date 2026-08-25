@@ -760,6 +760,30 @@ def _env_horizon_view(env, horizon):
     return view
 
 
+def _date_shift_placebo(F, fwd, pit, env, shifts=(5, 10, 21)):
+    """date-shift placebo（2026-08-24 用户认可的过拟合检验）：
+
+    因子矩阵整体后移 k 个 bar（今天的信号 = k 天前的信号），截面排序
+    保留、时间对齐破坏。真因子的 IC 应随 shift 崩向 0；shift 后仍
+    显著 = 因子在拟合慢变量与市场 regime 的巧合（截面置换测不到的
+    伪相关通道——它破坏截面关联，这里破坏时间对齐）。"""
+    out = {}
+    T = F.shape[0]
+    base = None
+    ic0 = _cross_sectional_ic(F, fwd, pit, env, sig_only=True)
+    if len(ic0) >= 2:
+        base = float(ic0.mean())
+    for k in shifts:
+        if k >= T:
+            continue
+        Fs = np.full_like(F, np.nan)
+        Fs[k:] = F[:-k]
+        ic_k = _cross_sectional_ic(Fs, fwd, pit, env, sig_only=True)
+        out[str(k)] = (float(ic_k.mean())
+                       if len(ic_k) >= 2 else None)
+    return {"unshifted_mean_ic": base, "shifted_mean_ic": out}
+
+
 def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
              pool_std: float | None = None, horizon=None,
              bar_sigma: float | None = None):
@@ -796,6 +820,7 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
                                                 real_ic=train_sig),
         "rolling_ic_stability_train": _rolling_ic_stability(train_sig),
         "decay_train": _decay_diagnostics(train_sig),
+        "date_shift": _date_shift_placebo(F, fwd, pit, env),
         "beta_exposure": _beta_exposure(F, env),
         "topn": None,
     }
@@ -803,6 +828,15 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
     topn_train = _top_n_excess(F, fwd, pit, env, t0=0, t1=t_end)
     if len(topn_train) > 0:
         result["topn"] = _summarize_topn(topn_train, env)
+
+    # 尾部三件套计算层（2026-08-25 用户批准设计）：自动计算 = 自动计数
+    # （Phase 5 tail 账本据此累计，堵可选停时）；train 区、只 top 侧；
+    # 本层只标注不门，失败不阻断评估主结果。
+    try:
+        from .tail import tail_metrics
+        result["tail"] = tail_metrics(F, env)
+    except Exception as _te:
+        result["tail"] = {"error": f"{type(_te).__name__}: {_te}"[:120]}
 
     # 纪律层（discipline）：deflated p + 分界敏感性 + RED_FLAG + 结构化 verdict
     from ..discipline import red_flags_and_verdict

@@ -10,16 +10,28 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
 import type { FactorMiningService, JsonRecord, OperatorsRequest, StateResetRequest } from '@deepseek-ai/dsh-factor-mining'
 import type {} from '@deepseek-ai/dsh-factor-mining'
+import { applyDrive } from './drive.ts'
 
 export const name = 'tool-factor-mining'
 export const inject = ['tools', 'factorMining']
 
 export interface Config {
   enableArxivSearch?: boolean
+  /** Turn-boundary auto-drive injector (2026-08-24): on a completed turn of a
+   * factor_* session, inject the engine's strategy directive as a user-role
+   * followup after a quiet window. */
+  enableDrive?: boolean
+  /** Quiet window between turn end and injection (ms, default 60s). */
+  driveDelayMs?: number
+  /** Max consecutive `continue` injections before yielding (default 5). */
+  driveMaxConsecutiveSimple?: number
 }
 
 export const Config: z<Config> = z.object({
   enableArxivSearch: z.boolean().default(false),
+  enableDrive: z.boolean().default(true),
+  driveDelayMs: z.number().default(60_000),
+  driveMaxConsecutiveSimple: z.number().default(5),
 })
 
 const JSON_RENDER = (_args: unknown, value: unknown) => [{
@@ -59,6 +71,17 @@ function jsonRecord(value: unknown, field: string): Record<string, unknown> {
 
 export function apply(ctx: Context, config: Config): void {
   const service = ctx.factorMining as FactorMiningService
+
+  // Turn-boundary auto-drive (2026-08-24): mechanical replacement for the
+  // user's 31 manual pushes. Enabled by default; see drive.ts for guardrails.
+  if (config.enableDrive !== false) {
+    applyDrive(ctx, service, {
+      ...config.driveDelayMs !== undefined ? { delayMs: config.driveDelayMs } : {},
+      ...config.driveMaxConsecutiveSimple !== undefined
+        ? { maxConsecutiveSimple: config.driveMaxConsecutiveSimple }
+        : {},
+    })
+  }
 
   ctx.tools.register(defineTool({
     name: 'factor_status',
@@ -199,6 +222,46 @@ export function apply(ctx: Context, config: Config): void {
         ...args.n_folds !== undefined ? { n_folds: args.n_folds } : {},
         ...args.t0_date !== undefined ? { t0_date: args.t0_date } : {},
         ...args.t1_date !== undefined ? { t1_date: args.t1_date } : {},
+      }))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'factor_noise_test',
+    description: 'Overfitting hard gate (2026-08-24): the factor\'s direct performance on M synthetic random-noise worlds (per-asset vol-matched Gaussian random-walk OHLCV; PIT mask/calendar preserved). A genuine alpha cannot predict noise by construction — systematic IC across noise worlds (|z| >= 3) means the factor formula is fitting an evaluation artifact and is unconditionally rejected at submit. Returns the full IC_IR distribution (mean/std/quantiles/z), not just a verdict.',
+    parameters: {
+      envId: { type: 'string', description: 'Environment id; defaults to primary.' },
+      source: { type: 'string', required: true, description: 'Python factor source defining def factor(env).' },
+      m: { type: 'integer', description: 'Number of noise worlds (default 100, cap 300).' },
+      seed: { type: 'integer', description: 'Base seed; defaults to one derived from the environment fingerprint (reproducible).' },
+    },
+    output: { schema: { type: 'json' }, render: JSON_RENDER },
+    async execute(args) {
+      return json(service.noiseTest({
+        envId: args.envId ?? 'primary',
+        source: args.source,
+        ...args.m !== undefined ? { m: args.m } : {},
+        ...args.seed !== undefined ? { seed: args.seed } : {},
+      }))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'factor_day_perm_test',
+    description: 'Exact temporal-alignment null on REAL data (2026-08-25): keeps both marginals real (factor cross-sections AND return cross-sections, all market structure preserved) and randomly re-pairs their timelines — the temporal twin of the in-evaluate column permutation. Small p_two (alignment_dependent=true) = the factor\'s performance depends on precise time alignment — the union of genuine short-horizon factors and timing-specific overfitting, indistinguishable in-sample; large p_two = persistent-tilt structure dominates (a legitimate cross-sectional form certified by column-perm). REPORT-ONLY at submit (no rejection): gate direction is set by calibration on known-good vs falsified factors. Returns observed statistic vs the full permutation null (quantiles, p_upper/p_lower/p_two, percentile).',
+    parameters: {
+      envId: { type: 'string', description: 'Environment id; defaults to primary.' },
+      source: { type: 'string', required: true, description: 'Python factor source defining def factor(env).' },
+      m: { type: 'integer', description: 'Number of random pairings (default 200, cap 500).' },
+      seed: { type: 'integer', description: 'Base seed; defaults to one derived from the environment fingerprint (reproducible).' },
+    },
+    output: { schema: { type: 'json' }, render: JSON_RENDER },
+    async execute(args) {
+      return json(service.dayPermTest({
+        envId: args.envId ?? 'primary',
+        source: args.source,
+        ...args.m !== undefined ? { m: args.m } : {},
+        ...args.seed !== undefined ? { seed: args.seed } : {},
       }))
     },
   }))
@@ -366,13 +429,15 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_registry_submit',
-    description: 'Evaluate one candidate against acceptance criteria and submit it to the user registry. IMPORTANT: pass the FULL factor_evaluate result as `diagnosis` — the bridge verifies a receipt inside it (fabricated numbers are rejected/downgraded), applies the iron rule (same source cannot be re-registered under a new name, and the same NAME cannot be submitted twice — duplicate submissions are rejected) and refuses red-flagged results. To fix a description later, use factor_registry_update instead of re-submitting.',
+    description: 'Evaluate one candidate against acceptance criteria and submit it to the user registry. IMPORTANT: pass the FULL factor_evaluate result as `diagnosis` — the bridge verifies a receipt inside it (fabricated numbers are rejected/downgraded), applies the iron rule (same source cannot be re-registered under a new name, and the same NAME cannot be submitted twice — duplicate submissions are rejected) and refuses red-flagged results. To fix a description later, use factor_registry_update instead of re-submitting. At submit the engine runs three overfitting gates autonomously: noise worlds (|z|>=3 rejects), day-permutation temporal null (report-only), and parameter-flatness over declared params (report-only). Declare ALL tunable numeric literals of the source in flatness_params — a declared value not present in the source aborts the transaction.',
     parameters: {
       envId: { type: 'string', description: 'Environment id; defaults to primary.' },
       source: { type: 'string', required: true, description: 'Python factor source.' },
       name: { type: 'string', description: 'Candidate name.' },
       signal: { type: 'string', description: 'Human-readable precise factor definition.' },
       diagnosis: { type: 'json', description: 'The complete factor_evaluate diagnosis object, passed through verbatim from the evaluate call you are registering. Required — submissions without it are rejected.' },
+      flatness_params: { type: 'json', description: 'Parameter declaration for the flatness check: [{name, value, step}] — every tunable numeric literal of the source (window lengths, thresholds, weights; NOT structural constants like 252 annualization). value must appear as a numeric literal in the source (mismatch aborts); step is the minimal meaningful step (window 10 -> 1, weight 0.65 -> 0.05). Omit entirely for genuinely parameter-free factors.' },
+      admit_basis: { type: 'string', description: 'Admission track: "ic" (default, the IC_IR chain) or "tail" (the tail-spread chain for factors whose top-K group return is strong even with mediocre full IC — requires the auto-computed tail block from factor_evaluate; gates: top-N placebo z>=3, spread noise-gate |z|<3, selection-Jaccard N_eff deflation with cross-track Sidak alpha).', enum: ['ic', 'tail'] },
     },
     output: { schema: { type: 'json' }, render: JSON_RENDER },
     async execute(args) {
@@ -382,6 +447,8 @@ export function apply(ctx: Context, config: Config): void {
         ...args.name !== undefined ? { name: args.name } : {},
         ...args.signal !== undefined ? { signal: args.signal } : {},
         ...args.diagnosis !== undefined ? { diagnosis: jsonRecord(args.diagnosis, 'diagnosis') as JsonRecord } : {},
+        ...args.flatness_params !== undefined ? { flatness_params: args.flatness_params } : {},
+        ...args.admit_basis !== undefined ? { admit_basis: args.admit_basis } : {},
       }))
     },
   }))
@@ -407,16 +474,22 @@ export function apply(ctx: Context, config: Config): void {
   if (config.enableArxivSearch) {
     ctx.tools.register(defineTool({
       name: 'factor_arxiv_search',
-      description: 'Search arxiv for methodology papers (mathematical structure + finance/time series), not for profitable factors.',
+      description: 'Search arxiv for methodology papers (q-fin categories by default; results are deduplicated against the paper ledger — seen papers carry seen_before and yield slots to fresh ones, exhausted papers are excluded). Returns {query, results[], fresh, ledger}. Use the engine seed query from loop.strategy when present; cite the arxiv_ids you actually used in the trail entry\'s papers field.',
       parameters: {
         query: { type: 'string', required: true, description: 'Methodology query.' },
-        max_results: { type: 'integer', description: 'Maximum results (default 10).' },
-        category: { type: 'string', description: 'Optional arxiv category.' },
+        max_results: { type: 'integer', description: 'Maximum results (default 10, cap 25).' },
+        category: { type: 'string', description: 'Optional explicit arxiv category (e.g. q-fin.ST). Omit for the default q-fin OR-chain filter.' },
+        start: { type: 'integer', description: 'Pagination offset (0-based) for deep walks of the same query instead of re-hitting the top-N.' },
       },
       output: { schema: { type: 'json' }, render: JSON_RENDER },
       async execute(args) {
         if (service.arxivSearch === undefined) throw new Error('arxiv search is not provided by the mounted factor-mining service')
-        return json(service.arxivSearch({ query: args.query, ...args.max_results !== undefined ? { max_results: args.max_results } : {}, ...args.category !== undefined ? { category: args.category } : {} }))
+        return json(service.arxivSearch({
+          query: args.query,
+          ...args.max_results !== undefined ? { max_results: args.max_results } : {},
+          ...args.category !== undefined ? { category: args.category } : {},
+          ...args.start !== undefined ? { start: args.start } : {},
+        }))
       },
     }))
   }

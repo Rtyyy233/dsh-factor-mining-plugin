@@ -25,6 +25,8 @@ import type {
   DataLoadRequest,
   DataProbeReport,
   DataProbeRequest,
+  DayPermTestRequest,
+  DayPermTestResult,
   EvaluateRequest,
   FactorDiagnosis,
   FactorMiningStatus,
@@ -33,6 +35,8 @@ import type {
   LibraryQueryResult,
   NullLandscapeRequest,
   NullLandscapeResult,
+  NoiseTestRequest,
+  NoiseTestResult,
   OperatorsRequest,
   OperatorSetResult,
   PathQueryRequest,
@@ -172,6 +176,14 @@ export class FactorMiningPythonService extends FactorMiningService {
 
   async walkForward(request: WalkForwardRequest): Promise<WalkForwardDiagnosis> {
     return await this.client.request('factor.walk_forward', request as unknown as Record<string, unknown>) as WalkForwardDiagnosis
+  }
+
+  async noiseTest(request: NoiseTestRequest): Promise<NoiseTestResult> {
+    return await this.client.request('factor.noise_test', request as unknown as Record<string, unknown>) as NoiseTestResult
+  }
+
+  async dayPermTest(request: DayPermTestRequest): Promise<DayPermTestResult> {
+    return await this.client.request('factor.day_perm_test', request as unknown as Record<string, unknown>) as DayPermTestResult
   }
 
   async audit(request: FactorSourceRequest): Promise<AuditReport> {

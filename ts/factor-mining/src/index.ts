@@ -24,6 +24,8 @@ import type {
   DataLoadRequest,
   DataProbeReport,
   DataProbeRequest,
+  DayPermTestRequest,
+  DayPermTestResult,
   EvaluateRequest,
   FactorDiagnosis,
   FactorMiningStatus,
@@ -32,6 +34,8 @@ import type {
   LibraryQueryResult,
   NullLandscapeRequest,
   NullLandscapeResult,
+  NoiseTestRequest,
+  NoiseTestResult,
   OperatorsRequest,
   OperatorSetResult,
   PathQueryRequest,
@@ -99,6 +103,12 @@ export abstract class FactorMiningService extends Service {
 
   /** Time-ordered walk-forward block robustness. */
   abstract walkForward(request: WalkForwardRequest): Promise<WalkForwardDiagnosis>
+
+  /** Overfitting hard gate: the factor's direct performance on random-noise worlds. */
+  abstract noiseTest(request: NoiseTestRequest): Promise<NoiseTestResult>
+
+  /** Exact temporal-alignment null on real data (report-only diagnostic). */
+  abstract dayPermTest(request: DayPermTestRequest): Promise<DayPermTestResult>
 
   /** Independent two-implementation audit. */
   abstract audit(request: FactorSourceRequest): Promise<AuditReport>

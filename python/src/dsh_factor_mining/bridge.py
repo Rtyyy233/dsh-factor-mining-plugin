@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -53,9 +54,11 @@ from .factor.evaluate import (
 )
 from .library.contract import LibraryError, UserLibrary, query_entries
 from .state import (
+    MINING_CONFIG,
     append_explored,
     append_search_path,
     append_trail,
+    arc_rounds_bump,
     check_termination,
     read_json_list,
     read_mining_state,
@@ -107,6 +110,315 @@ def _as_dict(value: Any, field: str) -> dict[str, Any]:
 
 def _error(code, message, data=None):
     return {"code": code, "message": message, "data": data}
+
+
+def _lossless(value):
+    """dispatch 出口消毒（2026-08-25 factor_trail_summary 事故产品化）：
+
+    DSH 工具框架的 lossless JSON 检查拒绝 NaN/±Infinity/**-0**
+    （walkJsonValue: !Number.isFinite || Object.is(x,-0)）。Python 侧
+    json.dumps 默认把 NaN 写成裸字面量、-0.0 原样写——JS JSON.parse
+    对 -0 不报错但检查击杀（NaN 则 parse 直接炸）。产地实证：
+    ic_series_sketch 的 round(-0.00004,4)=-0.0（生产 trail_engine
+    66 个字面量，last-5 命中 → trail_summary 整体报错）。
+
+    规则：NaN/±Inf → None；-0.0 → +0.0；numpy 标量 → Python 原生
+    （in_process 模式下可能漏出）。响应层兜底，写入口另行归一化。"""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        if value == 0.0:
+            return 0.0  # 归一化 -0.0（含 +0.0 原样）
+        return value
+    if isinstance(value, int):
+        return int(value)
+    try:  # numpy 标量（in_process 防御）
+        import numpy as _np
+        if isinstance(value, _np.generic):
+            return _lossless(value.item())
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {str(k): _lossless(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_lossless(v) for v in value]
+    return value
+
+
+# ---- 穷尽宣告拒收（2026-08-24，session.jsonl 诊断产品化） ----
+# 实测：agent 33 个 turn 里 12 次宣告「因子空间已穷尽/天花板/建议换池子」，
+# 每次被 push 后同一池子又能立刻挖出新因子族（Kyle IC_IR 0.485~0.612）——
+# 12/12 假穷尽。「我的想法队列空了」≠「空间挖尽了」；后者只有机械判据
+# （试验计数 / IC_IR 改善收敛）有资格宣判。停笔宣言混进 next_hypothesis
+# 会被引擎回显背书成状态，所以写入口和回显口都拒收。
+_SURRENDER_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("穷尽", "穷尽宣告——12/12 实测全假，空间是否挖尽只有试验计数和 IC_IR 收敛判据说了算"),
+    ("探索完成", "探索完成宣告——停点仅由引擎机械判据触发"),
+    ("探索结束", "探索结束宣告——停点仅由引擎机械判据触发"),
+    ("探索已达", "探索已达上限宣告——停点仅由引擎机械判据触发"),
+    ("方向已完成", "方向完成宣告——单方向完成不是停点，换假设继续"),
+    ("族已完成", "族完成宣告——单族完成不是停点，换假设继续"),
+    ("家族已完成", "族完成宣告——单族完成不是停点，换假设继续"),
+    ("合成完成", "合成完成宣告——里程碑不是停点，换假设继续"),
+    ("已充分探索", "充分探索宣告——停点仅由引擎机械判据触发"),
+    ("天花板", "天花板宣告——边际是否有收益由 IC_IR 收敛判据机械判定"),
+    ("理论上限", "理论上限宣告——同上，引擎机械判定"),
+    ("理论极限", "理论极限宣告——同上，引擎机械判定"),
+    ("等待用户", "等待用户——挖掘阶段禁止停下来等指示"),
+    ("用户决定", "等用户决定——挖掘阶段禁止"),
+    ("建议用户", "替用户决策——挖掘阶段走法是 agent 自己的事"),
+    ("问用户", "挖掘中途问询被禁止（数据路径冷启动除外）"),
+    ("需要用户", "挖掘阶段不依赖用户输入"),
+    ("换池", "数据集/池轮换是用户操作，不是 agent 假设——随里程碑汇报上报即可"),
+    ("换频率", "数据/频率轮换是用户操作，不是 agent 假设"),
+    ("换数据源", "数据源轮换是用户操作，不是 agent 假设"),
+    ("换数据集", "数据集轮换是用户操作，不是 agent 假设"),
+    ("新数据集", "新数据集是用户操作，不是 agent 假设"),
+    ("新 stateRoot", "stateRoot 轮换是用户操作，不是 agent 假设"),
+    ("新stateRoot", "stateRoot 轮换是用户操作，不是 agent 假设"),
+    ("总结汇报", "总结汇报不是假设——下一轮构造什么、测什么才是"),
+    ("收尾", "收尾不是假设——停点由引擎决定"),
+    ("无法达到", "门槛达不到不是停点——换假设继续，或由 IC_IR 收敛判据机械停"),
+    ("无法通过", "门槛判负不是停点——换假设继续，或由 IC_IR 收敛判据机械停"),
+)
+
+
+def _surrender_match(text: str) -> str | None:
+    """命中停笔宣言 → 返回拒收理由；合法假设 → None。"""
+    for pat, why in _SURRENDER_PATTERNS:
+        if pat in text:
+            return why
+    return None
+
+
+# ---- 成分血缘指纹（2026-08-25 CMF 事故产品化） ----
+# 事故：pw15_compD 合成因子的 IC 序列与 pw15 核心解相关（尾对齐
+# ρ<0.6），家族链断裂 → 引擎误以为 agent 在换方向 → 3/6/9 升级从未
+# 触发，agent 在同一族磨了 10 小时。修复：源码的 MinHash 构造指纹
+# 让同族磨种（共享构造成分）保持链连续——合成=核心+装饰，指纹
+# 重叠度高；真正换方向=全新构造，指纹不重叠。
+
+_FP_N_HASHES = 32
+_FP_SHINGLE_LINES = 2
+_FP_LINEAGE_THRESH = 0.25  # MinHash Jaccard 估计的族归属阈值
+
+
+def _stable_hash(s: str) -> int:
+    """跨进程稳定的 32-bit 哈希（不用内置 hash——PYTHONHASHSEED 每次启动
+    不同，指纹会不可复现）。"""
+    import hashlib
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _construction_fingerprint(source: str) -> list[int]:
+    """源码构造指纹：MinHash 签名（32 个 uint32，~128 字节/条）。
+
+    1. 规范化：去注释行、空行、docstring
+    2. 行对 shingle（连续 2 行）：比单行更稳定（微改一行只影响 2 个
+       shingle），比 3 行更敏感（装饰性改写不该完全遮蔽核心）
+    3. MinHash：32 个确定性通用哈希取 min → Jaccard 估计"""
+    import re as _re
+    # 去 docstring（三引号块）
+    src = _re.sub(r'"""[\s\S]*?"""', "", source)
+    src = _re.sub(r"'''[\s\S]*?'''", "", src)
+    lines = []
+    for ln in src.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        lines.append(s)
+    shingles = []
+    k = _FP_SHINGLE_LINES
+    for i in range(max(len(lines) - k + 1, 1)):
+        sh = "\n".join(lines[i:i + k])
+        shingles.append(_stable_hash(sh))
+    if not shingles:
+        return [0] * _FP_N_HASHES
+    # MinHash：确定性系数（固定种子 → 跨进程可复现）
+    import random as _random
+    rng = _random.Random(20260825)
+    coeffs = [(rng.randrange(1, 2 ** 31), rng.randrange(0, 2 ** 31))
+              for _ in range(_FP_N_HASHES)]
+    return [min(((a * sh + b) % (2 ** 31 - 1)) & 0xFFFFFFFF
+                for sh in shingles) for a, b in coeffs]
+
+
+def _fingerprint_similarity(sig_a: list, sig_b: list) -> float:
+    """MinHash 签名一致率 = Jaccard 的无偏估计。"""
+    if not isinstance(sig_a, list) or not isinstance(sig_b, list) \
+            or len(sig_a) != len(sig_b) or not sig_a:
+        return 0.0
+    return sum(1 for a, b in zip(sig_a, sig_b) if a == b) / len(sig_a)
+
+
+def _entries_linked(a: dict, b: dict) -> bool:
+    """两试验条目是否同族（v5 血缘 + v3 IC 双信号 OR，对称谓词）。
+
+    从 _family_chain 的链内比较提取——链回溯与断链检测（arc 归零）必须
+    用同一判定，否则「streak 断了但 arc 没归零」或反之。任一侧缺信号
+    （无 sketch 且无指纹，如旧条目）→ False（与 _family_chain 的断链
+    语义一致：无信号条目是单例族）。"""
+    def _sketch(e):
+        s = e.get("ic_series_sketch")
+        return s if isinstance(s, (list, tuple)) and len(s) >= 5 else None
+
+    sa, sb = _sketch(a), _sketch(b)
+    if sa is not None and sb is not None:
+        from .factor.evaluate import _tail_aligned_corr
+        c = _tail_aligned_corr(list(sa), list(sb))
+        if c is not None and abs(c) >= 0.6:
+            return True
+    fa, fb = a.get("construction_fp"), b.get("construction_fp")
+    if (isinstance(fa, list) and len(fa) == _FP_N_HASHES
+            and isinstance(fb, list) and len(fb) == _FP_N_HASHES):
+        if _fingerprint_similarity(fa, fb) >= _FP_LINEAGE_THRESH:
+            return True
+    return False
+
+
+# ---- arxiv 文献通道修复（2026-08-24 审计：31% 物理噪声 / 26% 论文级冗余 /
+# 自我词汇回音室 / paper→hypothesis 无溯源） ----
+# F2 类目过滤默认：q-fin 全类目 OR 链。审计中 28/28 次调用裸查全库，
+# cross-section/volume/momentum 等金融词与物理词碰撞返回了角动量/Higgs/
+# 薛定谔方程。除非显式传 category，bridge 层一律注入此过滤。
+_QFIN_CATS = ("q-fin.ST", "q-fin.PM", "q-fin.TR", "q-fin.CE",
+              "q-fin.GN", "q-fin.MF", "q-fin.PR", "q-fin.RM")
+_QFIN_FILTER = "(" + " OR ".join(f"cat:{c}" for c in _QFIN_CATS) + ")"
+
+# F5 查询种子正交化：方法论语域池，与 agent 当前假设词汇解耦——
+# 文献注入的目的恰恰是打破先验，用 agent 自己的词汇做相关性检索
+# 只会强化先验（28 条实测查询全部落在 agent 正卡着的族词汇内）。
+# 按 ledger.searches 计数轮转，不依赖随机数（可复现）。
+_LITERATURE_SEEDS = (
+    "realized skewness kurtosis higher moments cross-sectional returns",
+    "overnight intraday return decomposition predictability",
+    "long memory fractional integration volatility persistence",
+    "copula tail dependence cross-sectional asset returns",
+    "permutation entropy complexity measure financial time series",
+    "regime switching state dependent cross-sectional pricing",
+    "wavelet multi-scale decomposition return forecasting",
+    "extreme value theory cross-sectional tail risk",
+    "calendar seasonality anomalies asset pricing",
+    "network centrality spillover cross-sectional returns",
+    "optimal transport distance return distribution",
+    "realized volatility forecasting har heterogeneity",
+    "jump detection bipower variation cross-section",
+    "option implied information equity returns",
+)
+
+# F4 引用溯源：arxiv_id 归一化（接受完整 URL 或裸 id）
+_ARXIV_ID_RE = re.compile(r"(?:arxiv\.org/abs/)?(abs/)?(\d{4}\.\d{4,5})(v\d+)?$")
+
+
+# ---- 策略指令选择器（2026-08-24：31 次手动 push 的实证策略机械化） ----
+# session.jsonl 全轨迹配对分析（用户 push 类型 × 当时引擎状态）推导的优先级
+# 规则表。设计原则与 v3 停点一致：判断收进引擎，机械信号驱动，散文不参与。
+_STRATEGY_DIRECTIVES = {
+    "continue": ("继续探索：执行上一轮声明的假设；完成后立即记录归因并构造"
+                 "下一轮假设，不要停下来等待指示。"),
+    "refine": ("深挖当前最优因子：分析它的特性与构成（各窗口/算子/信息源"
+               "各自承担了什么），构思补正与强化方法，逐一验证。"),
+    "rotate": ("换一个方向：先用 factor_query_paths 查已试路径避免重复，"
+               "再从一个未覆盖的维度构造新假设并验证。"),
+    "literature": ("从文献找灵感：用 factor_arxiv_search 检索方法论论文"
+                   "（数学结构/微观结构/时间序列建模），提取一个可迁移的"
+                   "构造思路，自己改进后验证。"),
+    "compose": ("做中阶合成：从 trail 中挑已验证但未入册的单因子，构造"
+                "正交组合（目标截面相关 < 0.7），用 factor_evaluate_composite 验证。"),
+    "query": ("正交性审计：计算最近入册因子与既有入册因子的截面相关性，"
+              "确认是否带来增量信息；发现高相关就记录 explored 并构造去重组合。"),
+}
+
+
+def _pick_strategy(*, stop_kind: str | None = None, streak: int,
+                   pending_rejected, frozen: bool, plateau: bool,
+                   pass_unadmitted: int, accepted_n: int, agent_rounds: int,
+                   n_trials: int, lit_search_count: int = 0,
+                   family_marginal: dict | None = None) -> dict | None:
+    """下一轮方向类型选择（纯函数，供注入器与 loop 指令共用）。
+
+    停点分流（2026-08-25 arc 化：方向预算停点不再是静默终态）：
+    - stop_kind ∈ {finalize, convergence, fail_streak} → None（真终态/
+      全局平台，注入器静默——IC 收敛=换方向救不了，交还用户做数据集轮换）
+    - stop_kind == direction_budget（arc/簇上限）→ 强制 rotate/literature
+      （族边际 <-0.10 用 literature），跳过 R3-R8——预算耗尽的方向不允许
+      continue/refine 原地续推；换向断链自动重置预算，注入器照常推进
+    - stop_kind == None（running）→ 常规优先级
+
+    常规优先级（v6 2026-08-25：家族升级改边际收益驱动，删 streak 绝对阈值）：
+    R1 族内边际严重枯竭（marginal < -0.10）→ literature
+    R2 族内边际枯竭（marginal < -0.05）→ rotate
+    R3 streak≥3 且族内平台 plateau → refine（有最优载体+边际枯竭
+       → 深挖载体特性补正强化）
+    R4 pending 被拒收（停笔宣言）→ rotate
+    R5 frozen pending（同一句冻结 ≥2 轮）→ rotate
+    R6 accepted≥3 且为 3 的倍数 → query（里程碑审计）
+    R7 pass 未入册 ≥3 → compose
+    R8 兜底 → continue
+    key：常规类型含 round/n_trials（单调保证新鲜）；query 用 accepted。"""
+    if stop_kind in ("finalize", "convergence", "fail_streak"):
+        return None
+    fam = family_marginal or {}
+    fam_m = fam.get("marginal")
+    fam_ok = fam.get("enough_data") and isinstance(fam_m, (int, float))
+    t = None
+    if stop_kind == "direction_budget":
+        # 方向预算耗尽：族边际决定换向强度；无论边际如何都不允许原地续推
+        if fam_ok and fam_m < -0.10:
+            t = "literature"
+            why = (f"方向段预算耗尽且族内边际严重枯竭（{fam_m:+.3f}）——"
+                   "内生假设源枯竭，必须文献注入后换族")
+        else:
+            t = "rotate"
+            why = "方向段预算耗尽（轮次/簇试验上限）——必须换向，断链后预算自动重置"
+    elif fam_ok and fam_m < -0.10:
+        t = "literature"
+        why = (f"族内边际严重枯竭（{fam_m:+.3f}）——内生假设源枯竭，"
+               "必须文献注入")
+    elif fam_ok and fam_m < -0.05:
+        t = "rotate"
+        why = (f"族内边际枯竭（{fam_m:+.3f}）——族已饱和，换方向")
+    elif streak >= 3 and plateau:
+        t = "refine"
+        why = (f"同族试验连续 {streak} 次且最近 20 条试验未超越族历史最佳"
+               "达 0.05——族内边际枯竭但存在明确最优载体，转向特性分析型深挖")
+    elif pending_rejected is not None:
+        t = "rotate"
+        why = "上一轮 next_hypothesis 是停笔宣言（已被引擎拒收）——当前方向需要更换"
+    elif frozen:
+        t = "rotate"
+        why = "同一句 next_hypothesis 已冻结 ≥2 轮——停摆模式，强制换方向"
+    elif accepted_n >= 3 and accepted_n % 3 == 0:
+        t = "query"
+        why = f"已入册 {accepted_n} 个因子——里程碑正交性审计"
+    elif pass_unadmitted >= 3:
+        t = "compose"
+        why = f"{pass_unadmitted} 个已验证未入册的单因子——组合机会库存充足"
+    else:
+        t = "continue"
+        why = "无异常信号——惯性延续"
+    if t == "query":
+        key = f"query:{accepted_n}"
+    else:
+        key = f"{t}:{agent_rounds}:{n_trials}"
+    directive = _STRATEGY_DIRECTIVES[t]
+    if t == "literature":
+        # F5 种子正交化：按台账检索计数轮转方法论语域池，与 agent 当前
+        # 假设词汇解耦（相关性检索用自己的词汇查 = 强化先验的回音室）
+        seed = _LITERATURE_SEEDS[lit_search_count % len(_LITERATURE_SEEDS)]
+        directive = (directive
+                     + f"引擎轮转种子查询（与当前族正交）：「{seed}」。"
+                       "用它或自己的查询都可以，但论文必须未被标 exhausted，"
+                       "且假设来源论文写入 trail 的 papers 字段。")
+    if stop_kind == "direction_budget":
+        directive = (directive
+                     + "（本方向段轮次/簇试验预算已耗尽：新因子必须与当前族"
+                       "不同源——构造指纹或 IC 谱不同链；断链后预算自动重置，"
+                       "同族参数微调不会重置。）")
+    return {"type": t, "why": why, "key": key,
+            "directive": directive}
 
 
 class Bridge:
@@ -253,6 +565,11 @@ class Bridge:
             fp = self._env_full_fingerprint(env_id)
             main_h = self._main_horizon(env_id)
             new_entries = []
+            # 断链检测（2026-08-25 arc 化）：新试验不接当前尾部链 = 机械
+            # 换向事件 → 方向段轮次（arc_rounds）归零。簇试验计数
+            # （cluster_trials=streak）读时计算，断链自然断——两个计数
+            # 器在同一事件上重置，判定谓词同为 _entries_linked。
+            chain_broke = False
             for source_hash, stage, result, suspects in items:
                 sketch = None
                 horizon = None
@@ -267,7 +584,11 @@ class Bridge:
                         if len(s) > 256:
                             idx = np.linspace(0, len(s) - 1, 256).astype(int)
                             s = [s[i] for i in idx]
-                        sketch = [round(float(x), 4) for x in s]
+                        # +0.0 归一化 -0.0（IEEE: -0.0+0.0=+0.0）——DSH 的
+                        # lossless JSON 检查拒绝 -0（Object.is(-0)），round
+                        # (-0.00004,4)=-0.0 曾让 factor_trail_summary 整体
+                        # 报错（生产 trail_engine 实测 66 个 -0.0 字面量）
+                        sketch = [round(float(x), 4) + 0.0 for x in s]
                 entry = {
                     "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
                     "envId": env_id, "source_hash": source_hash, "stage": stage,
@@ -280,6 +601,17 @@ class Bridge:
                     "red_flags": result.get("red_flags", []) if isinstance(result, dict) else [],
                     "suspects": suspects,
                     "ic_series_sketch": sketch,
+                    # 成分血缘指纹（2026-08-25 CMF 事故）：合成因子的 IC
+                    # 序列与核心解相关骗过链判定；构造指纹让同族磨种
+                    # 保持链连续，3/6/9 升级正常触发强制换向
+                    "construction_fp": (result.get("_construction_fp")
+                                        if isinstance(result, dict) else None),
+                    # 尾部三件套计算层（2026-08-25）：spread_ir/tail_ic/
+                    # spread_ic_corr/topn placebo——Phase 5 tail 账本
+                    # （键 source_hash×horizon×K）的数据源；自动计算=
+                    # 自动计数
+                    "tail": (result.get("tail")
+                             if isinstance(result, dict) else None),
                 }
                 norm_new = horizon if horizon is not None else main_h
 
@@ -294,6 +626,9 @@ class Bridge:
                     return eh == norm_new
 
                 entries = [e for e in entries if not _same_trial(e)]
+                if entries and isinstance(entries[-1], dict) \
+                        and not _entries_linked(entries[-1], entry):
+                    chain_broke = True
                 entries.append(entry)
                 new_entries.append(entry)
             # v3 单调包络盖章（σ 单位）：写盘时刻的 E[max|X|]（尾对齐 R +
@@ -318,6 +653,13 @@ class Bridge:
             tmp = p.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
             os.replace(str(tmp), str(p))
+            if chain_broke:
+                # arc 归零在写盘成功之后（写失败不断链）；归零失败不阻断
+                # trail（下次断链或 reset 补——arc 少归一次零只会更保守）
+                try:
+                    arc_rounds_bump(self.state_root, reset=True)
+                except Exception:
+                    pass
         except Exception as e:
             # trail 是「不可瞒报」防线——写入失败必须可见（stderr 进 client 的 64KB 环形缓冲）
             try:
@@ -337,6 +679,9 @@ class Bridge:
         except Exception:
             pass
         source_hash = source_fingerprint(source)
+        # 构造指纹（v5 血缘，2026-08-25）：存 result 内部字段，trail append
+        # 时摘出为 construction_fp
+        result["_construction_fp"] = _construction_fingerprint(source)
         result["_meta"] = {
             "fingerprint": self._env_full_fingerprint(env_id),
             "engine_version": __version__,
@@ -475,6 +820,8 @@ class Bridge:
             "factor.evaluate_composite": self._factor_evaluate_composite,
             "factor.evaluate_batch": self._factor_evaluate_batch,
             "factor.walk_forward": self._factor_walk_forward,
+            "factor.noise_test": self._factor_noise_test,
+            "factor.day_perm_test": self._factor_day_perm_test,
             "factor.audit": self._factor_audit,
             "factor.random_generate": self._factor_random_generate,
             "factor.operators": self._factor_operators,
@@ -502,7 +849,7 @@ class Bridge:
     def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         fn = self._method(method)
         try:
-            return fn(params or {})
+            return _lossless(fn(params or {}))
         except DataError as e:
             # 用户数据/配置错误统一映射到域错误码（调用方无需感知异常类型）
             raise BridgeError(-32002, str(e)) from None
@@ -904,6 +1251,32 @@ class Bridge:
             return evaluate_walk_forward(
                 fn(env), env, n_folds=int(params.get("n_folds", 5)),
                 t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
+        if method == "factor.noise_test":
+            # 噪声硬门（2026-08-24 用户决策）——in_process 分发
+            from .factor.noise import noise_test
+            stat = None
+            if params.get("statistic") == "spread":
+                from .factor.tail import spread_ir_statistic
+                stat = spread_ir_statistic
+            return noise_test(fn, env,
+                              int(params.get("m", 100) or 100),
+                              int(params.get("base_seed", 0) or 0),
+                              statistic=stat)
+        if method == "factor.day_perm_test":
+            # 日期置换 null（2026-08-25）——in_process 分发
+            from .factor.permute import day_permutation_test
+            return day_permutation_test(fn, env,
+                                        int(params.get("m", 200) or 200),
+                                        int(params.get("base_seed", 0) or 0))
+        if method == "factor.flatness_test":
+            # 参数平坦性（2026-08-25）——变体在函数内逐个编译评估
+            # （无独立工具通道：submit 时引擎自主执行，防预收割）
+            from .factor.flatness import flatness_test
+            return flatness_test(source, env,
+                                 params.get("flatness") or [],
+                                 compile_fn=self._compile_factor,
+                                 budget_secs=float(
+                                     params.get("budget_secs", 90.0) or 90.0))
         if method == "factor.audit":
             return audit_mod.audit(fn, env)
         raise BridgeError(-32602, f"未知 factor 方法: {method}")
@@ -1248,100 +1621,263 @@ class Bridge:
                 entries = []
         return entries
 
-    def _family_streak(self, engine_trail: list) -> int:
-        """连续同族试验链长（v3 聚类数学复用）：从 trail 尾部向前，与最新
-        试验 sketch 尾对齐 |ρ|≥0.6 视为同族，数连续链长（含最新）。
+    def _family_chain(self, engine_trail: list) -> list:
+        """当前族的试验链（按时间正序）：从最新向前走链，返回链上条目。
 
-        batch 参数扫描（同族 5 变体一批）链长一次 +5——这正是要捕捉的
-        模式：轮次少但试验密度高，族内信息早已饱和。agent 换方向后链
-        自然断（最新试验不再与旧族相关）→ 新方向预算重新起算。"""
-        from .factor.evaluate import _tail_aligned_corr
-        sketches = [e.get("ic_series_sketch") for e in engine_trail
-                    if isinstance(e, dict)]
-        sketches = [s for s in sketches if isinstance(s, (list, tuple))
-                    and len(s) >= 5]
-        if len(sketches) < 2:
-            return len(sketches)
-        latest = sketches[-1]
-        chain = 0
-        for s in reversed(sketches[:-1]):
-            c = _tail_aligned_corr(list(s), list(latest))
-            if c is not None and abs(c) >= 0.6:
-                chain += 1
-            else:
+        链判定见 _entries_linked（双信号 OR：v5 构造血缘 + v3 IC）。
+        与断链检测（arc_rounds 归零）共用同一谓词。"""
+        if not engine_trail or not isinstance(engine_trail[-1], dict):
+            return []
+        latest = engine_trail[-1]
+        chain = [latest]
+        for e in reversed(engine_trail[:-1]):
+            if not isinstance(e, dict) or not _entries_linked(latest, e):
                 break
-        return chain + 1
+            chain.append(e)
+        chain.reverse()
+        return chain
+
+    def _family_streak(self, engine_trail: list) -> int:
+        """连续同族试验链长（v3 IC + v5 血缘双信号 OR，见 _family_chain）。"""
+        return len(self._family_chain(engine_trail))
+
+    def _family_marginal(self, engine_trail: list) -> dict:
+        """族内边际收益（2026-08-25 用户决策：升级不看链长绝对值，只看
+        边际收益）：
+
+        - family_best：族历史最佳 |IC_IR|
+        - recent_best：族内最近窗口（W=min(10, len//2)）最佳 |IC_IR|
+        - marginal = recent_best − family_best_before（族历史在窗口前
+          的最佳——正=还在超越，负=已在磨旧水平以下）
+        - plateau_trials：从最后一个「创造族最佳」的试验到尾部的距离
+
+        判定（纯边际，无链长阈值）：
+        - marginal ≥ 0：族还在改善（新试验超越历史）→ 不催
+        - marginal ∈ (-0.05, 0)：边际递减 → 建议换构造
+        - marginal ∈ (-0.10, -0.05)：边际枯竭 → rotate
+        - marginal < -0.10：严重枯竭 → literature（需要外部假设源）
+
+        族内样本 < 5 → enough_data=False，不做判定（小族不催）。"""
+        fam = self._family_chain(engine_trail)
+        irs = [abs(e["ic_ir"]) for e in fam
+               if isinstance(e, dict) and isinstance(e.get("ic_ir"), (int, float))
+               and not isinstance(e.get("ic_ir"), bool)]
+        if len(irs) < 5:
+            return {"enough_data": False, "family_size": len(irs)}
+        W = max(5, min(10, len(irs) // 2))
+        if len(irs) <= W:
+            return {"enough_data": False, "family_size": len(irs)}
+        family_best_before = max(irs[:-W])
+        recent_best = max(irs[-W:])
+        family_best = max(irs)
+        marginal = recent_best - family_best_before
+        # plateau_trials：尾部多少条未达到族最佳
+        plateau = 0
+        for ir in reversed(irs):
+            if ir >= family_best - 1e-9:
+                break
+            plateau += 1
+        return {
+            "enough_data": True,
+            "family_size": len(irs),
+            "family_best": round(family_best, 4),
+            "recent_best": round(recent_best, 4),
+            "family_best_before": round(family_best_before, 4),
+            "marginal": round(marginal, 4),
+            "plateau_trials": plateau,
+        }
+
+    def _ic_convergence(self, engine_trail: list,
+                        mining: dict) -> tuple[bool, str | None]:
+        """IC_IR 改善收敛（机械停点；2026-08-24 晚二次修正：滑窗对滑窗）。
+
+        最近 W 条试验的最佳 |IC_IR| 相对**前一个 W 条窗口**最佳的改善
+        < δ → 收敛。旧版对照全历史最佳——trail 只增不减，前史最佳是
+        只涨不跌的棘轮，越晚越难超越=变相永久停机（用户修正：参考系
+        必须同样可滑走）。新强因子出现时窗口滑过即自动解除。
+        仅引擎计算，agent 的穷尽宣告不算数。窗口/阈值来自 mining_state
+        （ic_conv_window/ic_conv_delta），<=0 视为关闭；需 ≥2W 条历史。"""
+        try:
+            w = int(mining.get("ic_conv_window", 0) or 0)
+            delta = float(mining.get("ic_conv_delta", 0) or 0)
+        except (TypeError, ValueError):
+            return False, None
+        if w <= 0 or delta <= 0:
+            return False, None
+        irs = [abs(e["ic_ir"]) for e in engine_trail if isinstance(e, dict)
+               and isinstance(e.get("ic_ir"), (int, float))
+               and not isinstance(e.get("ic_ir"), bool)]
+        if len(irs) < 2 * w:
+            return False, None
+        recent_best = max(irs[-w:])
+        prev_best = max(irs[-2 * w:-w])
+        if recent_best - prev_best < delta:
+            return True, (f"IC_IR 改善收敛（最近 {w} 条最佳 |IC_IR| "
+                          f"{recent_best:.3f} 未超前窗口最佳 {prev_best:.3f} 达 {delta}）")
+        return False, None
 
     def _loop_directive(self) -> dict:
         """停走指令：引擎对 agent 的唯一停走真相源（注入关键工具响应）。
 
-        - state=running → agent 必须继续内循环（总结后停 = 违规）；
-          running 时附 obligation（上一轮 next_hypothesis 未消化）与
-          escalation（家族饱和分级升级）。
-        - state=may_stop → 仅当：预算真实耗尽（check_termination 用
-          agent 轮次硬计数——record_round 死代码口径已修）或已有
-          accepted 因子入册（交付了价值，允许收尾汇报）。
-        计数口径：round = trail.json 叙事轮次（agent 挖掘深度的单位，
-        batch 变体扫描一轮只计一次）；n_trials = trail_engine 唯一
-        (source_hash, horizon) 试验数（选择运气的计价单位）。"""
+        v7（2026-08-25 arc 化）：轮次上限从终身改方向段相对——
+        - arc_rounds >= max_rounds（当前方向段叙事轮次；家族链断 → 归 0，
+          与 cluster_trials 同一事件双归零）→ kind=direction_budget
+        - cluster_trials >= max_cluster_trials（当前簇试验上限，断链重置）
+          → kind=direction_budget
+        direction_budget 停点不再是静默终态（50/50 触顶后注入器死机 =
+        手动 push 病理复现）：引擎强制挂 rotate/literature 策略，state=
+        must_rotate，注入器照常推进；换向断链自动重置预算回到 running。
+        - IC_IR 改善收敛（_ic_convergence，滑窗对滑窗，无终身棘轮）
+          → kind=convergence，静默终态——全局平台=换方向救不了，
+          交还用户做数据集轮换（用户保留权限）
+        - finalize（test 一次性锁）→ kind=finalize，真终态
+        候选池满 / accepted 因子不是停点；穷尽宣告一律拒收（写入拒/
+        回显降级 pending_rejected）。
+        计数口径：round = arc_rounds 当前方向段轮次；rounds_total =
+        trail.json 终身叙事轮次（信息性）；n_trials = trail_engine 唯一
+        (source_hash, horizon) 终身试验数（只用于 deflation 计价不做停点）；
+        cluster_trials = family_streak 同族链长。"""
         agent_trail = read_json_list("trail", self.state_root)
         engine_trail = self._read_engine_trail()
         agent_rounds = len(agent_trail)
+        mining = read_mining_state(self.state_root)
+        arc = int(mining.get("arc_rounds", 0) or 0)
         n_trials = len({(e.get("source_hash"), e.get("horizon"))
                         for e in engine_trail if isinstance(e, dict)
                         and e.get("source_hash")})
-        # 候选池 = 已 accepted 入册条目（mining_state.candidate_pool 是
-        # record_round 死代码口径；registry 才是硬事实）
-        try:
-            accepted = sum(1 for e in read_registry(self.state_root)
-                           if isinstance(e, dict) and e.get("accepted"))
-        except Exception:
-            accepted = 0
-        mining = read_mining_state(self.state_root)
-        effective = {**mining, "round": agent_rounds,
-                     "candidate_pool": list(range(accepted))}
+        # 簇 = 尾部同族链（_entries_linked 双信号）；streak 同时是
+        # 「当前簇试验数」，簇试验上限停点的计数基础
+        streak = self._family_streak(engine_trail)
+        effective = {**mining, "n_trials": n_trials,
+                     "cluster_trials": streak}
         term = check_termination(effective)
-        # 上一轮自己声明的下一步（引擎原样回显——执行或证伪，不得静默放弃）
+        conv = self._ic_convergence(engine_trail, mining)
+        # stop_kind：None=running；direction_budget=换向可解除（注入器推进）；
+        # convergence/finalize/fail_streak=静默终态（注入器让位用户）
+        stop_kind = None
+        stop_reason = None
+        if term.get("stop"):
+            stop_kind = term.get("kind") or "direction_budget"
+            stop_reason = term["reason"]
+        elif conv[0]:
+            stop_kind = "convergence"
+            stop_reason = conv[1]
+        may_stop = stop_kind is not None
+        state = ("running" if not may_stop
+                 else "must_rotate" if stop_kind == "direction_budget"
+                 else "may_stop")
+        # 上一轮自己声明的下一步（引擎原样回显——执行或证伪，不得静默放弃）；
+        # 停笔宣言不接受回显，降级为 pending_rejected 并点名拒收
         pending = None
+        pending_rejected = None
         if agent_trail and isinstance(agent_trail[-1], dict):
             nh = agent_trail[-1].get("next_hypothesis")
             if isinstance(nh, str) and nh.strip():
-                pending = nh.strip()[:400]
-        # 家族饱和分级（3/6/9 连续同族试验）
-        streak = self._family_streak(engine_trail)
+                hit = _surrender_match(nh)
+                if hit:
+                    pending_rejected = {"text": nh.strip()[:400], "reason": hit}
+                else:
+                    pending = nh.strip()[:400]
+        # 家族饱和：边际收益驱动（2026-08-25 用户决策：不看链长绝对
+        # 阈值，只看族内边际）——仍在改善的族不催（哪怕 100 个试验），
+        # 已平台的族催（哪怕只有 5 个）
+        fam_marg = self._family_marginal(engine_trail)
         escalation = None
-        if streak >= 9:
-            escalation = (f"同族试验连续 {streak} 次——必须 factor_arxiv_search "
-                          "引入文献级假设后构造新因子族。继续本族变体 = 浪费"
-                          "试验预算（每条 trail 都在抬高所有人的 deflation 门），"
-                          "且不会产生新信息")
-        elif streak >= 6:
-            escalation = (f"同族试验连续 {streak} 次——本族 IC_IR 天花板已测得，"
-                          "必须换信息源维度（新数据列/新算子族/新信号形式）。"
-                          "族内参数微调不再产生新信息")
-        elif streak >= 3:
-            escalation = (f"同族试验连续 {streak} 次——族内变体扫描趋于饱和，"
-                          "下一轮应换构造思路而非继续参数微调")
-        # may_stop：预算耗尽 / finalized / 候选满 / 已有 accepted 因子
-        has_value = accepted > 0
-        may_stop = bool(term.get("stop")) or has_value
+        if fam_marg.get("enough_data"):
+            m = fam_marg["marginal"]
+            fb = fam_marg["family_best"]
+            pt = fam_marg["plateau_trials"]
+            if m < -0.10:
+                escalation = (
+                    f"族内边际严重枯竭——最近 {fam_marg['family_size']} 个同族试验"
+                    f"的最佳 |IC_IR| {fam_marg['recent_best']:.3f} 落后族历史"
+                    f"最佳 {fam_marg['family_best_before']:.3f} 达 {abs(m):.3f}"
+                    f"（{pt} 个试验未刷新族最佳 {fb:.3f}）。必须 factor_arxiv_search"
+                    " 引入文献级假设后构造新因子族。继续本族 = 浪费试验预算。")
+            elif m < -0.05:
+                escalation = (
+                    f"族内边际枯竭——最近窗口最佳 {fam_marg['recent_best']:.3f}"
+                    f"落后族历史 {fam_marg['family_best_before']:.3f} 达 "
+                    f"{abs(m):.3f}（{pt} 个试验未刷新）。换信息源维度"
+                    "（新数据列/新算子族/新信号形式）。族内参数微调不再产生新信息。")
+            elif m < 0:
+                escalation = (
+                    f"族内边际递减——最近窗口最佳 {fam_marg['recent_best']:.3f}"
+                    f"未超越族历史 {fam_marg['family_best_before']:.3f}"
+                    f"（边际 {m:+.3f}，{pt} 个试验未刷新）。考虑换构造思路"
+                    "而非继续参数微调。")
         obligation = None
-        if not may_stop:
-            obligation = "继续内循环——禁止停下来等用户指示"
-            if pending:
+        if state == "running":
+            obligation = ("继续内循环——禁止停下来等用户指示。停点仅由引擎机械"
+                          "判据触发（方向段轮次/当前簇试验上限、IC_IR 改善收敛、"
+                          "finalize），穷尽宣告一律拒收")
+            if pending_rejected is not None:
+                obligation += (f"。上一轮 next_hypothesis 是停笔宣言（「"
+                               f"{pending_rejected['text'][:80]}」——"
+                               f"{pending_rejected['reason']}）：给出可执行的"
+                               "新假设（构造什么、测什么）并继续")
+            elif pending:
                 obligation += (f"。上一轮声明的 next_hypothesis 尚未消化："
                                f"「{pending[:120]}」——执行它，或用 "
                                "factor_record_explored 明确证伪，不得静默放弃")
+        elif state == "must_rotate":
+            obligation = ((stop_reason or "方向段预算耗尽")
+                          + "。执行策略指令换向：构造与当前族不同源的新因子"
+                            "（断链后预算自动重置，回到 running）。同族参数微调"
+                            "不会重置预算，禁止原地续推")
+        else:
+            obligation = ((stop_reason or "停点触发")
+                          + "。此停点换方向无法解除，注入器已静默——数据集轮换"
+                            "是用户操作，向用户上报当前进展即可，不要停下来空等")
+        # 策略指令（v4 2026-08-24）：下一轮方向类型的机械选择——注入器
+        # （TS drive 层）在 turn 结束后读它，以 user 角色注入 [引擎推进]。
+        # v7：must_rotate 状态照常注入（direction_budget 强制 rotate/
+        # literature）；convergence/finalize 返回 None（注入器静默）。
+        irs = [abs(e["ic_ir"]) for e in engine_trail if isinstance(e, dict)
+               and isinstance(e.get("ic_ir"), (int, float))
+               and not isinstance(e.get("ic_ir"), bool)]
+        plateau = (len(irs) > 40 and max(irs[-20:]) < max(irs[:-20]) + 0.05)
+        frozen = False
+        if len(agent_trail) >= 2:
+            a, b = agent_trail[-2], agent_trail[-1]
+            if (isinstance(a, dict) and isinstance(b, dict)
+                    and isinstance(a.get("next_hypothesis"), str)
+                    and a.get("next_hypothesis").strip()
+                    and a.get("next_hypothesis") == b.get("next_hypothesis")):
+                frozen = True
+        pass_n = sum(1 for e in engine_trail if isinstance(e, dict)
+                     and e.get("verdict") == "pass")
+        try:
+            accepted_n = sum(1 for e in read_registry(self.state_root)
+                             if isinstance(e, dict) and e.get("accepted"))
+        except Exception:
+            accepted_n = 0
+        lit_search_count = int(self._read_papers().get("searches", 0) or 0)
+        strategy = _pick_strategy(
+            stop_kind=stop_kind, streak=streak,
+            pending_rejected=pending_rejected, frozen=frozen,
+            plateau=plateau, pass_unadmitted=max(pass_n - accepted_n, 0),
+            accepted_n=accepted_n, agent_rounds=agent_rounds,
+            n_trials=n_trials, lit_search_count=lit_search_count,
+            family_marginal=fam_marg)
         return {
-            "state": "may_stop" if may_stop else "running",
-            "round": agent_rounds,
+            "state": state,
+            "stop_kind": stop_kind,
+            "round": arc,
+            "max_rounds": int(effective.get("max_rounds",
+                                            MINING_CONFIG["max_rounds"])),
+            "rounds_total": agent_rounds,
             "n_trials": n_trials,
+            "cluster_trials": streak,
+            "max_cluster_trials": int(effective.get(
+                "max_cluster_trials", MINING_CONFIG["max_cluster_trials"])),
             "family_streak": streak,
-            "stop_reason": term.get("reason") if term.get("stop") else (
-                "已有 accepted 因子入册，可收尾汇报" if has_value else None),
+            "stop_reason": stop_reason,
             "pending_hypothesis": pending,
+            "pending_rejected": pending_rejected,
             "obligation": obligation,
             "escalation": escalation,
+            "strategy": strategy,
         }
 
     def _factor_evaluate(self, params):
@@ -1490,6 +2026,8 @@ class Bridge:
                 diag["_meta"] = {"fingerprint": fp, "engine_version": __version__,
                                  "receipt": self._make_receipt(diag)}
                 diag["_receipt"] = diag["_meta"]["receipt"]
+                # v5 血缘：批成员也带构造指纹
+                diag["_construction_fp"] = _construction_fingerprint(str(src))
                 # A1（2026-08-19 堵 batch 绕过）：批次成员与单因子 evaluate 同等
                 # 写入 trail_engine——N_eff 计数不因走 batch 通道而漏计。此前
                 # batch 成员不写 trail → N 恒不涨 → deflated p 按 N=1 给出，
@@ -1557,6 +2095,115 @@ class Bridge:
             result["loop"] = self._loop_directive()
         except Exception:
             pass
+        return result
+
+    def _factor_noise_test(self, params):
+        """噪声硬门（2026-08-24 用户设计决策）：因子在 M 个随机噪声
+        世界上的直接表现。真 alpha 按构造不可预测噪声——噪声上仍显著
+        （|z|≥3，z=跨世界 IC_IR 均值/SE）= 因子公式在拟合评价
+        artifact，无条件拒收（submit 硬门同源调用本方法）。
+
+        种子默认从环境指纹派生（同环境可复现），显式 seed 覆盖。"""
+        import hashlib
+
+        env = self._require_panel_env(params.get("envId", "primary"))
+        source = params.get("source")
+        if not source:
+            raise BridgeError(-32602, "source 必填（def factor(env) 源码）")
+        m = max(10, min(int(params.get("m", 100) or 100), 300))
+        seed = params.get("seed")
+        if seed is None:
+            fp = self._env_full_fingerprint(params.get("envId", "primary")) or "nofp"
+            seed = int(hashlib.sha256(str(fp).encode("utf-8")).hexdigest()[:8], 16)
+        else:
+            seed = int(seed)
+        result = self._run_factor("factor.noise_test", str(source),
+                                  {"m": m, "base_seed": seed}, env)
+        if not isinstance(result, dict):
+            raise BridgeError(-32003, f"噪声测试返回异常: {type(result).__name__}")
+        result["seed"] = seed
+        result["gate"] = ("artifact 拒收（噪声世界 |z|≥3：因子在拟合评价"
+                          "管道 artifact 而非数据结构）"
+                          if result.get("artifact") else
+                          ("无法判定（有效世界不足）" if result.get("artifact") is None
+                           else "通过（噪声世界无系统性 IC——真信号只可能来自真实数据结构）"))
+        return result
+
+    def _flatness_decl_check(self, source: str, decl) -> None:
+        """平坦性申报表校验（形状 + value 真实出现在 source）。
+
+        漏报/错报 = 事务中止拒收（-32602）：申报值不在 source 数值字面量
+        中，说明参数表与代码不一致——防「申报无关参数、隐藏真正被调的
+        关键参数」绕过平坦性检查。"""
+        from .factor.flatness import literal_present
+
+        if not isinstance(decl, list) or not decl:
+            raise BridgeError(
+                -32602,
+                "flatness_params 必须是非空 [{name, value, step}] 列表"
+                "（name: 参数名；value: 数值，须出现在 source 字面量中；"
+                "step: 最小有意义步长，如窗口 10→1、权重 0.65→0.05）。"
+                "无参数因子直接省略该字段")
+        if len(decl) > 4:
+            raise BridgeError(
+                -32602,
+                f"flatness_params 最多 4 个参数（收到 {len(decl)}）——"
+                "邻域评估成本随参数线性增长（每参数 2 次变体评估）")
+        seen = set()
+        for d in decl:
+            if not isinstance(d, dict):
+                raise BridgeError(-32602, f"参数表条目必须是对象: {d}")
+            name = str(d.get("name") or "").strip()
+            val, step = d.get("value"), d.get("step")
+            if not name or name in seen:
+                raise BridgeError(-32602, f"参数 name 非法或重复: {d}")
+            seen.add(name)
+            if (isinstance(val, bool) or not isinstance(val, (int, float))
+                    or isinstance(step, bool)
+                    or not isinstance(step, (int, float)) or step <= 0):
+                raise BridgeError(
+                    -32602,
+                    f"参数 {name} 需要 数值 value + 正数 step: {d}")
+            if not literal_present(source, val):
+                raise BridgeError(
+                    -32602,
+                    f"参数 {name} 的 value={val} 未出现在 source 数值字面量"
+                    "中——申报不完整即拒（参数表必须与代码一致；防隐藏"
+                    "真正被调的关键参数绕过平坦性检查）")
+
+    def _factor_day_perm_test(self, params):
+        """日期置换 null（2026-08-25 用户决策：真实结构上的时序置换）。
+
+        真实因子截面 × 真实收益截面，只随机重排配对——一切真实市场
+        结构保留，专测时序对齐分量（与 column-perm 的截面分配分量
+        正交互补）。**report-only**：alignment_dependent 标注不拒收——
+        p 小 = 真短周期因子与时序性过拟合的并集（样本内不可分），
+        门方向与阈值由 Phase 6 校准（registry 已入册 × 证伪 preset
+        混淆矩阵）后启用。submit 门同源调用本方法。
+
+        种子默认从环境指纹派生（同环境可复现），显式 seed 覆盖。"""
+        import hashlib
+
+        env = self._require_panel_env(params.get("envId", "primary"))
+        source = params.get("source")
+        if not source:
+            raise BridgeError(-32602, "source 必填（def factor(env) 源码）")
+        m = max(20, min(int(params.get("m", 200) or 200), 500))
+        seed = params.get("seed")
+        if seed is None:
+            fp = self._env_full_fingerprint(params.get("envId", "primary")) or "nofp"
+            seed = int(hashlib.sha256(str(fp).encode("utf-8")).hexdigest()[:8], 16)
+        else:
+            seed = int(seed)
+        result = self._run_factor("factor.day_perm_test", str(source),
+                                  {"m": m, "base_seed": seed}, env)
+        if not isinstance(result, dict):
+            raise BridgeError(-32003, f"日期置换测试返回异常: {type(result).__name__}")
+        result["seed"] = seed
+        result["gate"] = ("report-only（对齐依赖标注，不拒收——门方向待校准）。"
+                          "p_two 小=时序对齐分量显著（真短周期因子或时序性过拟合"
+                          "的并集，样本内不可分）；p_two 大=持久倾斜结构主导"
+                          "（合法截面 alpha 形态，由 column-perm 认证）")
         return result
 
     def _factor_walk_forward(self, params):
@@ -1774,7 +2421,35 @@ class Bridge:
                        if layer == "trail" else
                        "search_paths 需要 direction/variant/result"))
         if layer == "explored":
+            # F4 引用溯源（2026-08-24）：证伪条目携带 papers 字段 →
+            # 台账标 exhausted（该论文推导的思路已证伪，后续检索
+            # 直接排除——防跨纪元从同一篇论文再推导同一思路）
             result = append_explored(entry, self.state_root)
+            papers = entry.get("papers")
+            if papers is not None:
+                if not isinstance(papers, list) or not all(
+                        isinstance(x, str) for x in papers):
+                    raise BridgeError(-32602,
+                                      "papers 必须是字符串 arxiv_id 列表"
+                                      "（如 [\"2108.05721\"]，完整 URL 也可）")
+                ids = [i for i in (self._normalize_arxiv_id(x) for x in papers) if i]
+                bad = [x for x, i in zip(papers, (self._normalize_arxiv_id(x) for x in papers)) if not i]
+                if bad:
+                    raise BridgeError(
+                        -32602, f"papers 含非法 arxiv_id: {bad[:3]}。"
+                        "格式：2108.05721 / abs/2108.05721 / 完整 URL")
+                if ids:
+                    d = self._read_papers()
+                    for pid in ids:
+                        e = d["papers"].setdefault(pid, {
+                            "title": "", "first_seen": d.get("searches", 0),
+                            "times_returned": 0, "queries": [],
+                            "cited_rounds": [], "exhausted": False})
+                        e["exhausted"] = True
+                    self._write_papers(d)
+                    result["note"] = (result.get("note", "")
+                                      + f"；{len(ids)} 篇论文标记 exhausted")
+            src = str(entry.get("source") or entry.get("factor_source") or "")
             # 正式证伪的因子入 falsified 池（防重复挖坟；有指纹缓存则带数值指纹）
             src = str(entry.get("source") or entry.get("factor_source") or "")
             if src:
@@ -1794,7 +2469,52 @@ class Bridge:
         if layer == "search_paths":
             return append_search_path(entry, self.state_root)
         if layer == "trail":
-            return append_trail(entry, self.state_root)
+            # 穷尽宣告拒收（2026-08-24）：停笔宣言混进 next_hypothesis 会被
+            # 引擎回显背书成状态（session.jsonl 实测 12/12 假穷尽）——写入口
+            # 直接拒绝，让停点定义权留在引擎机械判据手里
+            nh = str(entry.get("next_hypothesis", "") or "")
+            hit = _surrender_match(nh)
+            if hit:
+                raise BridgeError(
+                    -32602,
+                    f"next_hypothesis 被拒收（「{nh[:80]}」）：{hit}。"
+                    "停点仅由引擎机械判据触发（轮次/试验上限、IC_IR 改善收敛、"
+                    "finalize）。把 next_hypothesis 改写为可执行的新假设"
+                    "（构造什么、测什么），然后重写本条 trail")
+            # F4 引用溯源：文献驱动的假设必须携带 papers（paper→hypothesis
+            # 链条可验证——「直接迁移自论文X」的宣称不再不可审计）
+            papers = entry.get("papers")
+            if papers is not None:
+                if not isinstance(papers, list) or not papers:
+                    raise BridgeError(
+                        -32602,
+                        "papers 必须是非空 arxiv_id 列表（如 [\"2108.05721\"]，"
+                        "完整 URL 也可）。文献驱动的假设必填 papers——"
+                        "不引用具体论文的「迁移」宣称不可审计")
+                ids = [self._normalize_arxiv_id(x) for x in papers]
+                if not all(isinstance(x, str) for x in papers) or not all(ids):
+                    raise BridgeError(
+                        -32602, f"papers 含非法 arxiv_id: {papers[:3]}。"
+                        "格式：2108.05721 / abs/2108.05721 / 完整 URL")
+                d = self._read_papers()
+                rnd = entry.get("round")
+                for pid in ids:
+                    e = d["papers"].setdefault(pid, {
+                        "title": "", "first_seen": d.get("searches", 0),
+                        "times_returned": 0, "queries": [],
+                        "cited_rounds": [], "exhausted": False})
+                    if rnd is not None:
+                        e["cited_rounds"].append(rnd)
+                self._write_papers(d)
+            res = append_trail(entry, self.state_root)
+            # 方向段轮次计数（2026-08-25 arc 化）：一条叙事 trail = 当前
+            # 方向段一轮。上限按 arc 计不按终身计——机械换向（家族链断）
+            # 自动归零。计数失败不阻断叙事写入（少计只会更保守）。
+            try:
+                arc_rounds_bump(self.state_root)
+            except Exception:
+                pass
+            return res
         raise BridgeError(-32602, "layer 必须是 explored/search_paths/trail")
 
     def _state_trail_summary(self, params):
@@ -1851,9 +2571,11 @@ class Bridge:
     # "pool" 是目录（双池 json + fp/*.npy 数值指纹）：备份用 copytree、删除用 rmtree
     RESET_TARGETS: dict[str, list[str]] = {
         # trail_engine.json 是引擎层硬事实 trail，与 agent 叙事层 trail 同属 mining 轨迹；
-        # pool/ 是有界双池记忆（active/falsified + .npy 指纹），同属挖掘记忆
+        # pool/ 是有界双池记忆（active/falsified + .npy 指纹），同属挖掘记忆；
+        # papers.json 是文献台账（F1，2026-08-24），同属挖掘记忆
         "mining": ["trail.json", "trail_engine.json", "explored_paths.json",
-                   "search_paths.json", "mining_state.json", "pool"],
+                   "search_paths.json", "mining_state.json", "pool",
+                   "papers.json"],
         "landscape": ["null_landscape.json", "operator_set.json"],
         "registry": ["registry.json"],
         "config": ["data-config.json"],
@@ -1982,17 +2704,26 @@ class Bridge:
         # registry 被同一因子灌 3 条。两种情况都拒绝并引导 update / 换名。
         dup = next((e for e in existing if e.get("name") == name), None)
         if dup is not None:
-            if source_hash and dup.get("source_hash") == source_hash:
+            # 基础设施失败治愈（2026-08-25 pw15_compD_5050 事故）：旧版
+            # submit 的噪声门 fail-closed 分支会把「worker 超时/执行失败」
+            # 写成 accepted=false 条目 → 铁律按名拦截 → 重试被拒 = 名字
+            # 被烧。基础设施失败不是因子判定——清掉失败条目放行重试。
+            if dup.get("accepted") is False and str(dup.get("reason", "")).startswith(
+                    "噪声硬门执行失败"):
+                existing = [e for e in existing if e is not dup]
+                write_registry(existing, self.state_root)
+            elif source_hash and dup.get("source_hash") == source_hash:
                 raise BridgeError(
                     -32003,
                     f"名字「{name}」已登记过同一因子（铁律：不得重复入册）。"
                     "修正描述/追加备注用 factor_registry_update(name, signal/note)——"
                     "不要重复 submit。")
-            raise BridgeError(
-                -32003,
-                f"名字「{name}」已被另一个因子占用（源码不同）。"
-                f"若这是新变体请换一个名字重新 submit；若只是想修正「{name}」的描述，"
-                "用 factor_registry_update——改源码换汤不换药的重复登记会被拒绝。")
+            else:
+                raise BridgeError(
+                    -32003,
+                    f"名字「{name}」已被另一个因子占用（源码不同）。"
+                    f"若这是新变体请换一个名字重新 submit；若只是想修正「{name}」的描述，"
+                    "用 factor_registry_update——改源码换汤不换药的重复登记会被拒绝。")
         # A3（2026-08-19 堵冻结诊断绕过）：提交时刻以**当前 trail 的 N_eff**
         # 重算 deflated p——诊断生成后到提交之间的新试验（含 batch 通道、
         # 其他因子的 evaluate）全部计入。此前 submit 直接用诊断里冻结的
@@ -2055,6 +2786,162 @@ class Bridge:
         if diagnosis.get("red_flags"):
             accepted = False
             reason = f"red_flags 未清：{diagnosis['red_flags'][:2]}"
+        # 噪声硬门（2026-08-24 用户设计决策）：因子在随机噪声世界上的
+        # 直接表现。真 alpha 按构造不可预测噪声；噪声上仍显著 = 因子
+        # 公式在拟合评价 artifact（管道偏差/重叠窗口构造），无条件拒收。
+        # 2026-08-25 pw15_compD_5050 事故修正语义：基础设施失败（超时/
+        # worker 崩溃）= **事务中止（raise，不落盘）**——旧版写成
+        # accepted=false 条目导致铁律烧名，重试被「不得重复入册」挡死。
+        # 只有实质性判定（artifact 确认）才落拒绝条目。
+        noise_report = None
+        try:
+            noise_report = self._factor_noise_test({
+                "envId": params.get("envId", "primary"),
+                "source": source,
+                "m": int(read_mining_state(self.state_root).get(
+                    "noise_gate_m", 50) or 50)})
+        except Exception as e:
+            raise BridgeError(
+                -32003,
+                f"噪声硬门执行失败（事务中止，registry 未写入，可直接重试）："
+                f"{type(e).__name__}: {e}。慢因子可先 factor_noise_test(m=20) "
+                "自测（引擎有预算自适应），或优化因子计算（向量化）")
+        if noise_report is not None and noise_report.get("artifact") is None:
+            raise BridgeError(
+                -32003,
+                f"噪声硬门无法判定（有效世界不足 "
+                f"{noise_report.get('n_valid', 0)}/{noise_report.get('m')}，"
+                "事务中止未落盘）——因子输出覆盖异常（全 NaN/形状错），"
+                "先修因子再提交")
+        if noise_report is not None and noise_report.get("artifact"):
+            # 实质性判定：artifact 确认 → 拒绝条目落盘（这是因子 verdict，
+            # 不是基础设施失败——烧名是正确语义）
+            accepted = False
+            reason = (f"噪声硬门拒收：因子在 {noise_report['n_valid']} 个噪声"
+                      f"世界仍系统性显著（z={noise_report['z']:+.2f}，"
+                      f"mean IC_IR={noise_report['mean']:+.3f}）——真 alpha "
+                      "按构造不可预测噪声，这指示因子在拟合评价管道 "
+                      "artifact 而非数据结构。排查：前视构造/重叠窗口/掩码泄漏")
+        # 日期置换 null（2026-08-25 用户决策）：真实结构上的时序置换——
+        # report-only。基础设施失败 = 事务中止（raise 不落盘，同噪声门
+        # 语义）；alignment_dependent 仅标注不拒收：p 小 = 真短周期因子
+        # 与时序性过拟合的并集（样本内不可分），拒收方向与阈值由
+        # Phase 6 校准（registry × 证伪 preset 混淆矩阵）后启用。
+        dayperm_report = None
+        try:
+            dayperm_report = self._factor_day_perm_test({
+                "envId": params.get("envId", "primary"),
+                "source": source,
+                "m": int(read_mining_state(self.state_root).get(
+                    "day_perm_m", 200) or 200)})
+        except Exception as e:
+            raise BridgeError(
+                -32003,
+                f"日期置换测试执行失败（事务中止，registry 未写入，可直接"
+                f"重试）：{type(e).__name__}: {e}")
+        # 参数平坦性（2026-08-25 用户决策）：申报制最小步长邻域——submit
+        # 时引擎自主执行，无独立工具通道（agent 不能预收割邻域再挑峰值
+        # 提交）。悬崖签名（翻号/塌陷/退化）report-only，Phase 6 校准后
+        # 转硬门；申报不实（value 不在 source）= 事务中止拒收。
+        flatness_report = None
+        fp_decl = params.get("flatness_params")
+        if fp_decl is not None:
+            self._flatness_decl_check(source, fp_decl)
+            try:
+                flatness_report = self._run_factor(
+                    "factor.flatness_test", str(source),
+                    {"flatness": fp_decl},
+                    self._require_panel_env(params.get("envId", "primary")))
+            except BridgeError:
+                raise
+            except Exception as e:
+                raise BridgeError(
+                    -32003,
+                    f"平坦性评估执行失败（事务中止，registry 未写入，可"
+                    f"直接重试）：{type(e).__name__}: {e}")
+        else:
+            flatness_report = {
+                "n_params": 0,
+                "note": ("未申报参数——跳过平坦性检查（申报制边界：无通道"
+                         "强制申报；SKILL 纪律要求申报全部可调参数，trail "
+                         "审计抽查）")}
+        # 平坦性硬门（Phase 6 校准后启用，2026-08-25）：registry 19 个
+        # 已入册因子（amihud 窗口/阈值/复合权重族）悬崖签名 **0/19 假
+        # 阳性**——门可安全启用；检测功效待证伪 preset 校准补证。
+        # day-perm 维持 report-only：校准实证 19/19 好因子全部
+        # alignment_dependent（p 小=真短周期因子与时序过拟合的并集，
+        # 方向不可判）——永久作分解诊断，不做拒收门。
+        if isinstance(flatness_report, dict) and flatness_report.get("cliff"):
+            cliff_rows = [r for r in flatness_report.get("neighbors", [])
+                          if r.get("cliff")]
+            kinds = sorted({r["cliff"] for r in cliff_rows})
+            accepted = False
+            reason = ("[平坦性] 悬崖签名拒收：最小步长邻域出现 "
+                      f"{kinds}（真实 alpha 在参数空间是平滑峰——动量 "
+                      "horizon 谱系结构在大步长，最小步长不该有断崖；"
+                      "断崖 = 调参贴噪声）。换非刀锋构造后重新提交")
+        # 双轨判定（2026-08-25 用户决策：registry 标注 ic/tail/双入选）：
+        # submit 时**两轨都判**——admit_basis 决定哪轨管 acceptance，
+        # tracks + dual_pass 是完整标注（audit 实证双过仅 ~4/19，
+        # 是有区分度的信号质量维度）。
+        admit_basis = str(params.get("admit_basis") or "ic")
+        if admit_basis not in ("ic", "tail"):
+            raise BridgeError(-32602,
+                              f"admit_basis 必须是 ic | tail（收到 {admit_basis!r}）")
+        # IC 轨判定快照（此刻 accepted/reason 已含 deflation/red_flags/
+        # 噪声门/平坦性硬门全部 ic 链门）
+        ic_verdict = {"accepted": bool(accepted),
+                      "reason": str(reason)[:300]}
+        # 尾轨判定（两轨提交都跑——dual_pass 标注需要；G1/G3 用的
+        # spread_ir/placebo_z 在 evaluate 已自动算好，只补跑 G2）
+        engine_trail = self._read_engine_trail()
+        tail_block = None
+        for e in reversed(engine_trail):
+            if (isinstance(e, dict)
+                    and e.get("source_hash") == source_hash
+                    and isinstance(e.get("tail"), dict)
+                    and not e["tail"].get("error")):
+                tail_block = e["tail"]
+                break
+        import hashlib as _hl
+        _fp_ns = self._env_full_fingerprint(
+            params.get("envId", "primary")) or "nofp"
+        _seed_ns = int(_hl.sha256(
+            str(_fp_ns).encode("utf-8")).hexdigest()[:8], 16)
+        try:
+            spread_noise = self._run_factor(
+                "factor.noise_test", str(source),
+                {"m": int(read_mining_state(self.state_root).get(
+                    "tail_noise_m", 12) or 12),
+                 "base_seed": _seed_ns, "statistic": "spread"},
+                self._require_panel_env(params.get("envId", "primary")))
+        except Exception as e:
+            raise BridgeError(
+                -32003,
+                f"spread 噪声门执行失败（事务中止，可直接重试）："
+                f"{type(e).__name__}: {e}")
+        from .factor.tailgate import tail_admission, tail_ledger
+        tail_decision = tail_admission(
+            tail_block, tail_ledger(engine_trail),
+            spread_noise.get("z") if isinstance(spread_noise, dict)
+            else None)
+        tail_verdict = {
+            "accepted": bool(tail_decision["accepted"]),
+            "reason": str(tail_decision["reason"])[:300],
+            "diag": tail_decision.get("diag"),
+            "spread_noise": ({"z": spread_noise.get("z"),
+                              "n_valid": spread_noise.get("n_valid")}
+                             if isinstance(spread_noise, dict) else None),
+        }
+        dual_pass = bool(ic_verdict["accepted"] and tail_verdict["accepted"])
+        tail_track = None
+        if admit_basis == "tail":
+            # 兼容字段：tail 轨提交时保留原 tail_track 结构
+            tail_track = {"admit_basis": "tail",
+                          **tail_verdict,
+                          "ic_track": ic_verdict}
+            accepted = tail_verdict["accepted"]
+            reason = f"[tail轨] {tail_decision['reason']}"
         # 拒绝路径战略菜单（2026-08-21）：submit 拒绝是 agent 停止倾向最强
         # 的时刻（实测："等待用户决定是否清 trail 重置后重新注册"——等
         # 用户批准假门）。菜单把合法出路与禁止路径都写明，loop.state
@@ -2076,12 +2963,17 @@ class Bridge:
                 "options": [
                     "结构性新假设：换信息源/算子族（当前门下需 "
                     f"|IC_IR| ≳ {need_ir if need_ir is not None else 'bar×pool_std+1.645/√n'}）",
-                    "新数据集 / 新 stateRoot（新检验家族，试验计数 M 重开）",
+                    "正交组合构造：与 registry/library 已入册维度交互"
+                    "（目标截面相关 < 0.7 的新组合）",
                     "继续探索其他维度（接受 bar 继续抬升的成本）",
                 ],
                 "forbidden": [
                     "state.reset 洗 trail 后重注册同一因子（假门——搜索史不可撤销）",
                     "停下来问用户怎么办（loop.state=running，继续内循环）",
+                    "穷尽宣告（「因子空间已穷尽/天花板/建议换池子」）——停点仅由"
+                    "引擎机械判据触发（轮次/试验上限、IC_IR 收敛、finalize）；"
+                    "数据集/池/频率轮换是用户操作，只能随里程碑汇报上报，"
+                    "不是 agent 的停笔理由",
                 ],
             }
         entry = {
@@ -2092,6 +2984,16 @@ class Bridge:
             "ic_ir_train": diagnosis.get("ic_ir_train"),
             "verified": True if verified else False,
             "diagnosis": diagnosis,
+            "noise_gate": noise_report,
+            "day_perm": dayperm_report,
+            "flatness": flatness_report,
+            "admit_basis": admit_basis,
+            "tail_track": tail_track,
+            # 双轨完整标注（2026-08-25）：tracks = 两轨各自判定，
+            # dual_pass = 双过（IC 强 + top-N 变现都过门——audit 实证
+            # 仅 ~4/19，有区分度的信号质量维度）
+            "tracks": {"ic": ic_verdict, "tail": tail_verdict},
+            "dual_pass": dual_pass,
             "source": source,
             "source_hash": source_hash,
             "fingerprint": (diagnosis.get("_meta") or {}).get("fingerprint")
@@ -2127,6 +3029,12 @@ class Bridge:
                 "bar_sigma": dp_ledger.get("bar_sigma"),
                 "pool_std": dp_ledger.get("pool_std"),
                 "n_trials": dp_ledger.get("n_trials"),
+                "day_perm_p_align": (dayperm_report or {}).get("p_align"),
+                "alignment_dependent": (dayperm_report or {}).get(
+                    "alignment_dependent"),
+                "flatness_cliff": (flatness_report or {}).get("cliff"),
+                "admit_basis": admit_basis,
+                "dual_pass": dual_pass,
                 "engine_version": __version__,
                 "reason": str(reason)[:200],
             })
@@ -2147,7 +3055,13 @@ class Bridge:
         except Exception:
             loop = None
         result = {"accepted": accepted, "reason": reason, "entry": entry,
-                  "receipt_verified": bool(verified)}
+                  "receipt_verified": bool(verified),
+                  "day_perm": dayperm_report,
+                  "flatness": flatness_report,
+                  "admit_basis": admit_basis,
+                  "tail_track": tail_track,
+                  "tracks": {"ic": ic_verdict, "tail": tail_verdict},
+                  "dual_pass": dual_pass}
         if loop is not None:
             result["loop"] = loop
         if next_moves is not None:
@@ -2196,9 +3110,135 @@ class Bridge:
         return {"ok": True, "name": name, "changed": changed}
 
     def _arxiv_search(self, params):
+        """F1-F3 修复后的文献检索（2026-08-24 审计产品化）。
+
+        - F2 类目默认：无 category 时注入 q-fin OR 链（杀物理噪声）
+        - F3 分层采样：无 start 时拆 relevance 半 + submittedDate 半
+          （新旧覆盖）；显式 start 走深部分页模式
+        - F1 台账去重：papers.json 记录全部已返回论文；exhausted
+          （已被证伪引用）直接排除，已见论文标注 seen_before 并让位
+          给未见论文（去重发生在论文层——审计实测查询零重复但
+          结果 26% 论文级重叠，查询层去重无效）
+        """
         from . import arxiv
-        return arxiv.search(params.get("query", ""), int(params.get("max_results", 10)),
-                            params.get("category"))
+        query = str(params.get("query", "")).strip()
+        max_results = max(1, min(int(params.get("max_results", 10) or 10), 25))
+        category = params.get("category") or None
+        # F2：显式 category → 单类目；未传 → q-fin 全类目 OR 链（审计中
+        # 28/28 次裸查全库导致 31% 物理噪声——cross-section/momentum 等
+        # 金融词与物理词碰撞）
+        cat_filter = f"cat:{category}" if category else _QFIN_FILTER
+        try:
+            start = int(params.get("start", 0) or 0)
+        except (TypeError, ValueError):
+            start = 0
+        if not query:
+            return []
+        ledger = self._read_papers()
+        papers_seen = ledger.get("papers", {})
+        exhausted = {pid for pid, e in papers_seen.items()
+                     if isinstance(e, dict) and e.get("exhausted")}
+        raw_lists = []
+        if start > 0:
+            raw_lists.append(arxiv.search(
+                query, max_results + 5, cat_filter, "relevance", start))
+        else:
+            half = max(1, max_results // 2)
+            raw_lists.append(arxiv.search(
+                query, half + 5, cat_filter, "relevance", 0))
+            raw_lists.append(arxiv.search(
+                query, max_results - half + 5, cat_filter, "submittedDate", 0))
+        # 双调用各自可能整失败（[{"error":...}]）——全部失败才直通错误
+        merged, errors = [], []
+        for lst in raw_lists:
+            if isinstance(lst, list):
+                for r in lst:
+                    if isinstance(r, dict) and "error" in r:
+                        errors.append(r)
+                    elif isinstance(r, dict):
+                        merged.append(r)
+        if not merged and errors:
+            return errors
+        # 论文层去重（跨两次调用 + 跨历史调用）；台账键统一为归一化
+        # 裸 id（搜索返回的是完整 URL，trail papers 溯源是裸 id——
+        # 两路入口必须在同一键空间）
+        by_id, order = {}, []
+        for r in merged:
+            pid = self._normalize_arxiv_id(str(r.get("arxiv_id") or ""))
+            if not pid or pid in exhausted or pid in by_id:
+                continue
+            by_id[pid] = r
+            order.append(pid)
+        unseen = [pid for pid in order if pid not in papers_seen]
+        seen = [pid for pid in order if pid in papers_seen]
+        picked = unseen[:max_results] + seen[:max(0, max_results - len(unseen))]
+        out = []
+        for pid in picked:
+            r = dict(by_id[pid])
+            prev = papers_seen.get(pid)
+            if prev is not None:
+                r["seen_before"] = int(prev.get("times_returned", 1))
+            out.append(r)
+        # 只记录实际返回给 agent 的（抓到但未返回的不算已见）
+        self._record_papers_search(query, out)
+        ledger = self._read_papers()
+        return {
+            "query": query, "results": out,
+            "fresh": len(unseen[:max_results]),
+            "ledger": {"unique_papers": len(ledger.get("papers", {})),
+                       "searches": int(ledger.get("searches", 0)),
+                       "exhausted": len([e for e in ledger.get("papers", {}).values()
+                                         if isinstance(e, dict) and e.get("exhausted")])},
+        }
+
+    def _papers_path(self):
+        return Path(self.state_root) / "papers.json"
+
+    def _read_papers(self) -> dict:
+        """F1 论文台账：{papers: {id: {title, first_seen, times_returned,
+        queries, cited_rounds, exhausted}}, searches: N}。损坏 → 空。"""
+        try:
+            d = json.loads(self._papers_path().read_text(encoding="utf-8"))
+            if isinstance(d, dict) and isinstance(d.get("papers"), dict):
+                d.setdefault("searches", 0)
+                return d
+        except Exception:
+            pass
+        return {"papers": {}, "searches": 0}
+
+    def _write_papers(self, d: dict) -> None:
+        p = self._papers_path()
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(str(tmp), str(p))
+
+    def _record_papers_search(self, query: str, results: list) -> None:
+        d = self._read_papers()
+        d["searches"] = int(d.get("searches", 0)) + 1
+        for r in results:
+            pid = self._normalize_arxiv_id(str(r.get("arxiv_id") or ""))
+            if not pid:
+                continue
+            e = d["papers"].setdefault(pid, {
+                "title": r.get("title", ""), "first_seen": d["searches"],
+                "times_returned": 0, "queries": [], "cited_rounds": [],
+                "exhausted": False})
+            e["times_returned"] = int(e.get("times_returned", 0)) + 1
+            if r.get("title"):
+                e["title"] = r["title"]
+            if query not in e["queries"] and len(e["queries"]) < 20:
+                e["queries"].append(query)
+        self._write_papers(d)
+
+    @staticmethod
+    def _normalize_arxiv_id(raw: str) -> str | None:
+        """接受裸 id / abs/id / 完整 URL → 归一化 id；非法 → None。"""
+        if not isinstance(raw, str):
+            return None
+        s = raw.strip().rstrip("/")
+        m = _ARXIV_ID_RE.search(s)
+        return m.group(2) if m else None
 
     # ---- 结果卡片导出（批次1b）：零计算组装，数据来自引擎 trail / registry / null 地形 ----
     def _report_export(self, params):
