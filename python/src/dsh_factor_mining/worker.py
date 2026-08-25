@@ -134,6 +134,30 @@ def run_request(req: dict) -> dict:
     if method == "factor.walk_forward":
         return evaluate_walk_forward(fn(env), env, n_folds=int(params.get("n_folds", 5)),
                                      t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
+    if method == "factor.noise_test":
+        # 噪声硬门（2026-08-24 用户决策）：M 个噪声世界在单次 worker
+        # 调用内循环生成+求值（避免逐世界 spawn 子进程）
+        from .factor.noise import noise_test
+        m = int(params.get("m", 100) or 100)
+        base_seed = int(params.get("base_seed", 0) or 0)
+        stat = None
+        if params.get("statistic") == "spread":
+            from .factor.tail import spread_ir_statistic
+            stat = spread_ir_statistic
+        return noise_test(fn, env, m, base_seed, statistic=stat)
+    if method == "factor.day_perm_test":
+        # 日期置换 null（2026-08-25）：真实边缘 + 随机配对，worker 内循环
+        from .factor.permute import day_permutation_test
+        m = int(params.get("m", 200) or 200)
+        base_seed = int(params.get("base_seed", 0) or 0)
+        return day_permutation_test(fn, env, m, base_seed)
+    if method == "factor.flatness_test":
+        # 参数平坦性（2026-08-25）：变体逐个编译评估，worker 单次调用
+        from .factor.flatness import flatness_test
+        return flatness_test(req["source"], env, params.get("flatness") or [],
+                             compile_fn=_compile,
+                             budget_secs=float(params.get("budget_secs", 90.0)
+                                               or 90.0))
     if method == "factor.audit":
         return audit(fn, env)
     raise ValueError(f"worker 不支持的方法: {method}")
