@@ -77,7 +77,7 @@ def _make_bridge(root: Path, noise_m: int = 12) -> Bridge:
     state = root / "state"
     state.mkdir(exist_ok=True)
     (state / "mining_state.json").write_text(json.dumps(
-        {"noise_gate_m": noise_m, "ic_conv_window": 0,
+        {"noise_gate_m": noise_m, "fam_conv_window": 0,
          "finalized": False}), encoding="utf-8")
     b = Bridge(state_root=str(state), execution_mode="in_process")
     b.dispatch("config.save", {"config": {"version": 1, "environments": {

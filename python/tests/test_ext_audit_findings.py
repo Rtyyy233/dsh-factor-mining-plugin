@@ -165,3 +165,60 @@ def test_submit_incomplete_stats_rejected_with_clear_error(tmp_path):
                                          "diagnosis": complete})
     dp = (sub.get("entry") or {}).get("diagnosis", {}).get("deflated_train", {})
     assert dp.get("p") is not None, f"完整统计量仍 p=None（重算链路另有问题）：{dp}"
+
+
+# ---- 2026-08-25 反编造双闸（review P1-3） ----
+
+def test_receipt_mismatch_rejected(tmp_path):
+    """receipt 在场但关键数字被改 = 编造痕迹 → 拒收。此前只降级
+    verified=False 照常落盘：手构高 sr_hat 可直推 acceptance（receipt
+    不覆盖充分统计量 = 门只锁门框不锁门）。"""
+    data = tmp_path / "panel.parquet"
+    _panel(data)
+    b = Bridge(state_root=str(tmp_path / "state"), execution_mode="in_process")
+    b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
+    b.dispatch("data.load", {"envId": "etf"})
+    b.dispatch("factor.random_generate", {"envId": "etf", "mode": "null-calibration", "n": 5})
+    diag = b.dispatch("factor.evaluate", {"envId": "etf", "source": F,
+                                          "stage": "development"})
+    assert diag.get("_receipt"), "evaluate 诊断必须带 receipt"
+    tampered = {**diag,
+                "deflated_train": {**diag["deflated_train"],
+                                   "sr_hat": float(diag["deflated_train"]["sr_hat"]) + 1.0}}
+    try:
+        b.dispatch("registry.submit", {"envId": "etf", "name": "tamp",
+                                       "source": F, "signal": "x",
+                                       "diagnosis": tampered})
+        raise AssertionError("篡改充分统计量的 receipt 诊断未被拒收")
+    except BridgeError as e:
+        assert e.code == -32003 and "receipt" in str(e), (e.code, str(e))
+
+
+def test_stats_from_trail_authoritative(tmp_path):
+    """无 receipt 手构强数字：submit 重算用 trail_engine 的权威充分统计量
+    （dsr_stats），diagnosis 自报 sr_hat 不进门——弱真实因子谎报强数字
+    仍被拒。bridge 重启丢 receipt 缓存的场景由同一条 trail 记录兜底。"""
+    data = tmp_path / "panel.parquet"
+    _panel(data)
+    b = Bridge(state_root=str(tmp_path / "state"), execution_mode="in_process")
+    b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
+    b.dispatch("data.load", {"envId": "etf"})
+    b.dispatch("factor.random_generate", {"envId": "etf", "mode": "null-calibration", "n": 5})
+    # 真实评估 F（随机游走面板上弱）——trail 落盘引擎侧 dsr_stats
+    real = b.dispatch("factor.evaluate", {"envId": "etf", "source": F,
+                                          "stage": "development"})
+    assert abs(real["ic_ir_train"]) < 0.5  # 真实弱
+    # 手构强数字（无 _receipt）：谎报 sr_hat=5.0
+    fake_strong = {"ic_ir_train": 5.0, "ic_n_train": 100,
+                   "column_perm_train": {"z": 30.0, "p": 1e-9},
+                   "beta_exposure": 0.0,
+                   "deflated_train": {"p": 0.001, "n_trials": 1,
+                                      "sr_hat": 5.0, "skew": 0.0,
+                                      "kurt": 3.0, "n_obs": 100}}
+    sub = b.dispatch("registry.submit", {"envId": "etf", "name": "fake_strong",
+                                         "source": F, "signal": "x",
+                                         "diagnosis": fake_strong})
+    dp = sub["entry"]["diagnosis"]["deflated_train"]
+    assert dp.get("stats_from_trail") is True, dp
+    # 重算用的是引擎侧真实（弱）统计量 → p 不显著 → ic 轨拒
+    assert sub["tracks"]["ic"]["accepted"] is False, sub["tracks"]["ic"]

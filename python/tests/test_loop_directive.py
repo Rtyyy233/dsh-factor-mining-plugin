@@ -205,7 +205,7 @@ def test_cluster_trials_cap_stops(tmp_path):
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
-        "max_cluster_trials": 3, "ic_conv_window": 0,  # 关闭收敛判据
+        "max_cluster_trials": 3, "fam_conv_window": 0,  # 关闭收敛判据
         "finalized": False}), encoding="utf-8")
     _write_engine_trail(state, _family_sketches(3))  # 3 连同族 → streak 3
     loop = b._loop_directive()
@@ -223,7 +223,7 @@ def test_cluster_cap_resets_on_rotation(tmp_path):
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
-        "max_cluster_trials": 3, "ic_conv_window": 0,
+        "max_cluster_trials": 3, "fam_conv_window": 0,
         "finalized": False}), encoding="utf-8")
     _write_engine_trail(state, _family_sketches(3) + _indep_sketches(1, seed=21))
     loop = b._loop_directive()
@@ -236,7 +236,7 @@ def test_lifetime_trials_never_stop(tmp_path):
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
-        "max_cluster_trials": 3, "ic_conv_window": 0,
+        "max_cluster_trials": 3, "fam_conv_window": 0,
         "finalized": False}), encoding="utf-8")
     _write_engine_trail(state, _indep_sketches(8, seed=23))  # 8 试验全异族
     loop = b._loop_directive()
@@ -408,14 +408,15 @@ def test_strategy_query_on_accepted_milestone(tmp_path):
 
 
 def test_strategy_none_only_on_silent_terminals(tmp_path):
-    """v7 分流：静默终态（convergence/finalize）strategy=None、注入器
-    静默；方向预算停点 strategy 强制 rotate/literature（must_rotate）。"""
+    """v8 分流：静默终态（finalize/fail_streak——convergence 已退役，
+    2026-08-26 族收敛纯 must_rotate）strategy=None、注入器静默；
+    方向预算停点（arc/簇/族收敛）strategy 强制 rotate/literature。"""
     from dsh_factor_mining.bridge import _pick_strategy
     base = dict(streak=3, pending_rejected=None, frozen=False,
                 plateau=False, pass_unadmitted=0, accepted_n=0,
                 agent_rounds=1, n_trials=1)
     # 静默终态 → None
-    for kind in ("finalize", "convergence", "fail_streak"):
+    for kind in ("finalize", "fail_streak"):
         assert _pick_strategy(**base, stop_kind=kind) is None, kind
     # 方向预算 → 强制 rotate（族小无边际数据）或 literature（边际枯竭）
     s = _pick_strategy(**base, stop_kind="direction_budget")
@@ -452,7 +453,7 @@ def test_arc_cap_is_direction_budget(tmp_path):
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
         "max_rounds": 2, "arc_rounds": 2, "max_cluster_trials": 999,
-        "ic_conv_window": 0, "finalized": False}), encoding="utf-8")
+        "fam_conv_window": 0, "finalized": False}), encoding="utf-8")
     loop = b._loop_directive()
     assert loop["state"] == "must_rotate", loop
     assert loop["stop_kind"] == "direction_budget", loop
@@ -500,7 +501,7 @@ def test_arc_cap_released_by_rotation(tmp_path):
                             "ic_series_train": fam[0]}, None)
     (state / "mining_state.json").write_text(json.dumps({
         "max_rounds": 2, "arc_rounds": 2, "max_cluster_trials": 999,
-        "ic_conv_window": 0, "finalized": False}), encoding="utf-8")
+        "fam_conv_window": 0, "finalized": False}), encoding="utf-8")
     assert b._loop_directive()["state"] == "must_rotate"
     b._append_engine_trail("primary", "h2", "development",
                            {"ic_ir_train": 0.2, "horizon": 20,
@@ -510,49 +511,64 @@ def test_arc_cap_released_by_rotation(tmp_path):
     assert loop["round"] == 0, loop
 
 
-def test_ic_convergence_stops(tmp_path):
-    """滑窗对滑窗：前窗最佳 0.7，最近窗最佳 0.5 → 改善 -0.2 < 0.05 → 收敛。"""
+def test_family_convergence_stops(tmp_path):
+    """族内收敛（2026-08-26 v8：滑窗对滑窗搬进族内 + 纯 must_rotate）：
+    同族前窗最佳 0.7，最近窗最佳 0.5 → 改善 −0.2 < 0.05 → 收敛。
+    触发的是换向（direction_budget/must_rotate），不再是静默终态。"""
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
-        "max_cluster_trials": 999, "ic_conv_window": 4, "ic_conv_delta": 0.05,
-        "finalized": False}), encoding="utf-8")
-    _write_engine_trail_irs(state, [0.7, 0.7, 0.7, 0.7, 0.5, 0.5, 0.5, 0.5])
+        "max_cluster_trials": 999, "fam_conv_window": 4,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    sketches = _family_sketches(8)
+    _write_engine_trail_full(state, [
+        {"ic_ir": v, "ic_series_sketch": s}
+        for v, s in zip([0.7, 0.7, 0.7, 0.7, 0.5, 0.5, 0.5, 0.5], sketches)])
     loop = b._loop_directive()
-    assert loop["state"] == "may_stop", loop
-    assert loop["stop_kind"] == "convergence", loop
-    assert "IC_IR 改善收敛" in loop["stop_reason"], loop["stop_reason"]
-    assert "前窗口最佳" in loop["stop_reason"]
-    # 全局收敛 = 静默终态：无策略、注入器让位用户（数据集轮换是用户操作）
-    assert loop["strategy"] is None, loop
-    assert "用户" in loop["obligation"], loop["obligation"]
+    assert loop["state"] == "must_rotate", loop
+    assert loop["stop_kind"] == "direction_budget", loop
+    assert "族内 IC 收敛" in loop["stop_reason"], loop["stop_reason"]
+    assert "窗口最佳" in loop["stop_reason"]
+    # 纯 must_rotate：有策略（rotate/literature）、注入器照常推进
+    assert loop["strategy"] is not None, loop
+    assert loop["strategy"]["type"] in ("rotate", "literature"), loop["strategy"]
+    assert "换向" in loop["obligation"], loop["obligation"]
+    # 遥测在场（PASS-FAIL：多维报告）
+    fc = loop["family_convergence"]
+    assert fc["enough_data"] and fc["family_size"] == 8, fc
+    assert fc["recent_best"] == 0.5 and fc["prev_best"] == 0.7, fc
 
 
-def test_ic_convergence_not_fired_when_improving(tmp_path):
-    """前窗 0.3，最近窗 0.7 → 改善 0.4 ≥ 0.05 → 未收敛，继续。"""
+def test_family_convergence_not_fired_when_improving(tmp_path):
+    """族内前窗 0.3，最近窗 0.7 → 改善 0.4 ≥ 0.05 → 未收敛，继续。"""
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
-        "max_cluster_trials": 999, "ic_conv_window": 4, "ic_conv_delta": 0.05,
-        "finalized": False}), encoding="utf-8")
-    _write_engine_trail_irs(state, [0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3])
+        "max_cluster_trials": 999, "fam_conv_window": 4,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    sketches = _family_sketches(8)
+    _write_engine_trail_full(state, [
+        {"ic_ir": v, "ic_series_sketch": s}
+        for v, s in zip([0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3], sketches)])
     loop = b._loop_directive()
     assert loop["state"] == "running", loop
     assert loop["obligation"] is not None
 
 
-def test_ic_convergence_no_lifetime_ratchet(tmp_path):
-    """棘轮修正（2026-08-24 用户修正的同一逻辑）：全历史最高 0.9 在更早
-    位置，但前窗仅 0.4、最近窗 0.55 → 相对前窗改善 0.15 ≥ 0.05 → 不收敛。
-    旧版对照全历史最佳会被 0.9 棘轮永久压死。"""
+def test_family_convergence_no_lifetime_ratchet(tmp_path):
+    """棘轮修正（同族内）：族历史最高 0.9 在更早位置，但前窗仅 0.4、
+    最近窗 0.55 → 相对前窗改善 0.15 ≥ 0.05 → 不收敛。
+    对照全历史最佳会被 0.9 棘轮永久压死。"""
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "mining_state.json").write_text(json.dumps({
-        "max_cluster_trials": 999, "ic_conv_window": 4, "ic_conv_delta": 0.05,
-        "finalized": False}), encoding="utf-8")
-    _write_engine_trail_irs(
-        state, [0.9, 0.1, 0.1, 0.1, 0.1, 0.4, 0.4, 0.4, 0.4,
-                0.55, 0.5, 0.5, 0.5])
+        "max_cluster_trials": 999, "fam_conv_window": 4,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    irs = [0.9, 0.1, 0.1, 0.1, 0.1, 0.4, 0.4, 0.4, 0.4,
+           0.55, 0.5, 0.5, 0.5]
+    sketches = _family_sketches(len(irs))
+    _write_engine_trail_full(state, [
+        {"ic_ir": v, "ic_series_sketch": s} for v, s in zip(irs, sketches)])
     loop = b._loop_directive()
     assert loop["state"] == "running", loop
 
@@ -646,3 +662,136 @@ def test_loop_on_batch_and_summary(tmp_path):
     summary = b.dispatch("state.trail_summary", {})
     assert "loop" in summary, "trail_summary 缺 loop 指令"
     assert summary["loop"]["state"] == "running"
+
+
+# ---- 2026-08-25 review 修复回归 ----
+
+def test_family_convergence_dedups(tmp_path):
+    """族内收敛窗口按 (source_hash, horizon) 去重（与 n_trials/bar_sigma
+    同键）——跨 stage 重复条目不得灌窗口计数触发假收敛。"""
+    b = _make_bridge(tmp_path)
+    state = tmp_path / "state"
+    (state / "mining_state.json").write_text(json.dumps({
+        "fam_conv_window": 3, "fam_conv_delta": 0.05}), encoding="utf-8")
+    sketches = _family_sketches(8)
+    dup = [{"source_hash": "a", "horizon": 5, "ic_ir": 0.5,
+            "ic_series_sketch": s} for s in sketches]
+    fired, reason, diag = b._family_convergence(dup, {"fam_conv_window": 3,
+                                                      "fam_conv_delta": 0.05})
+    assert fired is False and diag["family_size"] == 1, diag  # 去重后 1 < 2W
+    uniq = [{"source_hash": f"s{i}", "horizon": 5, "ic_ir": 0.5,
+             "ic_series_sketch": s} for i, s in enumerate(sketches)]
+    fired, reason, diag = b._family_convergence(uniq, {"fam_conv_window": 3,
+                                                       "fam_conv_delta": 0.05})
+    assert fired is True and reason is not None, (fired, reason, diag)
+
+
+# ---- v8 族内收敛新增（2026-08-26 规划书） ----
+
+def test_new_family_not_suppressed_by_old_peak(tmp_path):
+    """核心动机：旧族峰值 0.9 不压新族——新族在改善中（族内 0.3→0.5）
+    → 族收敛不触发（running）。全局收敛在此场景必触发（recent 0.5
+    vs 前窗 max=0.9）——这正是被替换的行为。"""
+    b = _make_bridge(tmp_path)
+    state = tmp_path / "state"
+    (state / "mining_state.json").write_text(json.dumps({
+        "max_cluster_trials": 999, "fam_conv_window": 5,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    old_fam = _family_sketches(5, seed=21)          # 旧族：峰值族
+    new_fam = _family_sketches(10, seed=33)         # 新族：与旧族独立
+    entries = ([{"ic_ir": 0.9, "ic_series_sketch": s} for s in old_fam]
+               + [{"ic_ir": v, "ic_series_sketch": s}
+                  for v, s in zip([0.3] * 5 + [0.5] * 5, new_fam)])
+    _write_engine_trail_full(state, entries)
+    loop = b._loop_directive()
+    assert loop["state"] == "running", loop
+    fc = loop["family_convergence"]
+    assert fc["family_size"] == 10 and fc["recent_best"] == 0.5, fc
+    assert fc["prev_best"] == 0.3, fc               # 参考系 = 新族前一窗
+
+
+def test_new_family_plateau_rotates(tmp_path):
+    """对照：新族自身平台（族内 0.45→0.42）→ 族收敛触发 must_rotate
+    （族内确实没改善，换向合理——不是被旧峰值压死）。"""
+    b = _make_bridge(tmp_path)
+    state = tmp_path / "state"
+    (state / "mining_state.json").write_text(json.dumps({
+        "max_cluster_trials": 999, "fam_conv_window": 5,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    old_fam = _family_sketches(5, seed=21)
+    new_fam = _family_sketches(10, seed=33)
+    entries = ([{"ic_ir": 0.9, "ic_series_sketch": s} for s in old_fam]
+               + [{"ic_ir": v, "ic_series_sketch": s}
+                  for v, s in zip([0.45] * 5 + [0.42] * 5, new_fam)])
+    _write_engine_trail_full(state, entries)
+    loop = b._loop_directive()
+    assert loop["state"] == "must_rotate", loop
+    assert "族内 IC 收敛" in loop["stop_reason"], loop["stop_reason"]
+
+
+def test_family_convergence_small_family_silent(tmp_path):
+    """enough_data 门槛：族 < 2·Wf 条不判（小族由 marginal 软信号兜底），
+    也不会因族小触发假收敛。"""
+    b = _make_bridge(tmp_path)
+    state = tmp_path / "state"
+    (state / "mining_state.json").write_text(json.dumps({
+        "max_cluster_trials": 999, "fam_conv_window": 20,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    sketches = _family_sketches(22)                 # 22 < 2×20（生产当前族规模）
+    _write_engine_trail_full(state, [
+        {"ic_ir": 0.4 if i < 11 else 0.1, "ic_series_sketch": s}
+        for i, s in enumerate(sketches)])
+    loop = b._loop_directive()
+    assert loop["state"] == "running", loop
+    fc = loop["family_convergence"]
+    assert fc["enough_data"] is False and fc["family_size"] == 22, fc
+
+
+def test_family_convergence_disabled_by_zero_window(tmp_path):
+    """fam_conv_window ≤ 0 = 关闭（同旧全局版约定）。"""
+    b = _make_bridge(tmp_path)
+    state = tmp_path / "state"
+    (state / "mining_state.json").write_text(json.dumps({
+        "max_cluster_trials": 999, "fam_conv_window": 0,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    sketches = _family_sketches(8)
+    _write_engine_trail_full(state, [
+        {"ic_ir": v, "ic_series_sketch": s}
+        for v, s in zip([0.7] * 4 + [0.1] * 4, sketches)])
+    loop = b._loop_directive()
+    assert loop["state"] == "running", loop
+    assert loop["family_convergence"].get("disabled") is True
+
+
+def test_family_convergence_released_by_chain_break(tmp_path):
+    """断链解除：族收敛触发 must_rotate 后，新试验换源（独立 sketch）
+    断链 → 新族从头累计 → 回 running。同族续推则门持续压着。"""
+    b = _make_bridge(tmp_path)
+    state = tmp_path / "state"
+    (state / "mining_state.json").write_text(json.dumps({
+        "max_cluster_trials": 999, "fam_conv_window": 4,
+        "fam_conv_delta": 0.05, "finalized": False}), encoding="utf-8")
+    fam = _family_sketches(8)
+    _write_engine_trail_full(state, [
+        {"ic_ir": v, "ic_series_sketch": s}
+        for v, s in zip([0.7] * 4 + [0.5] * 4, fam)])
+    assert b._loop_directive()["state"] == "must_rotate"
+    # 换向：独立 sketch 的新试验断链（尾部族换成新单例；走真实追加路径
+    # ——断链检测/arc 归零随之发生）
+    b._append_engine_trail("primary", "newdir", "development",
+                           {"ic_ir_train": 0.3, "horizon": 20,
+                            "ic_series_train": _indep_sketches(1, seed=77)[0]},
+                           None)
+    loop = b._loop_directive()
+    assert loop["state"] == "running", loop
+    assert loop["family_convergence"]["family_size"] == 1, loop
+
+
+def test_trail_summary_cluster_counted(tmp_path):
+    """trail_summary 的 termination 注入读时计算的 cluster_trials——
+    此前直传盘上 mining（该键从不在盘上）恒显示「簇试验 0/200」，
+    与 loop 指令口径不一致。"""
+    b = _make_bridge(tmp_path)
+    _write_engine_trail(tmp_path / "state", _family_sketches(3))
+    s = b.dispatch("state.trail_summary", {})
+    assert s["termination"]["state"]["cluster_trials"] == 3, s["termination"]
