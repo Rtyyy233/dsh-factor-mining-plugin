@@ -3001,24 +3001,55 @@ class Bridge:
                 "trail_engine 权威统计量）")
         source = str(params.get("source", ""))
         source_hash = source_fingerprint(source) if source else None
+        # source 一致性硬校验（2026-08-26 rank_persistence_w30 事故根因：
+        # agent 提交时重打的 source 与评估时字节不一致 → hash 漂移 →
+        # 尾块反查失败 → 程序性拒绝烧名）。诊断的 _meta.source_hash 是
+        # evaluate 时真实评估对象的指纹——在场且不一致 = 提交物与评审物
+        # 不是同一份代码，事务性拒绝（不落盘），错误信息给出两侧 hash
+        # 引导原样复制。
+        _diag_hash = None
+        if isinstance(diagnosis.get("_meta"), dict):
+            _dh = diagnosis["_meta"].get("source_hash")
+            if isinstance(_dh, str) and _dh:
+                _diag_hash = _dh
+        if (source and source_hash and _diag_hash
+                and _diag_hash != source_hash):
+            raise BridgeError(
+                -32602,
+                f"提交的 source 与 diagnosis 的 source 不一致（提交 "
+                f"{source_hash[:12]} vs 诊断 {_diag_hash[:12]}）——diagnosis "
+                "必须来自同一份 source 的 factor_evaluate。原样复制 evaluate "
+                "时传入的 source 字符串（字节级一致，含空格/换行/注释）"
+                "重新提交，不要重新输入或微调")
         existing = read_registry(self.state_root)
         if source_hash:
-            for e in existing:
-                if e.get("source_hash") == source_hash and e.get("name") != name:
+            # hash 撞铁律 + 程序性治愈（2026-08-26）：同 hash 异名的旧条目
+            # 若全部是程序性拒绝（因子从未被评审）→ 删除放行重试；
+            # 任何 accepted/实质性拒绝在场 → 维持铁律
+            _hash_dups = [e for e in existing
+                          if isinstance(e, dict)
+                          and e.get("source_hash") == source_hash
+                          and e.get("name") != name]
+            if _hash_dups:
+                if all(e.get("accepted") is False and _is_procedural_reject(e)
+                       for e in _hash_dups):
+                    existing = [e for e in existing if e not in _hash_dups]
+                    write_registry(existing, self.state_root)
+                else:
                     raise BridgeError(
                         -32003,
-                        f"该因子源码已以名字「{e.get('name')}」登记过（铁律：同一因子不得重复登记为新发现）")
+                        f"该因子源码已以名字「{_hash_dups[0].get('name')}」登记过"
+                        "（铁律：同一因子不得重复登记为新发现）")
         # 2026-08-18 生产审计补充（同名重复入册事故）：同一名字只允许一条 entry——
         # 实测 agent 想修正描述却反复 submit（同 hash 同名 / 改源码同名各一次），
         # registry 被同一因子灌 3 条。两种情况都拒绝并引导 update / 换名。
         dup = next((e for e in existing if e.get("name") == name), None)
         if dup is not None:
-            # 基础设施失败治愈（2026-08-25 pw15_compD_5050 事故）：旧版
-            # submit 的噪声门 fail-closed 分支会把「worker 超时/执行失败」
-            # 写成 accepted=false 条目 → 铁律按名拦截 → 重试被拒 = 名字
-            # 被烧。基础设施失败不是因子判定——清掉失败条目放行重试。
-            if dup.get("accepted") is False and str(dup.get("reason", "")).startswith(
-                    "噪声硬门执行失败"):
+            # 程序性拒绝治愈（2026-08-25 pw15 事故首倡，2026-08-26 扩展为
+            # 拒绝分类制）：旧 entry 被拒但因子从未被真正评审（尾块反查
+            # 失败/基础设施失败）= 名字被无意义烧掉——删除放行重试。
+            # 实质性拒绝（门真判了）照旧烧名。
+            if dup.get("accepted") is False and _is_procedural_reject(dup):
                 existing = [e for e in existing if e is not dup]
                 write_registry(existing, self.state_root)
             elif source_hash and dup.get("source_hash") == source_hash:
@@ -3340,6 +3371,17 @@ class Bridge:
         tail_decision = tail_admission(
             tail_block, tail_ledger(engine_trail), _z_spread, s0_emp=_s0_emp,
             placebo_z_gate=_placebo_gate_z, placebo_m=_placebo_gate_m)
+        # 尾块反查失败的可行动信息（2026-08-26 rank_persistence_w30 事故：
+        # agent 提交的 source 与评估时字节不一致 → hash 漂移 → trail 查无
+        # 此 hash → 「tail 块缺失」烧名。原始 reason 不含 hash 与修法指引，
+        # agent 只能瞎猜（实测连续两次掉同一坑））
+        if tail_block is None and source_hash:
+            tail_decision["reason"] = (
+                f"tail 块缺失：提交 source 的 hash {source_hash[:12]} 在 "
+                "trail_engine 无评估记录——提交的 source 与 factor_evaluate "
+                "时用的字节不一致（哪怕空格/换行/注释），或从未评估过这份"
+                "source。修法：用与 evaluate 完全相同的 source 字符串先 "
+                "evaluate 再原样提交（source 与 diagnosis 都不要重新输入）")
         tail_verdict = {
             "accepted": bool(tail_decision["accepted"]),
             "reason": str(tail_decision["reason"])[:300],
@@ -3391,11 +3433,19 @@ class Bridge:
                     "不是 agent 的停笔理由",
                 ],
             }
+        # 拒绝分类（2026-08-26）：程序性（未评审——尾块反查失败/基础设施）
+        # vs 实质性（门真判了）——铁律据此决定重提交时治愈还是烧名
+        _rk = None
+        if not accepted:
+            _rk = ("procedural"
+                   if any(m in str(reason) for m in _PROCEDURAL_REJECT_MARKS)
+                   else "substantive")
         entry = {
             "name": name,
             "signal": signal,
             "accepted": accepted,
             "reason": reason,
+            "reject_kind": _rk,
             "ic_ir_train": diagnosis.get("ic_ir_train"),
             "verified": True if verified else False,
             "diagnosis": diagnosis,
@@ -3734,6 +3784,29 @@ class Bridge:
         out_path = out_dir / f"{_t.strftime('%Y%m%d-%H%M%S')}_{name.replace('/', '_')[:40]}.md"
         out_path.write_text(content, encoding="utf-8")
         return {"ok": True, "path": str(out_path), "content": content}
+
+
+# ---- 拒绝分类（2026-08-26 rank_persistence_w30 事故产品化） ----
+# 程序性拒绝 = 因子从未被真正评审（尾块反查失败/基础设施失败/无法判定）；
+# 实质性拒绝 = 门真的判了（deflation/G1-G3/噪声 artifact/平坦性悬崖/receipt
+# 编造）。铁律只烧实质性——程序性拒绝的 entry 在重提交时删除放行
+# （门全部引擎侧确定性重跑，重试无可翻盘的随机性，放行≠降标准）。
+_PROCEDURAL_REJECT_MARKS = ("噪声硬门执行失败", "tail 块缺失")
+
+
+def _is_procedural_reject(entry) -> bool:
+    """entry 的拒绝是否程序性（未评审）。新条目读 reject_kind 字段；
+    旧条目（无字段）按 reason 关键词回退——只认引擎写盘的已知模式，
+    且限定 reason 前 120 字符防误匹配。"""
+    if not isinstance(entry, dict):
+        return False
+    rk = entry.get("reject_kind")
+    if rk == "procedural":
+        return True
+    if rk == "substantive":
+        return False
+    r = str(entry.get("reason", ""))[:120]
+    return any(m in r for m in _PROCEDURAL_REJECT_MARKS)
 
 
 def _passes_acceptance(result, z_threshold=3.0, beta_threshold=0.3, min_n=20):
