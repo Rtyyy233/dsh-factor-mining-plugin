@@ -889,6 +889,40 @@ def _region_diagnostic(F, fwd, pit, env, region_ic, region_name, t0_date, t1_dat
         "beta_exposure": _beta_exposure(F, env),
         "topn": _summarize_topn(topn, env) if len(topn) > 0 else None,
     }
+    # test 区尾块（WS3 2026-08-25）：最小集 {region, spread_ir, tail_ic,
+    # k_typical}，无 null——placebo 是 train 区 null 语义，test 的判定是
+    # 真实表现 vs 预先声明（也不给任何在 test 区反复试的机会）。spread
+    # 统计量在 test 行集（全局采样网格 ∩ [t0, t1)）上算，与 topn 同行集。
+    # 两条防线（tail_ledger stage 过滤 + submit 反查排除）保证它绝不
+    # 混入计价/准入。
+    if region_name == "test":
+        try:
+            from .tail import K_FRAC, _topk_block
+            step = max(int(env.calibration.sample_step), 1)
+            sig = np.arange(0, env.T, step)
+            rows = sig[(sig >= int(t0))
+                       & (sig < (env.T if t1 is None else int(t1)))]
+            spreads, tail_ics, _ics, ks, _pairs = _topk_block(
+                F, fwd, pit, rows, K_FRAC)
+            tail = None
+            if len(spreads) >= 10:
+                sp = np.array(spreads)
+                sd = sp.std(ddof=1)
+                ti = np.array(tail_ics) if tail_ics else None
+                tail = {
+                    "region": "test",
+                    "k_frac": K_FRAC,
+                    "spread_ir": (round(float(sp.mean() / sd), 4) + 0.0
+                                  if sd > 0 else None),
+                    "tail_ic": (round(float(ti.mean() / ti.std(ddof=1)), 4) + 0.0
+                                if ti is not None and len(ti) >= 5
+                                and ti.std(ddof=1) > 0 else None),
+                    "k_typical": int(round(float(np.mean(ks)))) if ks else 0,
+                    "n_days": int(len(sp)),
+                }
+            result["tail"] = tail
+        except Exception as _te:
+            result["tail"] = {"error": f"{type(_te).__name__}: {_te}"[:120]}
     from ..discipline import red_flags_and_verdict
     gv = red_flags_and_verdict(result, region=region_name)
     result["verdict"] = gv["verdict"]
@@ -949,7 +983,9 @@ def evaluate_test(F, env, verbose=False, state_root=None, source_hash=None,
         "fingerprint": fingerprint,
         "engine_version": __import__("dsh_factor_mining", fromlist=["__version__"]).__version__,
         "diagnosis_summary": {"ic_ir": result.get("ic_ir"), "ic_mean": result.get("ic_mean"),
-                              "ic_n": result.get("ic_n"), "verdict": result.get("verdict")},
+                              "ic_n": result.get("ic_n"), "verdict": result.get("verdict"),
+                              "spread_ir_test": (result.get("tail") or {}).get("spread_ir")
+                              if isinstance(result.get("tail"), dict) else None},
         "calibration": {"dev_end": env.calibration.dev_end,
                         "sel_end": env.calibration.sel_end,
                         "horizon": env.calibration.horizon},

@@ -182,13 +182,18 @@ def test_receipt_verification_flow():
             "envId": "primary", "source": GOOD, "name": "mom20",
             "diagnosis": diag})
         assert r["receipt_verified"] is True and r["entry"]["verified"] is True
-        # 2) 编造数字（改 ic_ir_train 但偷 receipt）→ 验证失败
+        # 2) 编造数字（改 ic_ir_train 但偷 receipt）→ 拒收（2026-08-25
+        # 收紧：此前只降级 verified=False 照常落盘——receipt 不拦截等于
+        # 门只锁门框不锁门；诚实提交是逐字复制的，不会命中这里）
         forged = dict(diag)
         forged["ic_ir_train"] = 99.0
-        r2 = b.dispatch("registry.submit", {
-            "envId": "primary", "source": GOOD + "\n# variant", "name": "forged",
-            "diagnosis": forged})
-        assert r2["receipt_verified"] is False and r2["entry"]["verified"] is False
+        try:
+            b.dispatch("registry.submit", {
+                "envId": "primary", "source": GOOD + "\n# variant",
+                "name": "forged", "diagnosis": forged})
+            raise AssertionError("偷 receipt 改数字应被拒收")
+        except BridgeError as e:
+            assert "receipt" in e.message, e.message
         # 3) 同一 source 换名重复登记 → 铁律拒绝
         try:
             b.dispatch("registry.submit", {

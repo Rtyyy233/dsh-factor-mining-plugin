@@ -136,16 +136,20 @@ def test_deflation_bar_monotone():
 def test_admission_chain():
     good_tail = {"spread_ir": 5.0,
                  "topn": {"placebo_z": 10.0, "periods": 100}}
-    # 空 ledger → N_eff=1 → bar 低 → 通过（placebo 已过）
-    ok = tail_admission(good_tail, [], None)
+    # 空 ledger → N_eff=1 → bar 低 → 通过（placebo 已过；G2 z 正常无 artifact）
+    ok = tail_admission(good_tail, [], 0.5)
     assert ok["accepted"] is True, ok
     # G1 拒：placebo 弱
     g1 = tail_admission({"spread_ir": 5.0,
-                         "topn": {"placebo_z": 1.0, "periods": 100}}, [], None)
+                         "topn": {"placebo_z": 1.0, "periods": 100}}, [], 0.5)
     assert g1["accepted"] is False and "G1" in g1["reason"]
     # G2 拒：spread 噪声门爆表
     g2 = tail_admission(good_tail, [], 5.0)
     assert g2["accepted"] is False and "G2" in g2["reason"]
+    # G2 无法判定 = 不判过（fail-closed，2026-08-25：与 IC 轨噪声门
+    # 「无法判定 = 事务中止」同一纪律——z 不可计算不得静默放行）
+    g2n = tail_admission(good_tail, [], None)
+    assert g2n["accepted"] is False and "G2 无法判定" in g2n["reason"], g2n
     # G3 拒：N_eff 大 → 门超过 spread_ir（弱 spread + 大搜索史）
     big_ledger = [{"spread_ir": 1.0}
                   for _ in range(400)]
@@ -154,7 +158,7 @@ def test_admission_chain():
                   for i in range(400)]
     g3 = tail_admission({"spread_ir": 0.3,
                          "topn": {"placebo_z": 10.0, "periods": 100}},
-                        big_ledger, None)
+                        big_ledger, 0.5)
     assert g3["accepted"] is False and "G3" in g3["reason"], g3["reason"]
 
 
@@ -228,30 +232,32 @@ def test_dual_pass_annotation(tmp_path):
 
 
 def test_dual_pass_false_when_ic_rejected(tmp_path):
-    """ic 拒（弱 diagnosis）+ 尾轨过 → dual_pass=False（两轨判定独立）。"""
+    """ic 拒（红牌）+ 尾轨过 → dual_pass=False（两轨判定独立）。
+
+    2026-08-25 改用真实 evaluate 诊断：submit 重算现在优先用 trail_engine
+    的权威充分统计量（防手构 sr_hat），手构弱数字会被引擎侧真实数字
+    覆盖——「弱 diagnosis」必须来自真实弱评估。TILT 真实 IC_IR≈51 →
+    |IC_IR|>5 红牌 → ic 轨拒；尾轨（强 tilt）独立通过。"""
     b = _make_drift_bridge(tmp_path)
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
-    b.dispatch("factor.evaluate", {"envId": "primary",
-                                   "source": TILT_SOURCE,
-                                   "stage": "development"})
+    diag = b.dispatch("factor.evaluate", {"envId": "primary",
+                                          "source": TILT_SOURCE,
+                                          "stage": "development"})
+    assert diag.get("red_flags"), "TILT 真实 IC_IR 应触发红牌"
     sub = b.dispatch("registry.submit", {
         "name": "tilt_icweak", "signal": "x",
         "source": TILT_SOURCE,
-        "diagnosis": {"ic_ir_train": 0.05, "ic_n_train": 50,
-                      "column_perm_train": {"z": 3.5, "p": 0.0002},
-                      "beta_exposure": 0.1,
-                      "deflated_train": {"p": 0.5, "n_trials": 1,
-                                         "sr_hat": 0.05, "skew": 0.0,
-                                         "kurt": 3.0, "n_obs": 60}}})
-    assert sub["accepted"] is False                     # ic 轨管 acceptance
+        "diagnosis": diag})
+    assert sub["accepted"] is False                     # ic 轨管 acceptance（红牌拒）
     assert sub["tracks"]["ic"]["accepted"] is False
     assert sub["tracks"]["tail"]["accepted"] is True    # 尾轨独立判定
     assert sub["dual_pass"] is False
 
 
 def test_submit_default_ic_unchanged(tmp_path):
-    """默认 admit_basis=ic：不跑尾部轨，行为与 Phase 4 前一致。"""
+    """默认 admit_basis=ic：acceptance 由 ic 轨管（尾轨照常判定作
+    tracks.tail 标注），但不产生 tail_track 兼容字段。"""
     b = _make_drift_bridge(tmp_path)
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
@@ -279,3 +285,110 @@ def test_submit_default_ic_unchanged(tmp_path):
     except BridgeError:
         raised = True
     assert raised
+
+
+# ---- 6. G2 fail-closed + 尾块 horizon 匹配（2026-08-25 review 修复） ----
+
+def test_g2_undeterminable_fail_closed(tmp_path, monkeypatch):
+    """G2（spread 噪声门）无法判定：tail 轨准入 = 事务中止（不烧名，
+    与 IC 轨噪声门「无法判定 = 中止」同纪律）；ic 轨提交 = tracks.tail
+    保守判「不判过」（标注不受 G2 fail-open 静默放行）。"""
+    from dsh_factor_mining.factor import noise as noise_mod
+    real = noise_mod.noise_test
+
+    def fake_noise(fn, env, m, base_seed, **kw):
+        # bridge 的 in_process 分发把 "spread" 字符串换成了统计量函数再
+        # 传入——IC 版不传 statistic，spread 版传非 None
+        if kw.get("statistic") is not None:
+            return {"m": m, "requested_m": m, "n_valid": 1,
+                    "z": float("nan"), "artifact": None,
+                    "note": "有效世界不足，无法判定"}
+        return real(fn, env, m, base_seed, **kw)
+
+    monkeypatch.setattr(noise_mod, "noise_test", fake_noise)
+    b = _make_drift_bridge(tmp_path)
+    b.dispatch("factor.random_generate", {"envId": "primary",
+                                          "mode": "null-calibration", "n": 5})
+    diag = b.dispatch("factor.evaluate", {"envId": "primary",
+                                          "source": TILT_SOURCE,
+                                          "stage": "development"})
+    # tail 轨准入 → 事务中止，registry 不落盘
+    try:
+        b.dispatch("registry.submit", {
+            "name": "g2_abort", "signal": "x", "source": TILT_SOURCE,
+            "diagnosis": diag, "admit_basis": "tail"})
+        raised = False
+    except BridgeError as e:
+        raised = True
+        assert "spread 噪声门无法判定" in str(e), str(e)
+    assert raised
+    assert not (tmp_path / "state" / "registry.json").exists()
+    # ic 轨提交 → 主判定走 ic，尾轨标注保守（G2 无法判定 → 不判过）
+    sub = b.dispatch("registry.submit", {
+        "name": "g2_ic", "signal": "x", "source": TILT_SOURCE,
+        "diagnosis": diag})
+    assert sub["tracks"]["tail"]["accepted"] is False, sub["tracks"]["tail"]
+    assert "G2 无法判定" in sub["tracks"]["tail"]["reason"]
+    assert sub["dual_pass"] is False
+
+
+def _write_two_horizon_trail(state_root: Path, sh: str) -> None:
+    """同 source_hash 两个 horizon 的尾块：旧条目 horizon=5 强、
+    新条目 horizon=20 弱——老逻辑（只比 hash）会拿新的弱块。"""
+    strong = {"k_frac": 0.2, "spread_ir": 0.9,
+              "topn": {"placebo_z": 10.0, "periods": 100}}
+    weak = {"k_frac": 0.2, "spread_ir": 0.05,
+            "topn": {"placebo_z": 0.5, "periods": 100}}
+    trail = [
+        {"ts": "2026-08-25T10:00:00", "envId": "primary", "source_hash": sh,
+         "stage": "development", "horizon": 5, "tail": strong},
+        {"ts": "2026-08-25T11:00:00", "envId": "primary", "source_hash": sh,
+         "stage": "development", "horizon": 20, "tail": weak},
+    ]
+    (Path(state_root) / "trail_engine.json").write_text(
+        json.dumps(trail), encoding="utf-8")
+
+
+_WEAK_DIAG = {"ic_ir_train": 0.25, "ic_n_train": 50,
+              "column_perm_train": {"z": 4.0, "p": 0.0001},
+              "beta_exposure": 0.1,
+              "deflated_train": {"p": 0.001, "n_trials": 1,
+                                 "sr_hat": 0.5, "skew": 0.0,
+                                 "kurt": 3.0, "n_obs": 60}}
+
+
+def test_tail_block_horizon_matched(tmp_path):
+    """尾块按 (source_hash, horizon) 匹配：提交 horizon=5 的诊断必须
+    用 horizon=5 的尾块（强），不得被最新的 horizon=20 弱块遮蔽。"""
+    from dsh_factor_mining.discipline import source_fingerprint
+    b = _make_drift_bridge(tmp_path)
+    b.dispatch("factor.random_generate", {"envId": "primary",
+                                          "mode": "null-calibration", "n": 5})
+    _write_two_horizon_trail(tmp_path / "state",
+                             source_fingerprint(TILT_SOURCE))
+    sub = b.dispatch("registry.submit", {
+        "name": "hm5", "signal": "x", "source": TILT_SOURCE,
+        "diagnosis": {**_WEAK_DIAG, "horizon": 5}})
+    assert sub["tracks"]["tail"]["accepted"] is True, sub["tracks"]["tail"]
+    assert sub["tracks"]["tail"]["diag"]["n_eff"] == 2  # 两个尾块账本条目
+
+
+def test_tail_block_horizon_mismatch_uses_own(tmp_path):
+    """对照：提交 horizon=20 的诊断用 horizon=20 的弱块 → 拒收。
+    WS2 语义更新：G1 判定值来自 submit 权威重跑（tilt 因子真实 placebo
+    z 高 → G1 过），弱尾块的 spread_ir=0.05 在 G3 拒——horizon 匹配
+    语义仍被验证（若错拿 h=5 强块 spread_ir=0.9 则会通过）。"""
+    from dsh_factor_mining.discipline import source_fingerprint
+    b = _make_drift_bridge(tmp_path)
+    b.dispatch("factor.random_generate", {"envId": "primary",
+                                          "mode": "null-calibration", "n": 5})
+    _write_two_horizon_trail(tmp_path / "state",
+                             source_fingerprint(TILT_SOURCE))
+    sub = b.dispatch("registry.submit", {
+        "name": "hm20", "signal": "x", "source": TILT_SOURCE,
+        "diagnosis": {**_WEAK_DIAG, "horizon": 20}})
+    assert sub["tracks"]["tail"]["accepted"] is False
+    assert "G3" in sub["tracks"]["tail"]["reason"], sub["tracks"]["tail"]
+    # G1 走 submit 重算值（非弱块的轻量 placebo_z=0.5）
+    diag = sub["tracks"]["tail"]["diag"]
+    assert diag["placebo_degraded"] is False and diag["placebo_z"] >= 3, diag

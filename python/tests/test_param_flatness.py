@@ -219,3 +219,41 @@ def test_submit_without_decl_skips(tmp_path):
                                          "kurt": 3.0, "n_obs": 60}}})
     fl = sub.get("flatness")
     assert fl["n_params"] == 0 and "跳过" in fl["note"], fl
+
+
+# ---- 6. Phase 6 硬门接线（2026-08-25 review 补测试） ----
+
+def test_submit_cliff_rejects(tmp_path, monkeypatch):
+    """cliff 悬崖签名 → accepted=False + [平坦性] 理由落盘。此前只有
+    unit 级 cliff 语义与「平滑因子过 submit」的接线测试，Phase 6 启用
+    的拒收分支无集成覆盖。注入方式：monkeypatch train_ic_ir——中心
+    +0.5，全部邻居 -0.3（翻号签名）。"""
+    import dsh_factor_mining.factor.flatness as flat_mod
+    calls = {"n": 0}
+
+    def fake_train_ic_ir(F, env):
+        calls["n"] += 1
+        return 0.5 if calls["n"] == 1 else -0.3
+
+    monkeypatch.setattr(flat_mod, "train_ic_ir", fake_train_ic_ir)
+    b = _make_drift_bridge(tmp_path)
+    b.dispatch("factor.random_generate", {"envId": "primary",
+                                          "mode": "null-calibration", "n": 5})
+    sub = b.dispatch("registry.submit", {
+        "name": "f_cliff", "signal": "window momentum",
+        "source": WINDOW_SOURCE,
+        "diagnosis": {"ic_ir_train": 0.05, "ic_n_train": 50,
+                      "column_perm_train": {"z": 3.5, "p": 0.0002},
+                      "beta_exposure": 0.1,
+                      "deflated_train": {"p": 0.5, "n_trials": 1,
+                                         "sr_hat": 0.05, "skew": 0.0,
+                                         "kurt": 3.0, "n_obs": 60}},
+        "flatness_params": [{"name": "window", "value": 20, "step": 1}]})
+    assert sub["accepted"] is False
+    assert "[平坦性]" in sub["reason"] and "sign_flip" in sub["reason"], sub["reason"]
+    reg = json.loads((tmp_path / "state" / "registry.json")
+                     .read_text(encoding="utf-8"))
+    assert reg[-1]["accepted"] is False
+    assert reg[-1]["flatness"]["cliff"] is True
+    # note 语义与硬门一致（2026-08-25 修正：不再自述 report-only）
+    assert "report-only" not in reg[-1]["flatness"].get("note", "")

@@ -33,8 +33,13 @@ MINING_CONFIG = {
     # 计，不按终身计——trail 只增不减，终身上限=一次到顶永久停机）。
     # 簇 = 尾部同族链（|ρ|≥0.6 连续尾块），换方向即断链重置。
     "max_cluster_trials": 200,  # 当前方向连续同族试验上限（失控 backstop）
-    "ic_conv_window": 60,       # IC_IR 收敛窗口（滑窗对滑窗，见 _ic_convergence）
-    "ic_conv_delta": 0.05,      # 最近窗口最佳 |IC_IR| 超前一窗口最佳的幅度
+    # 族内 IC 收敛（2026-08-26 规划书：替换全局收敛——纯 must_rotate 停点，
+    # 族内滑窗对滑窗；旧键 ic_conv_window/ic_conv_delta 退役为死键不迁移）。
+    # Wf=10 由生产回放校准定稿（规划书附录 B1）：119 族中近期族 20-25 条
+    # 量级，Wf=20（门槛 40）下历史 0 触发=门形同虚设；Wf=10 的 5 个触发段
+    # 全部是真实平台（amihud 0.72 平台×3 + dk 族 0.348 vs 0.364×2）
+    "fam_conv_window": 10,      # 本族最近 Wf 条 vs 本族前一 Wf 条窗口（≤0 关闭）
+    "fam_conv_delta": 0.05,     # 改善 < δf → 族收敛（强制换向，断链解除）
 }
 
 
@@ -177,9 +182,10 @@ def check_termination(state: dict[str, Any] | None = None, root: str | os.PathLi
     finalize / fail_streak = 真终态，注入器静默交还用户。
     候选池满不是停点（12/12 假穷尽实证）。终身 n_trials 不做停点——
     只用于 deflation 多重检验计价（统计上必须全量计数）。
-    IC_IR 改善收敛是机械停点但在 bridge 侧计算（滑窗对滑窗，
-    见 bridge._ic_convergence；kind=convergence，全局平台=换向救不了，
-    静默终态），不经本函数。"""
+    IC_IR 改善收敛是机械停点但在 bridge 侧计算（族内滑窗对滑窗，
+    见 bridge._family_convergence；kind=direction_budget/must_rotate——
+    2026-08-26 v8：convergence 静默终态退役，族收敛只做换向信号），
+    不经本函数。"""
     st = state if state is not None else read_mining_state(root)
     arc = int(st.get("arc_rounds", 0))
     fail = int(st.get("global_fail_streak", 0))

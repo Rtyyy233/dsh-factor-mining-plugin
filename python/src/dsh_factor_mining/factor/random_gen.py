@@ -325,6 +325,23 @@ def _bucket_corr(s1, s2):
     return c if np.isfinite(c) else None
 
 
+def _train_end_date(v) -> str:
+    """train 区分界日期（v.calibration.dev_end None → 前 60% 回退）——
+    IC 分位段与 spread 段（WS1 2026-08-25）共用同一边界函数，
+    两段 null 的区域口径不得漂移。"""
+    dev_end = v.calibration.dev_end
+    if dev_end is None:
+        # 无显式分界（直调 API）：null 校准保守用前 60% 样本——
+        # 既不被三区卡死，也不把 selection/test 段纳入难度基线。
+        dev_end = str(pd.DatetimeIndex(v.dates)[int(v.T * 0.6)].date())
+    return dev_end
+
+
+def _train_end_of(v) -> int:
+    """train 区行边界（与 tail._train_end 同式：searchsorted dates）。"""
+    return int(np.searchsorted(v.dates, pd.Timestamp(_train_end_date(v))))
+
+
 def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress=None,
                          env_fingerprint=None, horizons=None):
     """null 地形：n 个随机因子的 IC_IR 经验分布，持久化。
@@ -344,9 +361,16 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
     跨 horizon IC 序列相关（cross_horizon_corr）——同因子扫 horizon 的族
     结构先验（N_eff 谱方法用它连接 (hash, h1)/(hash, h2) 试验）。成本 ×菜单
     宽度：n=50 × 4 horizon ≈ 单 horizon n=200 的量级。
+
+    spread 段（WS1 2026-08-25 任务书）：同批树 × horizon 视图追加 train 区
+    spread_ir（与 tail_metrics 同口径：行集 arange(0, t_end, sample_step)、
+    K = round(0.2·n_day)）→ per-horizon spread_ir 经验分布。尾部线 G3 的
+    s0 从解析式 1/√n_days 升级为该分布的 std（bridge._landscape_tail_s0）。
+    不另跑一批树——同批树保证 spread null 与 IC null 同条件。
     """
     from .evaluate import (_cross_sectional_ic, _env_horizon_view,
                            _forward_returns, _pit_mask)
+    from .tail import spread_ir_statistic
     opset = opset or effective_operator_set(state_root)
     menu = [int(h) for h in horizons] if horizons else [env.calibration.horizon]
     leaves = ["o", "h", "l", "c", "v"] + (["amount"] if getattr(env, "amount", None) is not None else [])
@@ -354,6 +378,7 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
     views = {h: _env_horizon_view(env, h) for h in menu}
     irs_by_h = {h: [] for h in menu}
     series_by_h = {h: [] for h in menu}
+    spread_by_h = {h: [] for h in menu}
     for _i in range(n):
         if on_progress is not None:
             try:
@@ -372,17 +397,21 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
         for h in menu:
             try:
                 v = views[h]
-                ic = _cross_sectional_ic(F, _forward_returns(v), _pit_mask(v),
-                                         v, sig_only=True)
-                dev_end = v.calibration.dev_end
-                if dev_end is None:
-                    dev_end = str(pd.DatetimeIndex(env.dates)[int(env.T * 0.6)].date())
-                ic = ic[ic.index < pd.Timestamp(dev_end)]
+                fwd = _forward_returns(v)
+                pit = _pit_mask(v)
+                ic = _cross_sectional_ic(F, fwd, pit, v, sig_only=True)
+                ic = ic[ic.index < pd.Timestamp(_train_end_date(v))]
                 if len(ic) >= 2 and ic.std(ddof=1) > 0:
                     ir = float(ic.mean() / ic.std(ddof=1))
                     if np.isfinite(ir):
                         irs_by_h[h].append(ir)
                         series_by_h[h].append(ic.values)
+                # spread null：与 IC 段同批树、同视图、同 train 边界
+                sp_ir = spread_ir_statistic(F, fwd, pit,
+                                            v.calibration.sample_step,
+                                            t_end=_train_end_of(v))
+                if sp_ir is not None and np.isfinite(sp_ir):
+                    spread_by_h[h].append(sp_ir)
             except Exception:
                 continue
 
@@ -400,6 +429,25 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
             "mean_abs": float(np.nanmean(np.abs(arr))) if len(arr) else None,
         }
 
+    # spread 段（WS1）：与 ic_ir per-horizon 结构同构，std 是 G3 的
+    # s0_emp（bridge._landscape_tail_s0 读）——同文件同 env_fingerprint，
+    # 指纹绑定自动生效
+    def _z(x):
+        # -0.0 归一（IEEE: -0.0+0.0=+0.0）——lossless JSON 检查拒 -0
+        return None if x is None else float(x) + 0.0
+
+    spread_out = {}
+    for h in menu:
+        k = len(spread_by_h[h])
+        arr = np.array(spread_by_h[h]) if k else np.array([np.nan])
+        spread_out[str(h)] = {
+            "p10": _z(_q(arr, 10)), "p50": _z(_q(arr, 50)),
+            "p90": _z(_q(arr, 90)), "p95": _z(_q(arr, 95)),
+            "std": _z(float(np.std(arr, ddof=1))) if k >= 2 else None,
+            "mean_abs": _z(float(np.mean(np.abs(arr)))) if k else None,
+            "n": int(k),
+        }
+
     # 跨 horizon 相关：同批随机因子在 (h1, h2) 的 IC 序列相关，跨因子平均
     cross_h = {}
     for i, h1 in enumerate(menu):
@@ -415,12 +463,17 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
     # 生产可见性（2026-08-20）：某 horizon 全空 = 该赌注无基线（下游 pool_std
     # None → D7 拒绝），静默 0-valid 是审计盲区——必须 stderr 可见
     for h in menu:
-        if len(irs_by_h[h]) == 0:
+        if len(irs_by_h[h]) == 0 or len(spread_by_h[h]) == 0:
             try:
                 import sys as _sys
-                _sys.stderr.write(
-                    f"[null-calibration] horizon={h} 无有效随机因子样本（全部"
-                    "生成/评估失败）——该 horizon 的 pool_std 基线缺失\n")
+                if len(irs_by_h[h]) == 0:
+                    _sys.stderr.write(
+                        f"[null-calibration] horizon={h} 无有效随机因子样本（全部"
+                        "生成/评估失败）——该 horizon 的 pool_std 基线缺失\n")
+                if len(spread_by_h[h]) == 0:
+                    _sys.stderr.write(
+                        f"[null-calibration] horizon={h} spread 段无有效样本——"
+                        "该 horizon 的尾部 s0_emp 基线缺失（G3 降级解析式）\n")
             except Exception:
                 pass
 
@@ -429,6 +482,7 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
         "env_fingerprint": env_fingerprint,
         "horizons": menu,
         "ic_ir": ic_ir_out,
+        "spread": spread_out,
         "cross_horizon_corr": cross_h,
         "interpretation": (
             "经验 null 分布（per-horizon）：随机因子的 IC_IR 集中在 p50 附近。"

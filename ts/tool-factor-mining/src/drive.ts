@@ -80,6 +80,23 @@ export function applyDrive(
   const states = new Map<unknown, DriveState>()
   const timers = new Set<ReturnType<typeof setTimeout>>()
 
+  // Bounded bookkeeping (2026-08-25 review): both containers otherwise grow
+  // unbounded over a long host run (one entry per session ever seen). Insertion
+  // order is preserved, so evicting the oldest entry is O(1).
+  const MAX_TRACKED = 500
+  const trimSessions = (): void => {
+    if (factorSessions.size <= MAX_TRACKED) return
+    const oldest = factorSessions.values().next().value
+    if (oldest !== undefined) factorSessions.delete(oldest)
+    if (states.size > MAX_TRACKED) {
+      const oldestState = states.keys().next().value
+      if (oldestState !== undefined && oldestState !== oldest) {
+        cancelPending(oldestState)
+        states.delete(oldestState)
+      }
+    }
+  }
+
   const stateFor = (id: unknown): DriveState => {
     let s = states.get(id)
     if (s === undefined) {
@@ -206,6 +223,7 @@ export function applyDrive(
             if (event.type === 'tool/call'
               && typeof data.name === 'string' && data.name.startsWith('factor_')) {
               factorSessions.add(session.id)
+              trimSessions()
               return
             }
             if (event.type === 'user/message' && data.source?.kind === 'user') {

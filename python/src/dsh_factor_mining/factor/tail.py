@@ -37,14 +37,18 @@ from .env import FactorEnv
 K_FRAC = 0.2
 
 
-def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC):
+def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
+                        *, t_end: int | None = None):
     """尾部组差 IR 独立统计量（noise/day-perm 的 spread 版共用签名：
-    (F, fwd, pit, step) → float | None）。全区间（无区域概念——
-    噪声世界/置换面板上的区域边界无意义），与 tail_metrics 的
-    train 区口径的差只影响绝对水平，同轨内比较不受影响。"""
+    (F, fwd, pit, step) → float | None）。t_end=None 全区间（无区域概念——
+    噪声世界/置换面板上的区域边界无意义），与 tail_metrics 的 train 区
+    口径的差只影响绝对水平，同轨内比较不受影响；t_end 给定 → 只用
+    [0, t_end) 行（WS1：null 校准的 spread 段与 tail_metrics 同口径，
+    K = round(0.2·n)，行集 arange(0, t_end, sample_step)）。"""
     F = np.asarray(F, dtype=np.float64)
+    end = F.shape[0] if t_end is None else min(int(t_end), F.shape[0])
     spreads = []
-    for t in range(0, F.shape[0], max(int(sample_step), 1)):
+    for t in range(0, end, max(int(sample_step), 1)):
         m = pit[t] & np.isfinite(F[t]) & np.isfinite(fwd[t])
         n = int(m.sum())
         if n < 8:
@@ -58,6 +62,77 @@ def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC):
     return float(np.mean(spreads) / s) if s > 0 else None
 
 
+def topn_placebo(F, fwd, pit, env, t_end, draws, seed,
+                 budget_secs: float | None = None) -> dict:
+    """top-N 净超额 vs 随机选股 placebo（WS2 2026-08-25 公共抽取：
+    evaluate 轻量版与 submit 权威版共用——一处实现两处口径）。
+
+    逐采样日置换因子截面（同构造/同成本/同期）重放 draws 次 → null
+    net 分布 → z。budget_secs 给 submit 权威版：跑满 10 次后按实测
+    均时外推，超预算且 ≥60 已跑即截断（60 下限保证 z 的 σ 估计误差
+    ≤ ~9%——evaluate 轻量版 10 draws 的 ~24% 不可作硬判据）。
+    截断不是失败，是如实样本量（draws 字段报实际值）。
+
+    返回 dict：periods/net_mean/gross_mean/turn_avg/draws（有效数）/
+    null_mean/null_std/z（不足 5 或零离散时缺省）+ truncated 标注。
+    """
+    import time as _time
+
+    from .evaluate import _top_n_excess
+    F = np.asarray(F, dtype=np.float64)
+    rows = np.arange(0, int(t_end), max(int(env.calibration.sample_step), 1))
+    real = _top_n_excess(F, fwd, pit, env, t0=0, t1=t_end)
+    if len(real) < 8 or int(draws) < 5:
+        return {"periods": int(len(real)), "draws": 0,
+                "note": "real 组合期 <8 或 draws <5——placebo 无从算"}
+    real_net = float(real["net"].mean())
+    rng = np.random.default_rng(seed)
+    null_nets = []
+    truncated = False
+    t_start = _time.monotonic()
+    target = int(draws)
+    i = 0
+    while i < target:
+        Fp = F.copy()
+        for t in rows:
+            m = pit[t] & np.isfinite(Fp[t])
+            n = int(m.sum())
+            if n >= 2:
+                idx = np.where(m)[0]
+                Fp[t][idx] = Fp[t][idx][rng.permutation(n)]
+        try:
+            pl = _top_n_excess(Fp, fwd, pit, env, t0=0, t1=t_end)
+        except Exception:
+            pl = None
+        if pl is not None and len(pl) >= 8:
+            null_nets.append(float(pl["net"].mean()))
+        i += 1
+        if budget_secs is not None and i >= 10 and i < target:
+            elapsed = _time.monotonic() - t_start
+            per = elapsed / i
+            if (elapsed + per * (target - i) > budget_secs
+                    and len(null_nets) >= 60):
+                truncated = True
+                break
+    out = {
+        "net_mean": round(real_net, 6) + 0.0,
+        "gross_mean": round(float(real["gross"].mean()), 6) + 0.0,
+        "turn_avg": round(float(real["turn"].mean()), 4) + 0.0,
+        "periods": int(len(real)),
+        "draws": len(null_nets),
+    }
+    if truncated:
+        out["truncated"] = True
+        out["note"] = (f"预算自适应截断（{target}→{len(null_nets)} draws，"
+                       f"预算 {budget_secs:.0f}s）——截断不是失败，draws 如实报")
+    if len(null_nets) >= 5 and np.std(null_nets, ddof=1) > 0:
+        out["null_mean"] = round(float(np.mean(null_nets)), 6) + 0.0
+        out["null_std"] = round(float(np.std(null_nets, ddof=1)), 6) + 0.0
+        out["z"] = round((real_net - np.mean(null_nets))
+                         / np.std(null_nets, ddof=1), 4) + 0.0
+    return out
+
+
 def _train_end(env: FactorEnv) -> int:
     import pandas as pd
 
@@ -68,8 +143,6 @@ def _train_end(env: FactorEnv) -> int:
 def _topk_block(F, fwd, pit, rows, k_frac):
     """逐采样日：top-K 组差 / top-K 内 IC / 全截面 IC（凸性对照）/
     top-K 名单 (day, 全局资产列) 对（Phase 5 名单 Jaccard 家族的原料）。"""
-    from .tailgate import selection_minhash
-
     spreads, tail_ics, ics, ks = [], [], [], []
     pairs = []
     for t in rows:
@@ -134,40 +207,42 @@ def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
                       if len(ic_arr) >= 10 and ic_arr.std() > 0 and sp_std > 0
                       else None)
 
+    # spread 高阶矩（WS4 2026-08-25）：G3 的 t 分母偏度/峰度修正原料——
+    # 与 IC 线 _dsr_p_from_stats 同构（g3/g4 = 总体矩 / 样本 std(ddof=1)
+    # 的幂；矩从完整序列算非 sketch，round 6 位；条目增量 ~60B）。
+    # 只存矩不存序列：尾线族几何用名单 MinHash，spread 序列无账本用途。
+    spread_moments = None
+    if sp_std > 0:
+        mu = float(sp.mean())
+        spread_moments = {
+            "g3": round(float(np.mean((sp - mu) ** 3)) / sp_std ** 3, 6) + 0.0,
+            "g4": round(float(np.mean((sp - mu) ** 4)) / sp_std ** 4, 6) + 0.0,
+            "n": int(len(sp)),
+        }
+
     # ---- top-N 净超额 + random-N placebo（复用生产 _top_n_excess）----
+    # placebo 走公共 topn_placebo（WS2：evaluate 轻量版与 submit 权威版
+    # 共用一处实现）；本层保持轻量自动计数语义不变（无预算参数）
     topn = {}
-    real = _top_n_excess(F, fwd, pit, env, t0=0, t1=t_end)
-    if len(real) >= 8:
-        real_net = float(real["net"].mean())
-        topn["net_mean"] = round(real_net, 6) + 0.0
-        topn["gross_mean"] = round(float(real["gross"].mean()), 6) + 0.0
-        topn["turn_avg"] = round(float(real["turn"].mean()), 4) + 0.0
-        topn["periods"] = int(len(real))
-        # placebo 规模自适应：生产面板（~5M 单元格）降抽样
-        if placebo_draws is None:
-            placebo_draws = max(10, min(40, int(4e6 / max(F.size, 1))))
-        rng = np.random.default_rng(placebo_seed)
-        null_nets = []
-        for _ in range(placebo_draws):
-            Fp = F.copy()
-            for t in rows:
-                m = pit[t] & np.isfinite(Fp[t])
-                n = int(m.sum())
-                if n >= 2:
-                    idx = np.where(m)[0]
-                    Fp[t][idx] = Fp[t][idx][rng.permutation(n)]
-            try:
-                pl = _top_n_excess(Fp, fwd, pit, env, t0=0, t1=t_end)
-            except Exception:
-                continue
-            if len(pl) >= 8:
-                null_nets.append(float(pl["net"].mean()))
-        topn["placebo_draws"] = len(null_nets)
-        if len(null_nets) >= 5 and np.std(null_nets, ddof=1) > 0:
-            topn["placebo_null_mean"] = round(float(np.mean(null_nets)), 6) + 0.0
-            topn["placebo_z"] = round(
-                float((real_net - np.mean(null_nets))
-                      / np.std(null_nets, ddof=1)), 4) + 0.0
+    if placebo_draws is None:
+        placebo_draws = max(10, min(40, int(4e6 / max(F.size, 1))))
+    pl = topn_placebo(F, fwd, pit, env, t_end, int(placebo_draws),
+                      placebo_seed)
+    if pl.get("periods", 0) >= 8:
+        for k in ("net_mean", "gross_mean", "turn_avg", "periods"):
+            topn[k] = pl.get(k)
+        topn["placebo_draws"] = pl.get("draws", 0)
+        if 0 < pl.get("draws", 0) < 20:
+            # σ 估计相对误差 ~ 1/√(2(n-1))：n=10 时 ~24%——z≥3 硬判据
+            # 建立在这么薄的 null 上只能是弱证据，G1 判定方（tailgate/人工）
+            # 需要看见样本数；权威判定在 submit 侧重跑（WS2）
+            topn["placebo_warning"] = (
+                f"null draws 仅 {pl['draws']}（<20）——placebo_z 的 σ "
+                "估计误差大（~1/√(2n)），G1 判定视为弱证据"
+                "（submit 侧重跑加厚，见 placebo_m）")
+        if pl.get("z") is not None:
+            topn["placebo_null_mean"] = pl["null_mean"]
+            topn["placebo_z"] = pl["z"]
 
     def _r4(x):
         return None if x is None else round(float(x), 4) + 0.0
@@ -181,6 +256,7 @@ def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
         "k_typical": int(round(float(np.mean(ks)))) if ks else 0,
         "spread_ir": _r4(spread_ir),
         "spread_mean": round(float(sp.mean()), 6) + 0.0,
+        "spread_moments": spread_moments,
         "tail_ic": _r4(tail_ic),
         "spread_ic_corr": _r4(spread_ic_corr),
         "selection_mh": selection_minhash(pairs),

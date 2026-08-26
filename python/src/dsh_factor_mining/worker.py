@@ -145,6 +145,29 @@ def run_request(req: dict) -> dict:
             from .factor.tail import spread_ir_statistic
             stat = spread_ir_statistic
         return noise_test(fn, env, m, base_seed, statistic=stat)
+    if method == "factor.tail_placebo":
+        # G1 权威 placebo（WS2 2026-08-25）：submit 侧重跑——样本加厚
+        # m≥60 + 预算自适应截断。horizon 视图与 tail_metrics 同口径
+        # （fwd/pit/sample_step/topn 都从视图读，F 在基础 env 上算——
+        # 与 evaluate 的 F = fn(env)、视图只改口径一致）
+        from .factor.evaluate import _env_horizon_view, _forward_returns, _pit_mask
+        from .factor.tail import topn_placebo
+        horizon = params.get("horizon")
+        try:
+            horizon = int(horizon) if horizon not in (None, "") else None
+        except (TypeError, ValueError):
+            horizon = None
+        F = fn(env)
+        v = _env_horizon_view(env, horizon) if horizon is not None else env
+        dev_end = v.calibration.dev_end
+        t_end = (int(np.searchsorted(v.dates, pd.Timestamp(dev_end)))
+                 if dev_end is not None else int(v.T))
+        budget = params.get("budget_secs")
+        return topn_placebo(
+            F, _forward_returns(v), _pit_mask(v), v, t_end,
+            int(params.get("draws", 120) or 120),
+            int(params.get("seed", 0) or 0),
+            budget_secs=(float(budget) if budget not in (None, "") else None))
     if method == "factor.day_perm_test":
         # 日期置换 null（2026-08-25）：真实边缘 + 随机配对，worker 内循环
         from .factor.permute import day_permutation_test

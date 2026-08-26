@@ -152,8 +152,9 @@ def flatness_test(source: str, env: FactorEnv, decl: list,
         "collapse_ratio": collapse_ratio,
         "neighbors": rows,
         "cliff": cliff,
-        "note": ("cliff 仅标注不拒收（report-only）——门方向与阈值由 "
-                 "Phase 6 校准（registry × 证伪 preset 混淆矩阵）后启用"),
+        "note": ("cliff 悬崖签名 = submit 硬拒收（Phase 6 校准 2026-08-25 "
+                 "启用：registry 19 个已入册因子 0/19 假阳性；检测功效待"
+                 "证伪 preset 校准补证）"),
     }
     if n_skipped:
         out["note"] += (f"；{n_skipped} 个邻居因预算跳过（覆盖不完整，"
