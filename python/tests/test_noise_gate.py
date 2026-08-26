@@ -145,10 +145,16 @@ def test_submit_noise_gate_rejects_lookahead(tmp_path):
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
     # 用干净源评估出合法诊断骨架，再把 source 换成前视（模拟 causality
-    # 失守的最坏情形）——噪声门在 submit 内独立运行，必须抓住
+    # 失守的最坏情形）——噪声门在 submit 内独立运行，必须抓住。
+    # 2026-08-26：摘掉 _meta/_receipt——source 一致性校验（防张冠李戴：
+    # 拿 A 的诊断给 B 的 source 背书）对带 _meta 的错配提交会更早拦截
+    # （-32602，见 test_procedural_reject_healing）；本测试专测噪声门
+    # 独立兜底，走无 _meta 的手工诊断路径
     diag = b.dispatch("factor.evaluate",
                       {"envId": "primary", "source": CLEAN_MOMENTUM,
                        "stage": "development"})
+    diag = {k: v for k, v in diag.items() if k not in ("_meta", "_receipt",
+                                                       "_construction_fp")}
     sub = b.dispatch("registry.submit", {
         "name": "lookahead_evil", "signal": "test",
         "source": LOOKAHEAD,
