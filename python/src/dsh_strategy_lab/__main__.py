@@ -13,6 +13,11 @@
   robustness）→ **全过才写 registry**；拒收也记账（procedural/
   substantive reject_kind + 理由，供后续策略避坑）+ 计试验；超时 =
   零写入不烧指纹。
+- ``factor-select``：因子 select 比较的记录（2026-08-28 用户决策：
+  策略层要有 select 的记录）——对因子 registry 全部 accepted 条目在
+  select 窗跑一轮 selection 评估（账目照常进因子 trail）+ 可选
+  衰减/稳健性体检，快照原子落策略层 state root；--choose 把特征
+  挑选决策本身留痕。
 - ``trail`` / ``status``：账本与状态查看。
 
 响应为紧凑投影（防截断——尾线 WS-A 教训前置）；--out-file 可存全量。
@@ -35,6 +40,7 @@ from .fingerprint import strategy_fingerprint
 from .simulator import CostModel
 from .state import (
     append_registry_entry,
+    atomic_write_json,
     check_factor_refs,
     check_test_lock,
     consume_test_lock,
@@ -451,6 +457,117 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_factor_select(args) -> int:
+    """因子 select 记录（用户决策 2026-08-28：策略开发层要有 select 的记录）。
+
+    一次调用 = 一轮 select 比较：对因子 registry 全部 accepted 条目在
+    因子层 stateRoot 上跑 stage=selection 评估（账目照常进因子 trail，
+    同键去重更新），快照原子写入策略层 state root 的 factor_select.json
+    ——特征挑选的证据与决策（--choose）从此留痕，不再是一次性脚本输出。
+
+    纪律不变：一轮比完就定；select 数字难看不许回头改因子再比（改了
+    = 新因子回 dev 重新排队）。--choose-only 只补记决策、不重跑比较。"""
+    import time as _time
+
+    sroot = resolve_state_root(args.state_root)
+    snap_path = sroot / "factor_select.json"
+
+    if args.choose_only:
+        if not snap_path.exists():
+            raise CliError("--choose-only 需要已有 factor_select 快照——"
+                           "先不带该参数跑一轮比较")
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap["chosen"] = list(args.choose or [])
+        snap["chosen_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
+        atomic_write_json(snap_path, snap)
+        _emit({"ok": True, "chosen": snap["chosen"],
+               "ts": snap["chosen_ts"]}, args.out_file)
+        return 0
+
+    if not args.factor_state_root:
+        raise CliError("需要 --factor-state-root（因子层状态根，只读+selection 评估）")
+    from dsh_factor_mining.bridge import Bridge
+    from dsh_factor_mining.state import read_registry as read_factor_registry
+
+    fb = Bridge(state_root=str(args.factor_state_root),
+                execution_mode="in_process")
+    env_id = args.env_id
+    if env_id is None:
+        cfg = json.loads((Path(args.factor_state_root)
+                          / "data-config.json").read_text(encoding="utf-8"))
+        envs = list((cfg.get("environments") or {}).keys())
+        if not envs:
+            raise CliError("因子层 data-config 无环境——先在因子层配置并 data.load")
+        env_id = envs[0]
+    fb.dispatch("data.load", {"envId": env_id})
+
+    cands = [e for e in read_factor_registry(args.factor_state_root)
+             if isinstance(e, dict) and e.get("accepted")
+             and isinstance(e.get("source"), str) and "def factor" in e["source"]]
+    if not cands:
+        raise CliError("因子 registry 无 accepted 条目——无从比较")
+
+    from .feature_diligence import battery
+    from dsh_factor_mining.worker import _compile
+
+    entries = []
+    for i, e in enumerate(cands):
+        name = str(e.get("name"))
+        try:
+            r = fb.dispatch("factor.evaluate", {"envId": env_id,
+                                                "stage": "selection",
+                                                "source": e["source"]})
+            topn = r.get("topn") or {}
+            bb = topn.get("block_bootstrap") or {}
+            tracks = e.get("tracks") if isinstance(e.get("tracks"), dict) else {}
+            ic_ok = bool((tracks.get("ic") or {}).get("accepted"))
+            tail_ok = bool((tracks.get("tail") or {}).get("accepted"))
+            item = {
+                "name": name,
+                "track": "dual" if (ic_ok and tail_ok) else ("tail" if tail_ok else "ic"),
+                "hash12": str(e.get("source_hash"))[:12],
+                "train_ic_ir": e.get("ic_ir_train"),
+                "sel_ic_ir": r.get("ic_ir"),
+                "sel_net_annual": topn.get("net_annual"),
+                "sel_gross_annual": topn.get("gross_annual"),
+                "sel_turn_avg": topn.get("turn_avg"),
+                "sel_boot_z": bb.get("z"),
+            }
+            if args.battery:
+                F = _compile(e["source"])(fb.envs[env_id])
+                item["battery"] = battery(F, fb.envs[env_id])
+            entries.append(item)
+            print(f"[{i + 1}/{len(cands)}] {name}: "
+                  f"sel_ic_ir={r.get('ic_ir')}",
+                  file=sys.stderr, flush=True)
+        except Exception as ex:  # noqa: BLE001 — 单因子失败不烧整轮
+            entries.append({"name": name, "error": f"{type(ex).__name__}: {ex}"[:200]})
+
+    snap = {
+        "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "factor_state_root": str(Path(args.factor_state_root).resolve()),
+        "env_id": env_id,
+        "n_candidates": len(cands),
+        "battery": bool(args.battery),
+        "entries": entries,
+        "chosen": list(args.choose or []),
+        "discipline": ("一轮比完就定；不因 select 数字回头改因子再比（改 = "
+                       "新因子回 dev 重新计价）；后续特征挑选以本快照为据"),
+    }
+    sroot.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(snap_path, snap)
+    _emit({"ok": True, "ts": snap["ts"], "n_candidates": len(cands),
+           "chosen": snap["chosen"],
+           "snapshot": str(snap_path),
+           "entries": [{"name": x.get("name"), "track": x.get("track"),
+                        "sel_ic_ir": x.get("sel_ic_ir"),
+                        "sel_net_annual": x.get("sel_net_annual"),
+                        **({"half_life": (x.get("battery") or {}).get("half_life_days")}
+                           if x.get("battery") else {})}
+                       for x in entries]}, args.out_file)
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="dsh_strategy_lab",
@@ -503,6 +620,20 @@ def main(argv=None) -> int:
     sp.add_argument("--name", default=None)
     _common(sp)
     sp.set_defaults(func=cmd_submit)
+
+    sp = sub.add_parser(
+        "factor-select",
+        help="因子 select 比较 → 策略层留痕快照（+可选衰减/稳健性体检）")
+    sp.add_argument("--env-id", default=None,
+                    help="因子层 envId（默认取 data-config 第一个环境）")
+    sp.add_argument("--battery", action="store_true",
+                    help="附特征体检：滞后 IC 衰减剖面 + 年度/滚动/bootstrap 稳健性")
+    sp.add_argument("--choose", nargs="*", default=None,
+                    help="记录选定的特征子集（决策留痕；--choose-only 可后补）")
+    sp.add_argument("--choose-only", action="store_true",
+                    help="只更新既有快照的 chosen 字段，不重跑比较")
+    _common(sp)
+    sp.set_defaults(func=cmd_factor_select)
 
     sp = sub.add_parser("trail", help="评估账本（最近 N 条）")
     sp.add_argument("--last", type=int, default=10)

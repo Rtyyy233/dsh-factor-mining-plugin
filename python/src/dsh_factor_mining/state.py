@@ -12,9 +12,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .discipline import source_fingerprint
 from .filelock import state_write_lock
 
 DEFAULT_STATE_ROOT = Path.cwd() / ".factor-mining"
+
+#: 内容寻址源码库目录名（外挂库，2026-08-29 需求）：trail 条目已有
+#: source_hash 作键，本库存 hash → 源码全文——账本不膨胀、源码可回溯
+FACTOR_SOURCES_DIR = "sources"
 
 FILES = {
     "trail": "trail.json",
@@ -47,6 +52,13 @@ MINING_CONFIG = {
     # 族收敛双轨 AND：两线都平才 must_rotate；本键 ≤0 = 尾部线退出判定
     # （回到 IC 单轨行为）
     "fam_conv_delta_tail": 0.05,
+    # 换手率定价（2026-08-28 规划书 WS-T2 v1 双报）：false = 判定基毛
+    # 口径（net 三件套只陪跑）；WS1 net 段重校 + bar 定档后切 true
+    # （G1 本就 net 不动，G2/G3 同步切）。可被 mining_state 同名键覆盖
+    "tail_net_basis": False,
+    # 成本口径版本（flat:v1 = 单边固定 bps，读 env.calibration.cost）——
+    # 进尾块/registry 条目/尾账本键；变更 = 新键重计（跨成本档不可比）
+    "cost_model_version": "flat:v1",
 }
 
 
@@ -129,6 +141,50 @@ def append_registry_entry(entry: dict[str, Any], root: str | os.PathLike | None 
         path = _path("registry", root)
         _atomic_write_json(path, entries)
     return {"kind": "registry", "count": len(entries), "path": str(path)}
+
+
+# ---------------------------------------------------------------- 源码外挂库
+
+def factor_source_path(source_hash: str, root: str | os.PathLike | None = None) -> Path:
+    """源码库路径：sources/<hash前2位>/<hash>.py（分片防单目录过大）。"""
+    return resolve_state_root(root) / FACTOR_SOURCES_DIR / str(source_hash)[:2] / f"{source_hash}.py"
+
+
+def store_factor_source(source: str, root: str | os.PathLike | None = None) -> dict[str, Any]:
+    """源码入外挂库（内容寻址、幂等、原子、无锁）。
+
+    键 = source_fingerprint(source)——与 trail 条目的 source_hash 同一函数，
+    账本零改动即可回溯。同键必同内容：并发写竞争是幂等的（各写 tmp 后
+    replace 同一字节序列），故不加写锁（评估高频路径不抢锁）。"""
+    h = source_fingerprint(source)
+    path = factor_source_path(h, root)
+    if path.exists():
+        return {"hash": h, "path": str(path), "dedup": True}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".py.tmp")
+    # newline=""：禁用换行翻译——存档字节必须与产生 source_hash 的原文
+    # 逐字节一致（CRLF 翻译会让按内容寻址的档案失真）
+    tmp.write_text(source or "", encoding="utf-8", newline="")
+    os.replace(str(tmp), str(path))
+    return {"hash": h, "path": str(path), "dedup": False}
+
+
+def factor_source_stats(root: str | os.PathLike | None = None) -> dict[str, Any]:
+    """源码库规模（trail_summary 展示用；目录缺失 = 空库）。"""
+    base = resolve_state_root(root) / FACTOR_SOURCES_DIR
+    count, total_bytes = 0, 0
+    if base.exists():
+        for shard in base.iterdir():
+            if shard.is_dir():
+                for f in shard.iterdir():
+                    if f.suffix == ".py":
+                        count += 1
+                        try:
+                            total_bytes += f.stat().st_size
+                        except OSError:
+                            pass
+    return {"count": count, "bytes": total_bytes,
+            "dir": str(base)}
 
 
 def read_mining_state(root: str | os.PathLike | None = None) -> dict[str, Any]:

@@ -138,10 +138,27 @@ def _trunc_env(env, t1_inclusive):
 
 
 def _test_region(ns, env, params: dict) -> dict:
-    """test 区一次性消费的评估本体（锁的写入在主进程，成功返回后）。"""
+    """test 区一次性消费的评估本体（锁的写入在主进程，成功返回后）。
+
+    t0 守卫（2026-08-28 修复配套）：显式 t0_date 早于 sel_end → 拒绝——
+    test 起点侵入 dev 区 = 把 overlay 迭代过的数据当样本外（只会更晚，
+    不会更早；省略即默认 sel_end 起）。"""
+    import pandas as _pd
+
     seed = int(params.get("seed", 42))
     cm = _cost_model(params)
-    t0_date = params.get("t0_date") or env.calibration.sel_end
+    sel_end = env.calibration.sel_end if env.calibration else None
+    t0_date = params.get("t0_date") or sel_end
+    if t0_date is not None and sel_end:
+        try:
+            early = _pd.Timestamp(str(t0_date)) < _pd.Timestamp(str(sel_end))
+        except Exception:
+            early = True   # 解析失败按越界处理（保守拒绝）
+        if early:
+            raise ValueError(
+                f"test 的 t0_date={t0_date} 早于 sel_end={sel_end}——"
+                "test 区起点不得侵入 dev 区（overlay 在此迭代过）；省略 "
+                "t0_date 即默认 sel_end 起，只允许更晚。")
     t0, _ = region_span(env, t0_date=t0_date)
     sub_env = _trunc_env(env, env.T) if t0 == 0 else _offset(env, t0)
     path = run_pipeline(ns, sub_env, seed)
@@ -217,6 +234,49 @@ def _submit(ns, env, params: dict) -> dict:
     return out
 
 
+def _dev_env(env, params: dict, stage: str):
+    """dev 区域硬切（2026-08-28 修复：test 窗窥视）——因子层 2026-08-18
+    生产审计同型修复（bridge._factor_walk_forward）的移植。
+
+    修前：development/walk_forward/submit 拿全面板——WF 末折即 test 窗、
+    dev 试验与 submit 门（G1′ placebo / G4′ 增量）的数字全含
+    [sel_end, T)，test_lock 形同虚设（窗早被看穿）。现 dev 侧 env 一律
+    物理截断到 sel_end（截断不可关，test 窗对开发过程不可见）：
+      - walk_forward 显式 t1_date 越过 sel_end → 拒绝（不是静默放行）
+      - calibration 无 sel_end（直调合成 env）→ 不切 + region_degraded
+        标注（此配置下 test 一次性语义不成立，生产禁止）
+    返回 (env, region_info)。"""
+    import pandas as _pd
+
+    sel_end = env.calibration.sel_end if env.calibration else None
+    if not sel_end:
+        return env, {"t1_date": None, "region_degraded": True,
+                     "n_bars": int(env.T),
+                     "note": "calibration 无 sel_end——dev 不切（全面板），"
+                             "test 一次性语义不成立；生产面板必须配三区"}
+    if stage == "walk_forward" and params.get("t1_date") is not None:
+        try:
+            over = _pd.Timestamp(str(params["t1_date"])) \
+                > _pd.Timestamp(str(sel_end))
+        except Exception:
+            over = True   # 解析失败按越界处理（保守拒绝，同因子层）
+        if over:
+            raise ValueError(
+                f"walk_forward 的 t1_date={params['t1_date']} 越过 "
+                f"sel_end={sel_end}——test 区只经 stage='test' 的一次性"
+                "流程消费，不得经 walk_forward 窥视。省略 t1_date 即默认"
+                "限制在 dev 区。")
+    end_idx = region_span(env, t1_date=sel_end)[1]
+    if end_idx <= 1:
+        raise ValueError(
+            f"sel_end={sel_end} 早于面板起点——dev 区为空，无可评估数据")
+    return (_trunc_env(env, end_idx) if end_idx < env.T else env), {
+        "t1_date": str(sel_end), "region_degraded": False,
+        "n_bars": int(min(end_idx, env.T)),
+        "note": "dev 区硬切到 sel_end（test 窗对开发过程物理不可见；"
+                "test 经 stage='test' 一次性消费）"}
+
+
 def run_request(req: dict) -> dict:
     env = load_env_npz(req["npzPath"])
     ns = compile_strategy(req["source"])
@@ -224,15 +284,20 @@ def run_request(req: dict) -> dict:
     method = req["method"]
     if method == "strategy.evaluate":
         stage = params.get("stage", "development")
-        if stage == "development":
-            return _evaluate(ns, env, params)
-        if stage == "walk_forward":
-            return _walk_forward(ns, env, params)
+        if stage in ("development", "walk_forward"):
+            env, region = _dev_env(env, params, stage)
+            out = _walk_forward(ns, env, params) if stage == "walk_forward" \
+                else _evaluate(ns, env, params)
+            out["dev_region"] = region
+            return out
         if stage == "test":
             return _test_region(ns, env, params)
         raise ValueError(f"未知 stage: {stage}")
     if method == "strategy.submit":
-        return _submit(ns, env, params)
+        env, region = _dev_env(env, params, "submit")
+        out = _submit(ns, env, params)
+        out["dev_region"] = region
+        return out
     raise ValueError(f"worker 不支持的方法: {method}")
 
 

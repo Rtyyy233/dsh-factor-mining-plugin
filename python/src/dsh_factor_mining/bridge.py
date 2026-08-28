@@ -68,6 +68,8 @@ from .procinfo import (
 from .state import (
     MINING_CONFIG,
     append_explored,
+    factor_source_stats,
+    store_factor_source,
     append_search_path,
     append_trail,
     arc_rounds_bump,
@@ -784,6 +786,16 @@ class Bridge:
         except Exception as e:
             # 对表/入池失败不阻断评估主结果，但必须可见——静默吞错曾酿成真实事故
             result["_pool_error"] = f"{type(e).__name__}: {e}"[:200]
+        # 源码外挂库（2026-08-29）：每次入账的试验源码按 hash 入库——
+        # trail 条目的 source_hash 即键，账本不膨胀、历史可回溯。幂等
+        # 无锁；失败可见（与 _pool_error 同款遥测）不阻断账本
+        try:
+            store_factor_source(source, self.state_root)
+        except Exception as e:
+            try:
+                result["_source_store_error"] = f"{type(e).__name__}: {e}"[:150]
+            except Exception:
+                pass
         # 写锁（并行 P0）：trail_engine 是读全量→过滤→追加→重写，多进程
         # 并发评估（多会话/batch 池化）下无锁会互相覆盖丢试验条目
         with state_write_lock(self.state_root):
@@ -1476,6 +1488,11 @@ class Bridge:
             if params.get("statistic") == "spread":
                 from .factor.tail import spread_ir_statistic
                 stat = spread_ir_statistic
+                # net 基（2026-08-28 WS-T2）：与 worker.run_request 同口径
+                if params.get("net_cost") is not None:
+                    import functools as _ft
+                    stat = _ft.partial(spread_ir_statistic,
+                                       cost=float(params["net_cost"]))
             return noise_test(fn, env,
                               int(params.get("m", 100) or 100),
                               int(params.get("base_seed", 0) or 0),
@@ -2541,6 +2558,22 @@ class Bridge:
         source_hash = source_fingerprint(source)
         if stage != "development":
             params = {**params, "source_hash": source_hash}
+            if stage == "test":
+                # test 准入前置（2026-08-28 加固）：test 是 stateRoot 级一次性
+                # 资源（全局锁挡**重复**消费），还须挡**浪费**消费——2026-08-24
+                # 生产取证：唯一一发 test 烧给了从未提交的候选（registry 查无
+                # 此 hash），已准入因子从此无 test 测量。test 只测已入册候选。
+                if not any(isinstance(r, dict)
+                           and r.get("source_hash") == source_hash
+                           and bool(r.get("accepted"))
+                           for r in read_registry(self.state_root)):
+                    raise BridgeError(
+                        -32003,
+                        f"test 只测已入册候选：source hash {source_hash[:12]} "
+                        "不在 registry 或未 accepted——先 factor_registry_submit"
+                        "通过准入再测。test 是 stateRoot 级一次性资源"
+                        "（2026-08-24 教训：唯一一发烧给了从未提交的候选），"
+                        "未入册的候选不得消耗它")
             result = self._run_factor("factor.evaluate", source, params, env)
             return self._wrap_diagnosis(env_id, source, stage, result)
 
@@ -2669,6 +2702,11 @@ class Bridge:
                 # v2：entry 带 horizon（试验单元 (hash, horizon)）。
                 src = str(sources.get(name, ""))
                 if src:
+                    # 源码外挂库：与单因子通道同款（error 成员不记账也不入库）
+                    try:
+                        store_factor_source(src, self.state_root)
+                    except Exception:
+                        pass
                     trail_items.append((source_fingerprint(src), "batch", diag, None))
             if trail_items:
                 # 写锁（并行 P0）：batch 通道与单因子同锁——读改写全程互斥
@@ -2910,6 +2948,10 @@ class Bridge:
                 env, self.state_root, n=n, seed=seed, opset=opset,
                 env_fingerprint=self._env_full_fingerprint(fp_env),
                 horizons=menu,
+                # 换手定价（2026-08-28）：成本口径戳进 landscape（v1 毛段，
+                # net 重校时换版本串 + spread_cost）
+                cost_model_version=MINING_CONFIG.get(
+                    "cost_model_version", "flat:v1"),
                 on_progress=lambda done, total: self._progress(
                     "null-calibration", done, total))
 
@@ -2996,6 +3038,29 @@ class Bridge:
                          "组差方向的候选；admit_basis=tail 轨同样可走标准管线"
                          "评估提交"),
             })
+        # 成本平局裁决列表（2026-08-28 换手率定价 WS-T3）：按
+        # break_even_cost c*（每单位换手毛利，单边 bps）排序——免假设，
+        # 不需要先拍成本数字即可比：统计平局间偏好低换手是偏好陈述，
+        # 不是判据篡改。无 c*（毛均 ≤0/零换手/截面不足）的树不进该列表
+        def _cs(r):
+            v = r["light_ic"].get("break_even_cost")
+            return float(v) if isinstance(v, (int, float)) else None
+
+        cost_ranked = sorted(
+            (r for r in results if _cs(r) is not None),
+            key=lambda r: -_cs(r))
+        top_net = []
+        for r in cost_ranked[:top_k]:
+            src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
+            top_net.append({
+                "index": r["index"],
+                "expression": r["expression"],
+                "light_ic": r["light_ic"],
+                "source": src,
+                "note": ("成本平局裁决幸存（break_even_cost 排序——每单位"
+                         "换手毛利 bps，高 = 经得起贵交易）——选择不是结论，"
+                         "走标准管线验证"),
+            })
         overlap_idx = sorted({r["index"] for r in results[:top_k]}
                              & {r["index"] for r in top_tail})
         dist = [abs(r["light_ic"].get("ic_ir") or 0.0) for r in results]
@@ -3004,6 +3069,7 @@ class Bridge:
             "mode": "explore", "n": n, "seed": seed, "seed_note": seed_note, "top_k": top_k,
             "top": top,
             "top_tail": top_tail,
+            "top_net": top_net,
             "overlap_indexes": overlap_idx,
             "abs_ic_ir_distribution": {
                 "median": float(np.median(dist)) if dist else None,
@@ -3019,9 +3085,12 @@ class Bridge:
                 "max": float(np.max(sp_dist)),
             }
         out["dual_list_note"] = (
-            "双列表（IC 线 top + 尾部线 top_tail，可重叠见 overlap_indexes）："
-            "top_tail 按 spread_ir（top-K 组差 IR）排序——尾部强、IC 平庸的"
-            "构造在这份列表可见；两列表都是选择不是结论，走标准管线验证")
+            "三列表（IC 线 top / 尾部线 top_tail / 成本平局 top_net，IC∩tail "
+            "重叠见 overlap_indexes）：top_tail 按 spread_ir（top-K 组差 IR）"
+            "排序——尾部强、IC 平庸的构造在这份列表可见；top_net 按 "
+            "break_even_cost（每单位换手毛利 bps）排序——统计平局间偏好"
+            "低换手（成本定价，无奖励系数）；三列表都是选择不是结论，走"
+            "标准管线验证")
         return out
 
     def _factor_operators(self, params):
@@ -3140,8 +3209,12 @@ class Bridge:
                                       + f"；{len(ids)} 篇论文标记 exhausted")
             src = str(entry.get("source") or entry.get("factor_source") or "")
             # 正式证伪的因子入 falsified 池（防重复挖坟；有指纹缓存则带数值指纹）
-            src = str(entry.get("source") or entry.get("factor_source") or "")
             if src:
+                # 源码外挂库：证伪源码全文入库（池只存签名，全文可回溯）
+                try:
+                    store_factor_source(src, self.state_root)
+                except Exception:
+                    pass
                 key = source_fingerprint(src)
                 cached = self._fp_cache.get(key)
                 try:
@@ -3269,6 +3342,9 @@ class Bridge:
             "evaluations": {"total": len(engine_trail),
                             "unique_sources": len({e.get("source_hash") for e in engine_trail}),
                             "verdict_counts": verdicts},
+            # 源码外挂库（2026-08-29）：source_hash 即键，按
+            # sources/<hash[:2]>/<hash>.py 取全文
+            "source_store": factor_source_stats(self.state_root),
             "agent_rounds": len(agent_trail),
             "explored_count": len(explored),
             "red_flagged": red_flagged[-10:],
@@ -3296,7 +3372,7 @@ class Bridge:
         # papers.json 是文献台账（F1，2026-08-24），同属挖掘记忆
         "mining": ["trail.json", "trail_engine.json", "explored_paths.json",
                    "search_paths.json", "mining_state.json", "pool",
-                   "papers.json"],
+                   "papers.json", "sources"],
         "landscape": ["null_landscape.json", "operator_set.json"],
         "registry": ["registry.json"],
         "config": ["data-config.json"],
@@ -3433,6 +3509,11 @@ class Bridge:
                 "tracks": {"ic": ic_ok, "tail": tail_ok},
                 "ic_ir": e.get("ic_ir_train"),
                 "spread_ir": diag_tail.get("spread_ir"),
+                # 换手定价（2026-08-28 WS-T1）：c* = 每单位换手毛利
+                # （单边 bps，免假设可比）+ 换手 + net 陪跑——旧条目 None
+                "net_spread_ir": diag_tail.get("net_spread_ir"),
+                "turn": diag_tail.get("turn_tail"),
+                "break_even_cost": diag_tail.get("break_even_cost"),
             }
             if not acc:
                 reason = e.get("reason")
@@ -3784,13 +3865,21 @@ class Bridge:
             params.get("envId", "primary")) or "nofp"
         _seed_ns = int(_hl.sha256(
             str(_fp_ns).encode("utf-8")).hexdigest()[:8], 16)
+        # 换手率定价（2026-08-28 规划书 WS-T2 v1 双报）：判定基开关——
+        # false（默认）= G2/G3 判毛口径，net 三件套只陪跑；true = 三门
+        # 全 net 口径（G1 本就 net）。可被 mining_state.tail_net_basis 覆盖
+        _net_basis = bool(read_mining_state(self.state_root).get(
+            "tail_net_basis", MINING_CONFIG["tail_net_basis"]))
+        _tail_env = self._require_panel_env(params.get("envId", "primary"))
         try:
             spread_noise = self._run_factor(
                 "factor.noise_test", str(source),
                 {"m": int(read_mining_state(self.state_root).get(
                     "tail_noise_m", 12) or 12),
-                 "base_seed": _seed_ns, "statistic": "spread"},
-                self._require_panel_env(params.get("envId", "primary")))
+                 "base_seed": _seed_ns, "statistic": "spread",
+                 "net_cost": (float(_tail_env.calibration.cost)
+                              if _net_basis else None)},
+                _tail_env)
         except Exception as e:
             raise BridgeError(
                 -32003,
@@ -3882,7 +3971,8 @@ class Bridge:
         from .factor.tailgate import tail_admission, tail_ledger
         tail_decision = tail_admission(
             tail_block, tail_ledger(engine_trail), _z_spread, s0_emp=_s0_emp,
-            placebo_z_gate=_placebo_gate_z, placebo_m=_placebo_gate_m)
+            placebo_z_gate=_placebo_gate_z, placebo_m=_placebo_gate_m,
+            net_basis=_net_basis)
         # 尾块反查失败的可行动信息（2026-08-26 rank_persistence_w30 事故：
         # agent 提交的 source 与评估时字节不一致 → hash 漂移 → trail 查无
         # 此 hash → 「tail 块缺失」烧名。原始 reason 不含 hash 与修法指引，

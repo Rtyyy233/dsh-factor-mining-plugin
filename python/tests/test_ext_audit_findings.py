@@ -43,6 +43,15 @@ def _panel(path: Path, T=900, N=40, seed=4):
 F = "def factor(env):\n    import pandas as pd\n    c = pd.DataFrame(env.c)\n    return (c / c.shift(20) - 1.0).values\n"
 
 
+def _register_factor(state, source=F):
+    """2026-08-28 加固配套：test 只测已入册候选——测试先入册再消费。"""
+    from dsh_factor_mining.discipline import source_fingerprint
+    from dsh_factor_mining.state import write_registry
+
+    write_registry([{"name": "f_mom", "source_hash": source_fingerprint(source),
+                     "accepted": True, "source": source}], root=str(state))
+
+
 def _env(data):
     return {"source": {"type": "parquet", "path": str(data)}, "layout": "long",
             "mapping": {"symbol": "symbol", "date": "eob", "open": "open", "high": "high",
@@ -59,12 +68,14 @@ def test_full_bypass_chain_blocked(tmp_path):
     b = Bridge(state_root=str(state), execution_mode="in_process")
     b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
     b.dispatch("data.load", {"envId": "etf"})
+    _register_factor(state)
 
     r1 = b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
     assert "error" not in r1, r1  # 首次消费成功
     assert (state / "test_lock.json").exists()
 
-    b.dispatch("state.reset", {"scope": "all"})
+    b.dispatch("state.reset", {"scope": "all", "confirm": True,
+                                "reason": "test: 绕过链/锁次序验证"})
     assert (state / "test_lock.json").exists()  # 锁存活
 
     # 重配 + load 后再消费 → 必须 -32003（审计者未走完的半条链）
@@ -97,8 +108,10 @@ def test_lock_error_precedes_missing_config(tmp_path):
     b = Bridge(state_root=str(state), execution_mode="in_process")
     b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
     b.dispatch("data.load", {"envId": "etf"})
+    _register_factor(state)
     b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-    b.dispatch("state.reset", {"scope": "all"})
+    b.dispatch("state.reset", {"scope": "all", "confirm": True,
+                                "reason": "test: 绕过链/锁次序验证"})
     try:
         b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
         raise AssertionError("应被纪律锁拒")
@@ -222,3 +235,30 @@ def test_stats_from_trail_authoritative(tmp_path):
     assert dp.get("stats_from_trail") is True, dp
     # 重算用的是引擎侧真实（弱）统计量 → p 不显著 → ic 轨拒
     assert sub["tracks"]["ic"]["accepted"] is False, sub["tracks"]["ic"]
+
+
+def test_test_stage_requires_registered_factor(tmp_path):
+    """2026-08-28 加固：test 只测已入册候选——未入册的 hash 直接 -32003，
+    不写锁不消费（防 2026-08-24 生产事故：唯一一发烧给从未提交的候选）；
+    已入册 accepted 的照常走一次性消费。"""
+    data = tmp_path / "panel.parquet"
+    _panel(data)
+    state = tmp_path / "state"
+    b = Bridge(state_root=str(state), execution_mode="in_process")
+    b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
+    b.dispatch("data.load", {"envId": "etf"})
+
+    # 未入册 → 拒，且不消费锁
+    try:
+        b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
+        raise AssertionError("未入册的因子测 test 应被拒")
+    except BridgeError as e:
+        assert e.code == -32003, e.code
+        assert "已入册候选" in e.message, e.message
+    assert not (state / "test_lock.json").exists()   # 锁未被浪费消费
+
+    # 入册（accepted）→ 照常一次性消费
+    _register_factor(state)
+    r = b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
+    assert "error" not in r, r
+    assert (state / "test_lock.json").exists()
