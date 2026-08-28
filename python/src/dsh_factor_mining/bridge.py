@@ -53,6 +53,18 @@ from .factor.evaluate import (
     evaluate_walk_forward,
 )
 from .library.contract import LibraryError, UserLibrary, query_entries
+from .filelock import pid_alive, state_write_lock
+from .procinfo import (
+    attach_worker_limits,
+    cpu_seconds,
+    detach_worker_limits,
+    effective_wall_timeout,
+    omp_quiet_env,
+    posix_limit_preexec,
+    resolve_jobs,
+    starvation_verdict,
+    worker_mem_bytes,
+)
 from .state import (
     MINING_CONFIG,
     append_explored,
@@ -348,9 +360,11 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
       自动重置预算，注入器照常推进
     - stop_kind == None（running）→ 常规优先级
 
-    常规优先级（v6 2026-08-25：家族升级改边际收益驱动，删 streak 绝对阈值）：
-    R1 族内边际严重枯竭（marginal < -0.10）→ literature
-    R2 族内边际枯竭（marginal < -0.05）→ rotate
+    常规优先级（v6 2026-08-25：家族升级改边际收益驱动，删 streak 绝对阈值；
+    2026-08-27 双轨化：R1/R2 与族收敛同口径——**两线都枯竭**才触发，单线
+    枯竭只出 escalation（IC 平但尾部有苗头的方向不被强制换向））：
+    R1 IC 与尾部线边际都严重枯竭（<-0.10）→ literature
+    R2 IC 与尾部线边际都枯竭（<-0.05）→ rotate
     R3 streak≥3 且族内平台 plateau → refine（有最优载体+边际枯竭
        → 深挖载体特性补正强化）
     R4 pending 被拒收（停笔宣言）→ rotate
@@ -358,29 +372,46 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
     R6 accepted≥3 且为 3 的倍数 → query（里程碑审计）
     R7 pass 未入册 ≥3 → compose
     R8 兜底 → continue
+    尾部线无数据（tail_marginal.enough_data=False）→ 回到 IC 单轨判定。
     key：常规类型含 round/n_trials（单调保证新鲜）；query 用 accepted。"""
     if stop_kind in ("finalize", "fail_streak"):
         return None
     fam = family_marginal or {}
     fam_m = fam.get("marginal")
     fam_ok = fam.get("enough_data") and isinstance(fam_m, (int, float))
+    tail = fam.get("tail_marginal") or {}
+    tail_m = tail.get("marginal")
+    tail_ok = tail.get("enough_data") and isinstance(tail_m, (int, float))
+
+    def _both_exhausted(level: float) -> bool:
+        """IC 线低于 level 且（尾部线在场时也低于 level）。尾部线无数据
+        → IC 单轨（与族收敛的「spread < 2Wf → IC-only」同一回退口径）。"""
+        if not (fam_ok and fam_m < level):
+            return False
+        return (not tail_ok) or tail_m < level
+
     t = None
     if stop_kind == "direction_budget":
         # 方向预算耗尽：族边际决定换向强度；无论边际如何都不允许原地续推
-        if fam_ok and fam_m < -0.10:
+        if _both_exhausted(-0.10):
             t = "literature"
-            why = (f"方向段预算耗尽且族内边际严重枯竭（{fam_m:+.3f}）——"
-                   "内生假设源枯竭，必须文献注入后换族")
+            why = (f"方向段预算耗尽且 IC/尾部线边际均严重枯竭"
+                   f"（IC {fam_m:+.3f}"
+                   + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
+                   + "）——内生假设源枯竭，必须文献注入后换族")
         else:
             t = "rotate"
             why = "方向段预算耗尽（轮次/簇试验上限）——必须换向，断链后预算自动重置"
-    elif fam_ok and fam_m < -0.10:
+    elif _both_exhausted(-0.10):
         t = "literature"
-        why = (f"族内边际严重枯竭（{fam_m:+.3f}）——内生假设源枯竭，"
-               "必须文献注入")
-    elif fam_ok and fam_m < -0.05:
+        why = (f"IC 与尾部线边际均严重枯竭（IC {fam_m:+.3f}"
+               + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
+               + "）——内生假设源枯竭，必须文献注入")
+    elif _both_exhausted(-0.05):
         t = "rotate"
-        why = (f"族内边际枯竭（{fam_m:+.3f}）——族已饱和，换方向")
+        why = (f"IC 与尾部线边际均枯竭（IC {fam_m:+.3f}"
+               + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
+               + "）——族已饱和，换方向")
     elif streak >= 3 and plateau:
         t = "refine"
         why = (f"同族试验连续 {streak} 次且最近 20 条试验未超越族历史最佳"
@@ -621,6 +652,11 @@ class Bridge:
                     "ic_mean": result.get("ic_mean_train", result.get("ic_mean")) if isinstance(result, dict) else None,
                     "verdict": result.get("verdict") if isinstance(result, dict) else None,
                     "red_flags": result.get("red_flags", []) if isinstance(result, dict) else [],
+                    # P4 Tier 3：效率入账（CPU 口径——并行下墙钟失真）。
+                    # 族均成本可从 trail 聚合；D3c：只展示不参与升级阶梯
+                    "cpu_s": ((result.get("perf") or {}).get("cpu_s")
+                              if isinstance(result, dict)
+                              and isinstance(result.get("perf"), dict) else None),
                     "suspects": suspects,
                     "ic_series_sketch": sketch,
                     # 成分血缘指纹（2026-08-25 CMF 事故）：合成因子的 IC
@@ -748,7 +784,10 @@ class Bridge:
         except Exception as e:
             # 对表/入池失败不阻断评估主结果，但必须可见——静默吞错曾酿成真实事故
             result["_pool_error"] = f"{type(e).__name__}: {e}"[:200]
-        self._append_engine_trail(env_id, source_hash, stage, result, suspects)
+        # 写锁（并行 P0）：trail_engine 是读全量→过滤→追加→重写，多进程
+        # 并发评估（多会话/batch 池化）下无锁会互相覆盖丢试验条目
+        with state_write_lock(self.state_root):
+            self._append_engine_trail(env_id, source_hash, stage, result, suspects)
         # A2：sketch 已由 _append_engine_trail 摘出存 trail；agent 可见
         # schema 保持不变（ic_series_train 不外泄，registry 不膨胀）
         result.pop("ic_series_train", None)
@@ -902,6 +941,59 @@ class Bridge:
         except DataError as e:
             # 用户数据/配置错误统一映射到域错误码（调用方无需感知异常类型）
             raise BridgeError(-32002, str(e)) from None
+        except BridgeError as e:
+            # W3（2026-08-26 规划书）：infra 失败（-32005 worker 超时/无输出）
+            # 入台账——loop 指令超时纠偏声道的数据源。纯附加遥测：异常原样
+            # re-raise，异常语义零变化
+            if e.code == -32005:
+                self._record_infra_failure(method)
+            raise
+
+    def _record_infra_failure(self, method: str) -> None:
+        """-32005 基础设施失败台账（stateRoot/tool_failures.json，有界 100、原子写）。
+
+        写失败绝不阻断原异常（台账是遥测不是事务）。"""
+        try:
+            p = Path(self.state_root) / "tool_failures.json"
+            entries = []
+            if p.exists():
+                entries = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(entries, list):
+                    entries = []
+            entries.append({"ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+                            "method": method, "code": -32005})
+            entries = entries[-100:]
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(str(tmp), str(p))
+        except Exception:
+            pass
+
+    def _recent_infra_failures(self, window_secs: float = 1800.0) -> list[dict]:
+        """最近 window_secs 内的 -32005 台账条目（读失败/无文件 = 空）。"""
+        try:
+            from datetime import datetime, timedelta
+            p = Path(self.state_root) / "tool_failures.json"
+            if not p.exists():
+                return []
+            entries = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                return []
+            cutoff = datetime.now() - timedelta(seconds=window_secs)
+            out = []
+            for e in entries:
+                if not isinstance(e, dict) or e.get("code") != -32005:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(e.get("ts", "")))
+                except ValueError:
+                    continue
+                if ts >= cutoff:
+                    out.append(e)
+            return out
+        except Exception:
+            return []
 
     # ---- system ----
     def _ping(self, params):
@@ -1170,6 +1262,7 @@ class Bridge:
         run_root = Path(self.state_root) / "worker_runs"
         run_root.mkdir(parents=True, exist_ok=True)
         wdir = Path(tempfile.mkdtemp(dir=str(run_root)))
+        job = None
         try:
             from .worker import write_env_npz
             npz = wdir / "env.npz"
@@ -1192,31 +1285,88 @@ class Bridge:
             # import pathlib 即崩（2026-08-18 DSH 实测事故根因）。
             pkg_dir = str(Path(__file__).resolve().parent)          # .../dsh_factor_mining
             src_dir = str(Path(pkg_dir).parent)                     # .../src 或 .../site-packages
-            env_os = dict(os.environ)
+            # P1：BLAS 单线程（多进程并行防自旋空烧 CPU 伪装成真慢）
+            env_os = omp_quiet_env()
             if "site-packages" not in src_dir:
                 env_os["PYTHONPATH"] = src_dir + os.pathsep + env_os.get("PYTHONPATH", "")
 
-            timeout_s = self.worker_timeout_ms / 1000.0
+            # P1/D3：墙钟上限按声明份额伸缩（jobs=DSH_FACTOR_JOBS，默认满核≈base）
+            timeout_s = effective_wall_timeout(base_s=self.worker_timeout_ms / 1000.0)
+            # P3：batch 的 CPU 预算按并行度放大——JOB_TIME/RLIMIT 是进程
+            # 树累计（N 个池子进程各烧一份），不放大会被提前击杀；
+            # 墙钟上限不放大（并行本就是为了在墙钟内装更多计算）
+            cpu_budget = (timeout_s * resolve_jobs()
+                          if method == "factor.evaluate_batch" else timeout_s)
             cmd = [sys.executable, "-m", "dsh_factor_mining.worker",
                    "--request", str(req_path), "--result", str(out_path)]
+            # P1/D1：Popen 化——超时时刻先读子进程 CPU 秒再做二维归因
+            # （进程退出后句柄失效，必须杀之前读）；cwd 隔离：worker 是纯计算
+            # 进程，绝不继承 DSH 工作区 cwd（node_modules 循环符号链接事故）
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env_os, cwd=str(run_root),
+                preexec_fn=posix_limit_preexec(cpu_s=cpu_budget,
+                                               mem_bytes=worker_mem_bytes()))
+            # P2：OS 级硬限额（父进程被饿死时仍确定性击杀；内存限额防
+            # 膨胀因子把整机拖进 swap 饿死所有并行会话）。失败优雅降级
+            job = attach_worker_limits(proc, cpu_s=cpu_budget,
+                                       mem_bytes=worker_mem_bytes())
+            stderr_txt = ""
             try:
-                # cwd 隔离：worker 是纯计算进程，绝不继承 DSH 工作区 cwd
-                # （曾因工作区 node_modules 循环符号链接 + MAX_PATH 触发 WinError 1921）。
-                proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      timeout=timeout_s, env=env_os, cwd=str(run_root))
+                _, stderr_txt = proc.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                # 杀进程树：Windows 用 taskkill /T（跨平台兼容：POSIX 下 subprocess.run
-                # 超时已自动 kill 主进程，worker 无孙进程，无需额外动作）
+                cpu_s = cpu_seconds(proc.pid)
+                verdict = starvation_verdict(cpu_s, timeout_s)
+                # 杀进程树：Windows 用 taskkill /T；POSIX kill 直接子进程
                 if sys.platform == "win32":
                     try:
                         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                                        capture_output=True)
                     except Exception:
                         pass
-                raise BridgeError(-32005, f"worker 超时（>{timeout_s:.0f}s），已终止")
+                else:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.communicate(timeout=15)
+                except Exception:
+                    pass
+                if verdict["class"] == "starved":
+                    # D2：饿死 = infra_failure（不是因子的错）——立即上报
+                    # 不自动重试（诚实信号：用户应看到机器超订），零写入
+                    # 不计账，重试是 agent 的下一步
+                    raise BridgeError(
+                        -32005,
+                        f"worker 超时（墙钟 {timeout_s:.0f}s，实际仅获得 "
+                        f"{verdict['cpu_s']:.1f}s CPU，占比 {verdict['ratio']:.0%}）——"
+                        "机器超订（并行会话/其他进程挤占 CPU）所致，不是 factor 实现慢。"
+                        "本次调用零写入（registry/trail 均未动，不烧名）。"
+                        "修法：直接重试同一因子即可（未计入账本）；若反复出现，"
+                        "降低并行（设 DSH_FACTOR_JOBS，多会话加总 ≤ 核数）。"
+                        "这是基础设施事件——不修实现、不换假设，也不作为对因子的判定。")
+                # 真慢（cpu_dense/borderline/数据不可读保守处理）：四要素
+                # 错误（W1 2026-08-26）——存活/零写入/根因修法/纪律
+                cpu_note = (f"（实测 CPU {verdict['cpu_s']:.1f}s / 墙钟 {timeout_s:.0f}s"
+                            f"——{verdict['note']}）" if verdict["ratio"] is not None else "")
+                raise BridgeError(
+                    -32005,
+                    f"worker 超时（>{timeout_s:.0f}s）——{method} 的 worker 子进程已终止"
+                    "并清理；bridge 本体未受影响，无需等待恢复，可立即重试。本次调用"
+                    "零写入（registry/trail 均未动，不烧名）。最可能根因：factor(env) "
+                    f"单次计算超过 {timeout_s:.0f}s，典型是 per-symbol Python 循环；"
+                    "修法 = 向量化（df.groupby(\"symbol\") 的 shift/rolling，或 unstack "
+                    "到宽表做矩阵运算）。这是基础设施事件，不是对因子/研究方向的判定"
+                    f"——修实现，不换假设。{cpu_note}")
 
             if not out_path.exists():
-                tail = (proc.stderr or "")[-500:]
+                tail = (stderr_txt or "")[-500:]
+                # P2 线索：无输出且提前死亡——可能被 OS 级限额（CPU/内存）击杀
+                limit_note = ("｜worker 提前死亡且无输出：若计算/内存量异常庞大，"
+                              "已被 OS 级限额击杀（DSH_FACTOR_TIMEOUT / "
+                              "DSH_FACTOR_WORKER_MEM_MB）——向量化或简化实现"
+                              if job else "")
                 # 污染特征快速诊断：stdlib backport 遮蔽（2026-08-18 实测事故，
                 # agent 曾为此耗掉整轮对话——在这里给出可执行的修法）
                 hint = ""
@@ -1225,7 +1375,8 @@ class Bridge:
                             "pip uninstall pathlib 后重启会话")
                 raise BridgeError(
                     -32005,
-                    f"worker 无结果输出(rc={proc.returncode}): {tail}{hint}")
+                    f"worker 无结果输出(rc={proc.returncode}): {tail}{hint}{limit_note}"
+                    "｜bridge 本体未受影响，本次调用零写入（不烧名），可立即重试")
             result = json.loads(out_path.read_text(encoding="utf-8"))
             if not result.get("ok"):
                 err = result.get("error") or {}
@@ -1236,6 +1387,9 @@ class Bridge:
                 raise BridgeError(-32603, str(msg))
             return result["result"]
         finally:
+            # P2：释放 job 句柄（job 内已无进程，无副作用；父崩溃时 OS 按
+            # KILL_ON_JOB_CLOSE 兜底杀残余）
+            detach_worker_limits(job)
             import shutil
             shutil.rmtree(str(wdir), ignore_errors=True)
 
@@ -1254,7 +1408,18 @@ class Bridge:
             return check_causality(fn, env)
         if method == "factor.evaluate":
             stage = params.get("stage", "development")
+            # W2（2026-08-26 规划书）：单次 factor(env) 计时 + submit 噪声门
+            # 可行性预警——与 worker.factor.evaluate 同口径（见 noise.factor_perf）；
+            # P1：CPU 秒并记（并行下墙钟失真）
+            import time as _time
+            from .factor.noise import factor_perf
+            _t0 = _time.monotonic()
+            _p0 = _time.process_time()
             F = fn(env)
+            _wall = _time.monotonic() - _t0
+            _cpu = _time.process_time() - _p0
+            _perf = {**factor_perf(_cpu), "wall_s": round(_wall, 3),
+                     "cpu_s": round(_cpu, 3)}
             _ps = params.get("pool_std")
             _ps = float(_ps) if isinstance(_ps, (int, float)) else None
             # v3：bar_sigma 为门参数（E[max|X|] σ 单位）；n_trials 纯遥测；
@@ -1269,16 +1434,20 @@ class Bridge:
             except (TypeError, ValueError):
                 _h = None
             if stage == "development":
-                return evaluate(F, env, n_trials=_nt, pool_std=_ps, horizon=_h,
-                                bar_sigma=_bs)
-            if stage == "selection":
-                return evaluate_selection(F, env)
-            if stage == "test":
+                out = evaluate(F, env, n_trials=_nt, pool_std=_ps, horizon=_h,
+                               bar_sigma=_bs)
+            elif stage == "selection":
+                out = evaluate_selection(F, env)
+            elif stage == "test":
                 try:
-                    return evaluate_test(F, env, state_root=self.state_root)
+                    out = evaluate_test(F, env, state_root=self.state_root)
                 except RuntimeError as e:
-                    raise BridgeError(-32003, str(e))
-            raise BridgeError(-32602, f"未知 stage: {stage}")
+                    raise BridgeError(-32003, str(e)) from None
+            else:
+                raise BridgeError(-32602, f"未知 stage: {stage}")
+            if isinstance(out, dict):
+                out["perf"] = _perf
+            return out
         if method == "factor.evaluate_composite":
             parts = {}
             for name, src in (params.get("ingredients") or {}).items():
@@ -1357,7 +1526,19 @@ class Bridge:
 
         缓存 key = 源码hash : 环境三元组指纹（数据文件+口径+引擎版本）——
         同一源码换环境/换数据文件后不得误命中旧结论：扰动法依赖 env 尺寸与数据，
-        跨环境的前视结论不可移植。纪律变机制，不靠 agent 自觉。"""
+        跨环境的前视结论不可移植。纪律变机制，不靠 agent 自觉。
+        P4 Tier 1：A 类确定性反模式同样在此硬拒（所有评估路径的必经门——
+        单因子/batch 逐成员/composite 全覆盖；拒绝评估 = 不计 trial）。"""
+        ineff = scan_inefficiency(source)
+        if ineff.get("hard_reject"):
+            pats = "；".join(f"L{h.get('line')} {h.get('pattern')}"
+                             for h in ineff.get("class_a", [])[:3])
+            raise BridgeError(
+                -32003,
+                f"因子源码含 A 类确定性反模式，拒绝评估（不计入 trial）：{pats}。"
+                "这些写法在 factor(env) 中没有合法用途（dsh_factor_mining.factor.ops "
+                "向量化算子库已覆盖等价表达）——按各条目内嵌的替换模板改写后重试。"
+                "拒绝发生在评估之前：零计算消耗、零账本写入。")
         key = self._causality_cache_key(source, env_id or "primary")
         cached = self._causality_cache.get(key)
         if cached is not None:
@@ -1385,8 +1566,16 @@ class Bridge:
         env_id = params.get("envId", "primary")
         env = self._require_panel_env(env_id)
         source = params.get("source", "")
-        # 低效模式扫描（效率防御层1）：warning 不阻断，附在结果里
+        # 低效模式扫描（效率防御层1）：A 类硬拒（与 _enforce_causality 同判，
+        # agent 显式 check 时即看到拒绝与替换模板）；B 类 warning 附结果
         ineff = scan_inefficiency(source)
+        if ineff.get("hard_reject"):
+            pats = "；".join(f"L{h.get('line')} {h.get('pattern')}"
+                             for h in ineff.get("class_a", [])[:3])
+            raise BridgeError(
+                -32003,
+                f"因子源码含 A 类确定性反模式，拒绝评估（不计入 trial）：{pats}。"
+                "按各条目内嵌的替换模板改写后重试——ops 向量化算子库已覆盖等价表达。")
         result = self._run_factor("factor.check_causality", source, params, env)
         if isinstance(result, dict):
             result["causal"] = result.get("verdict") == "causal"
@@ -1594,6 +1783,46 @@ class Bridge:
         if isinstance(std, (int, float)) and math.isfinite(std) and std > 0:
             return float(std)
         return None
+
+    def _tail_telemetry(self, engine_trail: list) -> dict:
+        """尾部线遥测块（2026-08-27 规划书 WS-B.1，进 loop 响应）。
+
+        从 tail_ledger 派生：n_trials_tail / N_eff / bar（当前 N_eff 与
+        s0 现算，legacy 公式近似——t_adj 全量重算不可行也不必要）/
+        near_misses（spread_ir ∈ [bar−0.10, bar) 最近 3 条）。给 agent
+        「差一点」的方向感，替代 IC 单轨下的一片漆黑。账本为空 → 计数
+        为 0 + bar=None，不炸。"""
+        from .factor.tailgate import (tail_deflation_bar, tail_ledger,
+                                      tail_near_misses, tail_n_eff)
+        ledger = tail_ledger(engine_trail)
+        n_eff, n_total = tail_n_eff(ledger)
+        out = {"n_trials_tail": n_total, "n_eff": n_eff}
+        periods = sorted(int(r["n_periods"]) for r in ledger
+                         if isinstance(r, dict)
+                         and isinstance(r.get("n_periods"), (int, float)))
+        n_days = periods[len(periods) // 2] if periods else 0
+        s0_emp = None
+        env_id = next(iter(self.envs), None) if getattr(self, "envs", None) else None
+        if env_id is not None:
+            try:
+                s0_emp = self._landscape_tail_s0(env_id)
+            except Exception:
+                s0_emp = None
+        bar = tail_deflation_bar(max(n_eff, 1), n_days, s0_emp=s0_emp)
+        if isinstance(bar, dict) and bar.get("ok"):
+            out["bar"] = {"value": bar.get("bar"),
+                          "s0_source": bar.get("s0_source")}
+            out["near_misses"] = tail_near_misses(ledger,
+                                                  float(bar["bar"]))
+            out["note"] = ("尾部线接近门槛的方向（spread_ir 距 bar < 0.10）"
+                           "——若与当前族不同源，优先构造变体")
+        else:
+            out["bar"] = None
+            out["near_misses"] = []
+            out["note"] = ("尾部线 deflation 门暂不可计算"
+                           f"（{bar.get('reason') if isinstance(bar, dict) else 'bar 缺失'}"
+                           "）——有 tail 块的评估积累后自动出现")
+        return out
 
     # ---- G1 权威 placebo 缓存（WS2 2026-08-25）----
     # 重 placebo 贵且确定性（seed = 指纹派生）——缓存键
@@ -1889,39 +2118,76 @@ class Bridge:
         - marginal ∈ (-0.10, -0.05)：边际枯竭 → rotate
         - marginal < -0.10：严重枯竭 → literature（需要外部假设源）
 
-        族内样本 < 5 → enough_data=False，不做判定（小族不催）。"""
+        族内样本 < 5 → enough_data=False，不做判定（小族不催）。
+
+        双线汇报（2026-08-27 规划书 WS-B.3）：diag 增 tail_marginal——
+        族内 spread_ir 滑窗对族前史最佳（同窗口数学，spread 单侧不取
+        绝对值）。_pick_strategy R1/R2 据两线都枯竭才触发；单线枯竭只出
+        escalation。尾部线样本 < 5 → tail_marginal.enough_data=False，
+        R1/R2 回到 IC 单轨行为。"""
         fam = self._family_chain(engine_trail)
         irs = [abs(e["ic_ir"]) for e in fam
                if isinstance(e, dict) and isinstance(e.get("ic_ir"), (int, float))
                and not isinstance(e.get("ic_ir"), bool)]
+        sps = []
+        for e in fam:
+            if not isinstance(e, dict):
+                continue
+            tail = e.get("tail") if isinstance(e.get("tail"), dict) else None
+            sp = tail.get("spread_ir") if tail else None
+            if (isinstance(sp, (int, float)) and not isinstance(sp, bool)
+                    and math.isfinite(float(sp))):
+                sps.append(float(sp))
+        out = None
         if len(irs) < 5:
-            return {"enough_data": False, "family_size": len(irs)}
-        W = max(5, min(10, len(irs) // 2))
-        if len(irs) <= W:
-            return {"enough_data": False, "family_size": len(irs)}
-        family_best_before = max(irs[:-W])
-        recent_best = max(irs[-W:])
-        family_best = max(irs)
-        marginal = recent_best - family_best_before
-        # plateau_trials：尾部多少条未达到族最佳
-        plateau = 0
-        for ir in reversed(irs):
-            if ir >= family_best - 1e-9:
-                break
-            plateau += 1
-        return {
-            "enough_data": True,
-            "family_size": len(irs),
-            "family_best": round(family_best, 4),
-            "recent_best": round(recent_best, 4),
-            "family_best_before": round(family_best_before, 4),
-            "marginal": round(marginal, 4),
-            "plateau_trials": plateau,
-        }
+            out = {"enough_data": False, "family_size": len(irs)}
+        else:
+            W = max(5, min(10, len(irs) // 2))
+            if len(irs) <= W:
+                out = {"enough_data": False, "family_size": len(irs)}
+            else:
+                family_best_before = max(irs[:-W])
+                recent_best = max(irs[-W:])
+                family_best = max(irs)
+                marginal = recent_best - family_best_before
+                # plateau_trials：尾部多少条未达到族最佳
+                plateau = 0
+                for ir in reversed(irs):
+                    if ir >= family_best - 1e-9:
+                        break
+                    plateau += 1
+                out = {
+                    "enough_data": True,
+                    "family_size": len(irs),
+                    "family_best": round(family_best, 4),
+                    "recent_best": round(recent_best, 4),
+                    "family_best_before": round(family_best_before, 4),
+                    "marginal": round(marginal, 4),
+                    "plateau_trials": plateau,
+                }
+        # 尾部线（同窗口数学；spread_ir 单侧不取绝对值——准入方向为正）
+        if len(sps) >= 5:
+            Wt = max(5, min(10, len(sps) // 2))
+            if len(sps) > Wt:
+                out["tail_marginal"] = {
+                    "enough_data": True,
+                    "family_size": len(sps),
+                    "family_best": round(max(sps), 4),
+                    "recent_best": round(max(sps[-Wt:]), 4),
+                    "family_best_before": round(max(sps[:-Wt]), 4),
+                    "marginal": round(max(sps[-Wt:]) - max(sps[:-Wt]), 4),
+                }
+            else:
+                out["tail_marginal"] = {"enough_data": False,
+                                        "family_size": len(sps)}
+        else:
+            out["tail_marginal"] = {"enough_data": False,
+                                    "family_size": len(sps)}
+        return out
 
     def _family_convergence(self, engine_trail: list,
                             mining: dict) -> tuple[bool, str | None, dict]:
-        """族内 IC 收敛（2026-08-26 规划书，替换全局收敛）。
+        """族内 IC×尾部双线收敛（2026-08-26 规划书；2026-08-27 双轨 AND）。
 
         动机：全局版的参考系是全试验 max，被历史峰值族主导——换到真实
         但更弱的新族时永远追不上前窗口旧族峰值 → 误判全局枯竭。
@@ -1933,6 +2199,14 @@ class Bridge:
           灌窗口，与全局版口径一致）
         - 门槛：去重后 ≥ 2·Wf 条才判（小族不判，由 _family_marginal
           软信号兜底）；收敛 ⟺ max(|IC|[-Wf:]) − max(|IC|[-2Wf:-Wf]) < δf
+
+        双轨 AND（2026-08-27 规划书 D2）：尾部线（族内带 tail 块条目的
+        spread_ir，同键去重、同 ≥2·Wf 门槛、同滑窗口径，delta 独立键
+        fam_conv_delta_tail）与 IC 线都平才 must_rotate。IC 平但尾部
+        仍在改善 → 不触发（diag.ic_converged=True 供 escalation 改写）。
+        尾部线条目 < 2·Wf 或 delta_tail ≤0 → 只有 IC 线参与判定（回到
+        单轨行为；弱波动不得成为赖着不换向的口子）。
+
         停点性质（用户钉死：纯 must_rotate）——触发方换向，断链自动
         解除；不设静默终态（convergence stop_kind 退役）。
 
@@ -1941,37 +2215,72 @@ class Bridge:
         try:
             w = int(mining.get("fam_conv_window", 0) or 0)
             delta = float(mining.get("fam_conv_delta", 0) or 0)
+            _dt = mining.get("fam_conv_delta_tail")
+            delta_tail = (float(_dt) if isinstance(_dt, (int, float))
+                          and not isinstance(_dt, bool) else delta)
         except (TypeError, ValueError):
             return False, None, {"error": "参数类型非法"}
         if w <= 0 or delta <= 0:
             return False, None, {"disabled": True, "window": w, "delta": delta}
         fam = self._family_chain(engine_trail)
         irs_by_key: dict = {}
+        sp_by_key: dict = {}
         order: list = []
         for e in fam:
             if not isinstance(e, dict):
                 continue
-            ir = e.get("ic_ir")
-            if not isinstance(ir, (int, float)) or isinstance(ir, bool):
-                continue
             k = (e.get("source_hash"), e.get("horizon"))
-            if k not in irs_by_key:
+            if k not in irs_by_key and k not in sp_by_key:
                 order.append(k)
-            irs_by_key[k] = abs(float(ir))
-        irs = [irs_by_key[k] for k in order]
+            ir = e.get("ic_ir")
+            if isinstance(ir, (int, float)) and not isinstance(ir, bool):
+                # 去重保序取最新（与 IC 单轨版同一语义）：键的窗口位置 =
+                # 首次出现，值 = 最近一次（跨 stage 重评更新不新增）
+                irs_by_key[k] = abs(float(ir))
+            tail = e.get("tail") if isinstance(e.get("tail"), dict) else None
+            sp = tail.get("spread_ir") if tail else None
+            if (isinstance(sp, (int, float)) and not isinstance(sp, bool)
+                    and math.isfinite(float(sp))):
+                # spread_ir 单侧语义（准入 spread_ir ≥ bar）——不取绝对值
+                sp_by_key[k] = float(sp)
+        irs = [irs_by_key[k] for k in order if k in irs_by_key]
+        sps = [sp_by_key[k] for k in order if k in sp_by_key]
+        tail_enabled = delta_tail > 0
+        tail_diag = {"family_size": len(sps), "window": w,
+                     "delta": delta_tail,
+                     "enough_data": tail_enabled and len(sps) >= 2 * w}
         diag = {"family_size": len(irs), "window": w, "delta": delta,
-                "enough_data": len(irs) >= 2 * w}
+                "enough_data": len(irs) >= 2 * w,
+                "tail": tail_diag}
         if len(irs) < 2 * w:
             return False, None, diag
         recent_best = max(irs[-w:])
         prev_best = max(irs[-2 * w:-w])
         diag.update({"recent_best": round(recent_best, 4),
-                     "prev_best": round(prev_best, 4)})
-        if recent_best - prev_best < delta:
-            return True, (f"族内 IC 收敛（本族最近 {w} 条最佳 |IC_IR| "
-                          f"{recent_best:.3f} 未超前窗口最佳 {prev_best:.3f} "
-                          f"达 {delta}）"), diag
-        return False, None, diag
+                     "prev_best": round(prev_best, 4),
+                     "ic_converged": recent_best - prev_best < delta})
+        if not diag["ic_converged"]:
+            return False, None, diag
+        # IC 线平：尾部线在场且数据足够 → AND 判定；否则 IC 单轨（现行行为）
+        if tail_diag["enough_data"]:
+            t_recent = max(sps[-w:])
+            t_prev = max(sps[-2 * w:-w])
+            tail_diag.update({"recent_best": round(t_recent, 4),
+                              "prev_best": round(t_prev, 4),
+                              "converged": t_recent - t_prev < delta_tail})
+            if not tail_diag["converged"]:
+                # IC 收敛但尾部仍在改善（+δ）——不触发 must_rotate，
+                # escalation 文案由 _loop_directive 按 diag 改写
+                return False, None, diag
+            reason = (f"族内 IC×尾部双线收敛（IC：本族最近 {w} 条最佳 |IC_IR| "
+                      f"{recent_best:.3f} 未超前窗口最佳 {prev_best:.3f} 达 "
+                      f"{delta}；spread：最近 {w} 条最佳 spread_ir "
+                      f"{t_recent:.3f} 未超前窗口最佳 {t_prev:.3f} 达 "
+                      f"{delta_tail}）")
+            return True, reason, diag
+        return True, (f"族内 IC 收敛（本族最近 {w} 条最佳 |IC_IR| "
+                      f"{recent_best:.3f} 未超前窗口最佳 {prev_best:.3f} "
+                      f"达 {delta}）"), diag
 
     def _loop_directive(self) -> dict:
         """停走指令：引擎对 agent 的唯一停走真相源（注入关键工具响应）。
@@ -2044,29 +2353,69 @@ class Bridge:
         # 已平台的族催（哪怕只有 5 个）
         fam_marg = self._family_marginal(engine_trail)
         escalation = None
-        if fam_marg.get("enough_data"):
+        # 双轨收敛分流文案（2026-08-27 D2）：IC 线收敛但尾部线仍在改善 →
+        # 不触发 must_rotate，escalation 把「为什么没换向」说清楚——
+        # 继续尾部维度或换向由策略分流
+        fc_diag = fam_conv[2] if isinstance(fam_conv[2], dict) else {}
+        fc_tail = fc_diag.get("tail") if isinstance(fc_diag.get("tail"), dict) else {}
+        if (fc_diag.get("ic_converged") and fc_tail.get("enough_data")
+                and fc_tail.get("converged") is False):
+            _t_imp = float(fc_tail["recent_best"]) - float(fc_tail["prev_best"])
+            escalation = (
+                f"IC 线收敛但尾部线仍在改善（spread_ir 最近窗最佳 "
+                f"{float(fc_tail['recent_best']):.3f} vs 前窗 "
+                f"{float(fc_tail['prev_best']):.3f}，+{_t_imp:.3f}）——"
+                "继续尾部维度或换向由策略分流")
+        elif fam_marg.get("enough_data"):
             m = fam_marg["marginal"]
             fb = fam_marg["family_best"]
             pt = fam_marg["plateau_trials"]
+            tm_info = fam_marg.get("tail_marginal") or {}
+            tm = tm_info.get("marginal") if tm_info.get("enough_data") else None
+            tail_ok = isinstance(tm, (int, float))
+            tail_txt = (f"；尾部线边际 {tm:+.3f}（最近窗 spread_ir 最佳 "
+                        f"{tm_info['recent_best']:.3f} vs 族前史 "
+                        f"{tm_info['family_best_before']:.3f}）") if tail_ok else ""
             if m < -0.10:
-                escalation = (
-                    f"族内边际严重枯竭——最近 {fam_marg['family_size']} 个同族试验"
-                    f"的最佳 |IC_IR| {fam_marg['recent_best']:.3f} 落后族历史"
-                    f"最佳 {fam_marg['family_best_before']:.3f} 达 {abs(m):.3f}"
-                    f"（{pt} 个试验未刷新族最佳 {fb:.3f}）。必须 factor_arxiv_search"
-                    " 引入文献级假设后构造新因子族。继续本族 = 浪费试验预算。")
+                if tail_ok and tm >= -0.10:
+                    escalation = (
+                        f"IC 线边际严重枯竭（{m:+.3f}）但尾部线边际 {tm:+.3f} "
+                        "未同枯竭——单线枯竭不强制文献注入，"
+                        "继续尾部维度或换向由策略分流")
+                else:
+                    escalation = (
+                        f"族内边际严重枯竭——最近 {fam_marg['family_size']} 个同族试验"
+                        f"的最佳 |IC_IR| {fam_marg['recent_best']:.3f} 落后族历史"
+                        f"最佳 {fam_marg['family_best_before']:.3f} 达 {abs(m):.3f}"
+                        f"（{pt} 个试验未刷新族最佳 {fb:.3f}）{tail_txt}。"
+                        "必须 factor_arxiv_search 引入文献级假设后构造新因子族。"
+                        "继续本族 = 浪费试验预算。")
             elif m < -0.05:
-                escalation = (
-                    f"族内边际枯竭——最近窗口最佳 {fam_marg['recent_best']:.3f}"
-                    f"落后族历史 {fam_marg['family_best_before']:.3f} 达 "
-                    f"{abs(m):.3f}（{pt} 个试验未刷新）。换信息源维度"
-                    "（新数据列/新算子族/新信号形式）。族内参数微调不再产生新信息。")
+                if tail_ok and tm >= -0.05:
+                    escalation = (
+                        f"IC 线边际枯竭（{m:+.3f}）但尾部线边际 {tm:+.3f} 未同"
+                        "枯竭——不强制换向，优先构造尾部维度变体（top-K 组差"
+                        "方向，见 loop.tail 遥测）")
+                else:
+                    escalation = (
+                        f"族内边际枯竭——最近窗口最佳 {fam_marg['recent_best']:.3f}"
+                        f"落后族历史 {fam_marg['family_best_before']:.3f} 达 "
+                        f"{abs(m):.3f}（{pt} 个试验未刷新）{tail_txt}。"
+                        "换信息源维度（新数据列/新算子族/新信号形式）。"
+                        "族内参数微调不再产生新信息。")
             elif m < 0:
                 escalation = (
                     f"族内边际递减——最近窗口最佳 {fam_marg['recent_best']:.3f}"
                     f"未超越族历史 {fam_marg['family_best_before']:.3f}"
-                    f"（边际 {m:+.3f}，{pt} 个试验未刷新）。考虑换构造思路"
-                    "而非继续参数微调。")
+                    f"（边际 {m:+.3f}，{pt} 个试验未刷新）{tail_txt}。"
+                    "考虑换构造思路而非继续参数微调。")
+            elif tail_ok and tm < -0.05:
+                escalation = (
+                    f"尾部线边际枯竭（{tm:+.3f}，最近窗 spread_ir 最佳 "
+                    f"{tm_info['recent_best']:.3f} vs 族前史 "
+                    f"{tm_info['family_best_before']:.3f}）而 IC 线仍在改善"
+                    f"（{m:+.3f}）——尾部维度已饱和，继续 IC 维度或换向，"
+                    "策略不强制")
         obligation = None
         if state == "running":
             obligation = ("继续内循环——禁止停下来等用户指示。停点仅由引擎机械"
@@ -2121,7 +2470,7 @@ class Bridge:
             accepted_n=accepted_n, agent_rounds=agent_rounds,
             n_trials=n_trials, lit_search_count=lit_search_count,
             family_marginal=fam_marg)
-        return {
+        loop = {
             "state": state,
             "stop_kind": stop_kind,
             "round": arc,
@@ -2135,12 +2484,26 @@ class Bridge:
             "family_streak": streak,
             "stop_reason": stop_reason,
             "family_convergence": fam_conv[2],
+            "tail": self._tail_telemetry(engine_trail),
             "pending_hypothesis": pending,
             "pending_rejected": pending_rejected,
             "obligation": obligation,
             "escalation": escalation,
             "strategy": strategy,
         }
+        # W3（2026-08-26 规划书）：最近 30 分钟 infra 失败（-32005）≥1 → 附加
+        # 纠偏引导——超时后 agent 的下一个成功调用（status/evaluate/
+        # trail_summary）即收到。纯附加遥测：不影响上面任何停走判定，
+        # 也不参与策略选择
+        infra = self._recent_infra_failures()
+        if infra:
+            loop["infra_failures"] = {
+                "recent_count": len(infra),
+                "last_method": infra[-1].get("method"),
+                "note": ("worker 超时是基础设施事件：向量化实现，勿因超时更换研究方向；"
+                         "失败的调用零写入、可立即重试"),
+            }
+        return loop
 
     def _factor_evaluate(self, params):
         env_id = params.get("envId", "primary")
@@ -2153,11 +2516,20 @@ class Bridge:
             lock_path = Path(self.state_root) / "test_lock.json"
             if lock_path.exists():
                 try:
-                    if json.loads(lock_path.read_text(encoding="utf-8")).get("consumed", False):
+                    _tl = json.loads(lock_path.read_text(encoding="utf-8"))
+                    if _tl.get("consumed", False):
                         raise BridgeError(
                             -32003,
                             "test 已被消费（test_lock.json）。test 是最终消耗品，禁止反复评估调参。"
                             "锁不在任何 reset scope——只能手动删除（意味着声明放弃本 stateRoot 的 test 纪律）。")
+                    # 并行 P0 claim 态：另一进程正在评估 test（claim-then-compute）
+                    _cl = _tl.get("claim") or {}
+                    _cpid = _cl.get("pid")
+                    if _cpid and pid_alive(int(_cpid)) and int(_cpid) != os.getpid():
+                        raise BridgeError(
+                            -32003,
+                            f"test 正在被另一进程评估（PID={_cpid}，始于 {_cl.get('ts', '?')}）——"
+                            "等它完成后再试；确认其已崩溃可手动删除 test_lock.json 的 claim 后重试。")
                 except BridgeError:
                     raise
                 except Exception:
@@ -2299,7 +2671,9 @@ class Bridge:
                 if src:
                     trail_items.append((source_fingerprint(src), "batch", diag, None))
             if trail_items:
-                self._append_engine_trail_batch(env_id, trail_items)
+                # 写锁（并行 P0）：batch 通道与单因子同锁——读改写全程互斥
+                with state_write_lock(self.state_root):
+                    self._append_engine_trail_batch(env_id, trail_items)
             # A2：sketch 已存 trail；agent 可见 schema 保持不变（不留 ic_series_train）
             # 就地重算（2026-08-20 会话轨迹审计修复）：evaluate() 对每个成员
             # 单独算 deflated 时是单检验口径（batch 视图里的 p 系统性偏乐观，
@@ -2559,14 +2933,29 @@ class Bridge:
             seed_note = (f"seed_used={seed}（运行时自动派生，与 null 校准 seed={null_seed} "
                          "不冲突；复现本批结果时用该 seed）")
         rng = np.random.default_rng(seed)
+        # spread 分位参照（WS-C 2026-08-27）：landscape 指纹匹配时取主
+        # horizon 的 spread 段——light_ic_scan 里做查表插值（spread_pct）；
+        # 无 landscape / 指纹不匹配 → None（spread_pct 缺省，不炸）
+        spread_ref = None
+        if isinstance(landscape, dict):
+            try:
+                fp_ok = self._landscape_fingerprint_status(
+                    landscape, params.get("envId", "primary")) == "match"
+            except Exception:
+                fp_ok = False
+            if fp_ok and isinstance(landscape.get("spread"), dict):
+                spread_ref = landscape["spread"].get(
+                    str(int(env.calibration.horizon)))
         results = []
         for i in range(n):
             tree = random_gen.generate_tree(rng, opset)
             try:
                 F = random_gen._eval_tree(tree, env)
-                diag = random_gen.light_ic_scan(F, env)
+                diag = random_gen.light_ic_scan(F, env, spread_ref=spread_ref)
             except Exception as e:
-                diag = {"ic_mean": None, "ic_ir": None, "n": 0, "error": str(e)[:120]}
+                diag = {"ic_mean": None, "ic_ir": None, "n": 0,
+                        "spread_ir": None, "spread_pct": None,
+                        "error": str(e)[:120]}
             results.append({
                 "index": i,
                 "expression": tree.to_expression(),
@@ -2585,10 +2974,37 @@ class Bridge:
                 "source": src,
                 "note": "随机幸存=选择非结论：拿 source 走标准管线 causality→evaluate→evaluate_batch(deflate)",
             })
+        # 尾部线列表（WS-C / D3 双列表）：按 spread_ir 排序——尾部强、
+        # IC 平庸的树首次可见。无 spread_ir 的树不进该列表（计算失败/
+        # 截面样本不足）。与 IC 列表的重叠如实报告
+        def _sp(r):
+            v = r["light_ic"].get("spread_ir")
+            return float(v) if isinstance(v, (int, float)) else None
+
+        tail_ranked = sorted(
+            (r for r in results if _sp(r) is not None),
+            key=lambda r: -_sp(r))
+        top_tail = []
+        for r in tail_ranked[:top_k]:
+            src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
+            top_tail.append({
+                "index": r["index"],
+                "expression": r["expression"],
+                "light_ic": r["light_ic"],
+                "source": src,
+                "note": ("尾部线幸存（spread_ir 排序，IC 可能平庸）——top-K "
+                         "组差方向的候选；admit_basis=tail 轨同样可走标准管线"
+                         "评估提交"),
+            })
+        overlap_idx = sorted({r["index"] for r in results[:top_k]}
+                             & {r["index"] for r in top_tail})
         dist = [abs(r["light_ic"].get("ic_ir") or 0.0) for r in results]
-        return {
+        sp_dist = [_sp(r) for r in results if _sp(r) is not None]
+        out = {
             "mode": "explore", "n": n, "seed": seed, "seed_note": seed_note, "top_k": top_k,
             "top": top,
+            "top_tail": top_tail,
+            "overlap_indexes": overlap_idx,
             "abs_ic_ir_distribution": {
                 "median": float(np.median(dist)) if dist else None,
                 "p95": float(np.percentile(dist, 95)) if dist else None,
@@ -2596,6 +3012,17 @@ class Bridge:
             },
             "null_hint": "top 因子的 |IC_IR| 若未超 null p95，大概率是噪声（见 factor.null_landscape）",
         }
+        if sp_dist:
+            out["spread_ir_distribution"] = {
+                "median": float(np.median(sp_dist)),
+                "p95": float(np.percentile(sp_dist, 95)),
+                "max": float(np.max(sp_dist)),
+            }
+        out["dual_list_note"] = (
+            "双列表（IC 线 top + 尾部线 top_tail，可重叠见 overlap_indexes）："
+            "top_tail 按 spread_ir（top-K 组差 IR）排序——尾部强、IC 平庸的"
+            "构造在这份列表可见；两列表都是选择不是结论，走标准管线验证")
+        return out
 
     def _factor_operators(self, params):
         """查看/配置生效算子集。action: get | set（set 覆盖式写 operator_set.json）。"""
@@ -2809,6 +3236,28 @@ class Bridge:
                 red_flagged.append({"source_hash": e.get("source_hash"),
                                     "stage": e.get("stage"),
                                     "red_flags": e["red_flags"][:3]})
+        # last_engine_trail 条目投影（2026-08-27 WS-A）：全字段每条 ~2.4KB
+        # （ic_series_sketch/suspects/construction_fp/tail 全量），且排在
+        # 响应 dict 末位——DH 呈现层按字符截断时最先死，agent 看不见最近
+        # 历史。投影每条 ≈150B，并前移到 loop 之后（即使未来再被截，最近
+        # 历史最先存活）。
+        def _trail_entry_compact(e) -> dict:
+            if not isinstance(e, dict):
+                return {"ts": None, "source_hash": None}
+            tail = e.get("tail") if isinstance(e.get("tail"), dict) else {}
+            topn = tail.get("topn") if isinstance(tail.get("topn"), dict) else {}
+            return {
+                "ts": e.get("ts"),
+                "source_hash": str(e.get("source_hash") or "")[:12],
+                "horizon": e.get("horizon"),
+                "stage": e.get("stage"),
+                "ic_ir": e.get("ic_ir"),
+                "verdict": e.get("verdict"),
+                "red_flags": list(e.get("red_flags") or [])[:2],
+                "tail": {"spread_ir": tail.get("spread_ir"),
+                         "placebo_z": topn.get("placebo_z")},
+            }
+
         return {
             "generated_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
             "mining": {k: mining.get(k) for k in ("round", "global_fail_streak", "finalized")},
@@ -2816,6 +3265,7 @@ class Bridge:
             # 自主性停走指令（2026-08-21）：恢复会话/定方向前先看这里——
             # loop.state=running 必须继续内循环，不得停下来问用户
             "loop": self._loop_directive(),
+            "last_engine_trail": [_trail_entry_compact(e) for e in engine_trail[-5:]],
             "evaluations": {"total": len(engine_trail),
                             "unique_sources": len({e.get("source_hash") for e in engine_trail}),
                             "verdict_counts": verdicts},
@@ -2823,8 +3273,9 @@ class Bridge:
             "explored_count": len(explored),
             "red_flagged": red_flagged[-10:],
             "pool": self._pool().stats(),
-            "last_engine_trail": engine_trail[-5:],
             "note": ("引擎层 trail 为 evaluate 自动记录（硬事实，不可瞒报）；"
+                     "last_engine_trail 为紧凑投影（每条 ≈150B，防呈现层截断），"
+                     "完整条目人读 stateRoot/trail_engine.json；"
                      "agent 层叙事见 factor_query_paths(layer='trail' 不支持时读文件)"),
         }
 
@@ -2901,26 +3352,28 @@ class Bridge:
         backup_dir = None
         removed = []
         skipped = []
-        for name in targets:
-            p = Path(self.state_root) / name
-            if not p.exists():
-                continue
-            try:
-                if backup_dir is None:
-                    # 加毫秒防同秒两次 reset 互相覆盖备份
-                    backup_dir = Path(self.state_root) / "backups" / (
-                        _time.strftime("%Y%m%d-%H%M%S") + f"-{int(_time.time() * 1000) % 1000:03d}")
-                    backup_dir.mkdir(parents=True, exist_ok=True)
-                if p.is_dir():
-                    # 目录目标（pool/）：整目录备份 + 整目录删除
-                    shutil.copytree(p, backup_dir / name)
-                    shutil.rmtree(p)
-                else:
-                    shutil.copy2(p, backup_dir / name)
-                    p.unlink()
-                removed.append(name)
-            except Exception as e:
-                skipped.append({"file": name, "error": f"{type(e).__name__}: {e}"[:150]})
+        # 写锁内删除（并行 P0）：与并发追加互斥，避免删到一半被写入
+        with state_write_lock(self.state_root):
+            for name in targets:
+                p = Path(self.state_root) / name
+                if not p.exists():
+                    continue
+                try:
+                    if backup_dir is None:
+                        # 加毫秒防同秒两次 reset 互相覆盖备份
+                        backup_dir = Path(self.state_root) / "backups" / (
+                            _time.strftime("%Y%m%d-%H%M%S") + f"-{int(_time.time() * 1000) % 1000:03d}")
+                        backup_dir.mkdir(parents=True, exist_ok=True)
+                    if p.is_dir():
+                        # 目录目标（pool/）：整目录备份 + 整目录删除
+                        shutil.copytree(p, backup_dir / name)
+                        shutil.rmtree(p)
+                    else:
+                        shutil.copy2(p, backup_dir / name)
+                        p.unlink()
+                    removed.append(name)
+                except Exception as e:
+                    skipped.append({"file": name, "error": f"{type(e).__name__}: {e}"[:150]})
         if scope in ("config", "all") and "data-config.json" in removed:
             # 配置被清：内存状态同步归零（文件即事实源）
             self.data_config = None
@@ -2941,7 +3394,59 @@ class Bridge:
         return result
 
     def _registry_get(self, params):
-        return {"registry": read_registry(self.state_root)}
+        """紧凑投影（2026-08-27 规划书 WS-A / D1）。
+
+        取证：全量响应 232KB（29 条 × ~8KB，diagnosis/noise_gate/flatness
+        等全字段）经 TS stringify 再膨胀 ~40%，DH 呈现层按字符截断——
+        registry 按时间序追加，截掉的正是最新条目（拒收理由、tracks
+        标注在每条 entry 尾部），agent 实际活在「看不见账本」状态。
+
+        本投影每条 ≤ ~200B，29 条 ≈ 6KB：截断永不触发。无 agent 侧全量
+        入口（全量 = 人读 stateRoot/registry.json；TS detail 参数是后续
+        可选增强，需 TS 管线）。"""
+        registry = read_registry(self.state_root)
+        entries = []
+        by_track = {"ic": 0, "tail": 0, "dual": 0}
+        accepted_n = 0
+        for e in registry:
+            if not isinstance(e, dict):
+                continue
+            acc = bool(e.get("accepted"))
+            if acc:
+                accepted_n += 1
+            tracks = e.get("tracks") if isinstance(e.get("tracks"), dict) else {}
+            ic_ok = bool((tracks.get("ic") or {}).get("accepted"))
+            tail_ok = bool((tracks.get("tail") or {}).get("accepted"))
+            basis = e.get("admit_basis") if e.get("admit_basis") in ("ic", "tail") \
+                else "ic"
+            if ic_ok and tail_ok:
+                by_track["dual"] += 1
+            elif acc:
+                by_track[basis] += 1
+            diag = e.get("diagnosis") if isinstance(e.get("diagnosis"), dict) else {}
+            diag_tail = diag.get("tail") if isinstance(diag.get("tail"), dict) else {}
+            item = {
+                "name": e.get("name"),
+                "ts": e.get("ts"),
+                "accepted": acc,
+                "admit_basis": basis,
+                "tracks": {"ic": ic_ok, "tail": tail_ok},
+                "ic_ir": e.get("ic_ir_train"),
+                "spread_ir": diag_tail.get("spread_ir"),
+            }
+            if not acc:
+                reason = e.get("reason")
+                item["reject_kind"] = e.get("reject_kind")
+                item["reject_reason"] = str(reason)[:120] if reason else None
+            entries.append(item)
+        return {
+            "count": len(entries),
+            "accepted": accepted_n,
+            "by_track": by_track,
+            "entries": entries,
+            "note": ("紧凑视图（防呈现层截断）；投影字段覆盖正交性审计与避坑"
+                     "所需；完整诊断为引擎内部数据，人读 stateRoot/registry.json"),
+        }
 
     def _authoritative_dsr_stats(self, source_hash: str | None,
                                  horizon: int | None) -> dict | None:
@@ -3033,8 +3538,11 @@ class Bridge:
             if _hash_dups:
                 if all(e.get("accepted") is False and _is_procedural_reject(e)
                        for e in _hash_dups):
-                    existing = [e for e in existing if e not in _hash_dups]
-                    write_registry(existing, self.state_root)
+                    # 治愈写入：锁内重读过滤（读在锁外有丢并发更新窗口）
+                    with state_write_lock(self.state_root):
+                        cur = read_registry(self.state_root)
+                        cur = [e for e in cur if e not in _hash_dups]
+                        write_registry(cur, self.state_root)
                 else:
                     raise BridgeError(
                         -32003,
@@ -3050,8 +3558,12 @@ class Bridge:
             # 失败/基础设施失败）= 名字被无意义烧掉——删除放行重试。
             # 实质性拒绝（门真判了）照旧烧名。
             if dup.get("accepted") is False and _is_procedural_reject(dup):
-                existing = [e for e in existing if e is not dup]
-                write_registry(existing, self.state_root)
+                # 治愈写入：锁内重读过滤（同上）
+                with state_write_lock(self.state_root):
+                    cur = read_registry(self.state_root)
+                    cur = [e for e in cur if not (isinstance(e, dict)
+                                                  and e.get("name") == name)]
+                    write_registry(cur, self.state_root)
             elif source_hash and dup.get("source_hash") == source_hash:
                 raise BridgeError(
                     -32003,
@@ -3440,8 +3952,22 @@ class Bridge:
             _rk = ("procedural"
                    if any(m in str(reason) for m in _PROCEDURAL_REJECT_MARKS)
                    else "substantive")
+        _pf = diagnosis.get("perf") if isinstance(diagnosis.get("perf"), dict) else {}
+        _entry_cpu_s = _pf.get("cpu_s") if isinstance(_pf.get("cpu_s"), (int, float)) else None
+        _entry_cpu_rel = None
+        if _entry_cpu_s is not None and _entry_cpu_s > 0:
+            try:
+                from .factor.calib import ref_cpu_seconds
+                _ref = ref_cpu_seconds(self.state_root)
+                if _ref:
+                    _entry_cpu_rel = round(float(_entry_cpu_s) / _ref, 2)
+            except Exception:
+                _entry_cpu_rel = None
         entry = {
             "name": name,
+            # ts（2026-08-27 WS-A）：紧凑投影的时间字段——旧条目无此键，
+            # 投影侧容忍 None（顺序即时间序）
+            "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
             "signal": signal,
             "accepted": accepted,
             "reason": reason,
@@ -3465,10 +3991,35 @@ class Bridge:
                            or self._env_full_fingerprint(params.get("envId", "primary")),
             "engine_version": __version__,
             "verdict": diagnosis.get("verdict"),
+            # P4 Tier 3：效率元数据——慢因子的税是永久性的（入册后每次
+            # 指纹采样/walk-forward 五折/噪声门 ≥10 倍/策略 apply 都重算它）。
+            # cpu_rel = cpu_s / 本机参考负载（跨机可比）；无校准时为 null
+            "cpu_s": _entry_cpu_s,
+            "cpu_rel": _entry_cpu_rel,
         }
-        registry = existing
-        registry.append(entry)
-        write_registry(registry, self.state_root)
+        # 终点写（并行 P0）：提交前的长计算（噪声门等）不持锁；落盘时刻
+        # 锁内重读 registry——预检查用的是几分钟前的快照，并发会话可能
+        # 已写入同名/同源码条目。锁内重跑硬不变量（同源码/同名非程序性
+        # 拒绝在场 = 铁律拒绝），治愈逻辑不在此重复（罕见路径，直接拒）。
+        with state_write_lock(self.state_root):
+            registry = read_registry(self.state_root)
+            if source_hash and any(
+                    isinstance(e, dict) and e.get("source_hash") == source_hash
+                    and not (e.get("accepted") is False and _is_procedural_reject(e))
+                    for e in registry):
+                raise BridgeError(
+                    -32003,
+                    "并发提交拦截：该源码已在另一会话登记（铁律：同一因子"
+                    "不得重复登记）——用 factor_query_registry 查看后走 update。")
+            if any(isinstance(e, dict) and e.get("name") == name
+                   and not (e.get("accepted") is False and _is_procedural_reject(e))
+                   for e in registry):
+                raise BridgeError(
+                    -32003,
+                    f"并发提交拦截：名字「{name}」已被另一会话占用——"
+                    "换名提交或用 factor_registry_update 修正已有条目。")
+            registry.append(entry)
+            write_registry(registry, self.state_root)
         # 永久审计账本（v4 2026-08-22）：ledger.json 记录每一次 submit——
         # name/结果/门参数/p，**不随任何 state.reset scope 清除**（只随
         # scope=registry 连带清空）。不做门的输入（层 2 已评审撤回：
@@ -3477,38 +4028,39 @@ class Bridge:
         try:
             import time as _lt
             ledger_path = Path(self.state_root) / "ledger.json"
-            ledger = []
-            if ledger_path.exists():
-                try:
-                    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-                    if not isinstance(ledger, list):
+            with state_write_lock(self.state_root):
+                ledger = []
+                if ledger_path.exists():
+                    try:
+                        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                        if not isinstance(ledger, list):
+                            ledger = []
+                    except Exception:
                         ledger = []
-                except Exception:
-                    ledger = []
-            dp_ledger = (diagnosis.get("deflated_train") or {})
-            ledger.append({
-                "ts": _lt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "name": name, "accepted": bool(accepted),
-                "ic_ir_train": diagnosis.get("ic_ir_train"),
-                "p": dp_ledger.get("p"),
-                "bar_sigma": dp_ledger.get("bar_sigma"),
-                "pool_std": dp_ledger.get("pool_std"),
-                "n_trials": dp_ledger.get("n_trials"),
-                "day_perm_p_align": (dayperm_report or {}).get("p_align"),
-                "alignment_dependent": (dayperm_report or {}).get(
-                    "alignment_dependent"),
-                "flatness_cliff": (flatness_report or {}).get("cliff"),
-                "admit_basis": admit_basis,
-                "dual_pass": dual_pass,
-                "tail_placebo_m": _placebo_gate_m,
-                "tail_placebo_z": _placebo_gate_z,
-                "engine_version": __version__,
-                "reason": str(reason)[:200],
-            })
-            tmp = ledger_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            os.replace(str(tmp), str(ledger_path))
+                dp_ledger = (diagnosis.get("deflated_train") or {})
+                ledger.append({
+                    "ts": _lt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "name": name, "accepted": bool(accepted),
+                    "ic_ir_train": diagnosis.get("ic_ir_train"),
+                    "p": dp_ledger.get("p"),
+                    "bar_sigma": dp_ledger.get("bar_sigma"),
+                    "pool_std": dp_ledger.get("pool_std"),
+                    "n_trials": dp_ledger.get("n_trials"),
+                    "day_perm_p_align": (dayperm_report or {}).get("p_align"),
+                    "alignment_dependent": (dayperm_report or {}).get(
+                        "alignment_dependent"),
+                    "flatness_cliff": (flatness_report or {}).get("cliff"),
+                    "admit_basis": admit_basis,
+                    "dual_pass": dual_pass,
+                    "tail_placebo_m": _placebo_gate_m,
+                    "tail_placebo_z": _placebo_gate_z,
+                    "engine_version": __version__,
+                    "reason": str(reason)[:200],
+                })
+                tmp = ledger_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=1),
+                               encoding="utf-8")
+                os.replace(str(tmp), str(ledger_path))
         except Exception as e:
             try:
                 import sys as _ls
@@ -3548,32 +4100,34 @@ class Bridge:
         name = str(params.get("name") or "")
         if not name:
             raise BridgeError(-32602, "registry_update 需要 name（要更新的条目名）")
-        registry = read_registry(self.state_root)
-        entry = next((e for e in registry if e.get("name") == name), None)
-        if entry is None:
-            raise BridgeError(-32602, f"registry 中没有名为「{name}」的条目")
-        forbidden = [k for k in ("source", "diagnosis", "ic_ir_train", "source_hash",
-                                 "fingerprint", "verdict", "accepted", "verified")
-                     if k in params]
-        if forbidden:
-            raise BridgeError(
-                -32003,
-                f"registry_update 不允许修改 {forbidden}——source/diagnosis/数字/判定是"
-                "铁律域：换 source = 新因子（走 registry_submit），改数字 = 编造。"
-                "只允许 signal（新描述）与 note（追加备注）。")
-        changed = []
-        if params.get("signal"):
-            entry["signal"] = str(params["signal"])
-            changed.append("signal")
-        if params.get("note"):
-            notes = entry.get("notes") or []
-            notes.append({"ts": _t.strftime("%Y-%m-%d %H:%M:%S"),
-                          "note": str(params["note"])[:1000]})
-            entry["notes"] = notes
-            changed.append("note(append)")
-        if not changed:
-            raise BridgeError(-32602, "没有可更新字段：传 signal（新描述）或 note（追加备注）")
-        write_registry(registry, self.state_root)
+        # 写锁内读改写（并行 P0）：update 是短计算，整段持锁无饥饿风险
+        with state_write_lock(self.state_root):
+            registry = read_registry(self.state_root)
+            entry = next((e for e in registry if e.get("name") == name), None)
+            if entry is None:
+                raise BridgeError(-32602, f"registry 中没有名为「{name}」的条目")
+            forbidden = [k for k in ("source", "diagnosis", "ic_ir_train", "source_hash",
+                                     "fingerprint", "verdict", "accepted", "verified")
+                         if k in params]
+            if forbidden:
+                raise BridgeError(
+                    -32003,
+                    f"registry_update 不允许修改 {forbidden}——source/diagnosis/数字/判定是"
+                    "铁律域：换 source = 新因子（走 registry_submit），改数字 = 编造。"
+                    "只允许 signal（新描述）与 note（追加备注）。")
+            changed = []
+            if params.get("signal"):
+                entry["signal"] = str(params["signal"])
+                changed.append("signal")
+            if params.get("note"):
+                notes = entry.get("notes") or []
+                notes.append({"ts": _t.strftime("%Y-%m-%d %H:%M:%S"),
+                              "note": str(params["note"])[:1000]})
+                entry["notes"] = notes
+                changed.append("note(append)")
+            if not changed:
+                raise BridgeError(-32602, "没有可更新字段：传 signal（新描述）或 note（追加备注）")
+            write_registry(registry, self.state_root)
         return {"ok": True, "name": name, "changed": changed}
 
     def _arxiv_search(self, params):
@@ -3819,62 +4373,32 @@ def _rpc_error(req_id, code, message, data=None):
                       ensure_ascii=False)
 
 
-def _acquire_state_lock(state_root: str) -> None:
-    """多会话防护：同一 stateRoot 只允许一个 bridge 进程（test 双消费/文件竞争防线）。
-    锁 = PID 文件；PID 已死（stale）则接管。进程级（main 里调用），单测直调 Bridge 不受影响。
-
-    原子性：先尝试 O_EXCL 独占创建——两个进程同时到达时只有一个能创建成功，
-    消除「检查-存活-写入」三步之间的 TOCTOU 竞态；只在接管 stale 锁时才走删除+重建。
-    """
-    import re as _re
-    import subprocess as _sp
-
-    lock = Path(state_root) / ".lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"pid": os.getpid(),
-                          "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S")})
-    # 快路径：独占创建（不存在时原子成功）
+def _register_bridge_instance(state_root: str) -> None:
+    """实例登记（并行 P0，取代启动独占锁）：同一 stateRoot 允许多个 bridge
+    共存（层 2 放行决策）——状态一致性由变更级写锁保证（filelock）。
+    本函数只维护报告性的 .bridge-instances.json（pid → 启动时间），
+    顺带清掉已死实例；诊断时可知 root 上有几个活跃会话。"""
+    p = Path(state_root) / ".bridge-instances.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open(lock, "x", encoding="utf-8") as f:
-            f.write(payload)
-        return
-    except FileExistsError:
-        pass
-    # 已有锁：检查持锁者是否存活
-    try:
-        old = json.loads(lock.read_text(encoding="utf-8"))
-        pid = int(old.get("pid", 0))
-        alive = False
-        if pid > 0 and pid != os.getpid():
-            if sys.platform == "win32":
-                r = _sp.run(["tasklist", "/FI", f"PID eq {pid}"],
-                            capture_output=True, text=True, timeout=10)
-                # 词边界匹配：裸子串会把 PID 5 误配到内存列/标题里的任何含 5 数字
-                alive = _re.search(rf"(?<!\d){pid}(?!\d)", (r.stdout or "")) is not None
-            else:
-                try:
-                    os.kill(pid, 0)
-                    alive = True
-                except OSError:
-                    alive = False
-        if alive:
-            raise SystemExit(
-                f"stateRoot '{state_root}' 正被另一会话使用（PID={pid}，启动于 "
-                f"{old.get('ts','?')}）。关闭那个会话或等待其退出后再启动；"
-                f"确认其已崩溃则手动删除 {lock}")
-    except (json.JSONDecodeError, ValueError, OSError):
-        pass  # 锁损坏 → 接管
-    # stale / 损坏 → 删除后重试独占创建一次（仍失败说明有人抢先，让位退出）
-    try:
-        lock.unlink()
-    except OSError:
-        pass
-    try:
-        with open(lock, "x", encoding="utf-8") as f:
-            f.write(payload)
-    except FileExistsError:
-        raise SystemExit(
-            f"stateRoot '{state_root}' 的锁在接管瞬间被另一进程抢先获取，本次启动让位退出")
+        with state_write_lock(state_root):
+            instances = {}
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    instances = raw
+            except Exception:
+                instances = {}
+            # 清死实例 + 登记 self
+            instances = {k: v for k, v in instances.items()
+                         if str(k) != str(os.getpid()) and pid_alive(int(k))}
+            instances[str(os.getpid())] = __import__("time").strftime("%Y-%m-%dT%H:%M:%S")
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(instances, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(str(tmp), str(p))
+    except Exception:
+        pass  # 登记失败不阻断启动（诊断性文件）
 
 
 def main(argv=None):
@@ -3895,7 +4419,7 @@ def main(argv=None):
         return 0
 
     bridge = Bridge(state_root=args.state_root, data_config_path=args.data_config)
-    _acquire_state_lock(bridge.state_root)
+    _register_bridge_instance(bridge.state_root)
     bridge._on_progress = lambda p: print(
         json.dumps({"jsonrpc": "2.0", "method": "progress", "params": p}, ensure_ascii=False),
         flush=True)

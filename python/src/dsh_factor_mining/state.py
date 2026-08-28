@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .filelock import state_write_lock
+
 DEFAULT_STATE_ROOT = Path.cwd() / ".factor-mining"
 
 FILES = {
@@ -40,6 +42,11 @@ MINING_CONFIG = {
     # 全部是真实平台（amihud 0.72 平台×3 + dk 族 0.348 vs 0.364×2）
     "fam_conv_window": 10,      # 本族最近 Wf 条 vs 本族前一 Wf 条窗口（≤0 关闭）
     "fam_conv_delta": 0.05,     # 改善 < δf → 族收敛（强制换向，断链解除）
+    # 尾部线收敛 delta（2026-08-27 规划书 D4）：与 IC 线同值同量纲
+    # （spread_ir 与 |IC_IR| 同为 IR 尺度，bar≈0.43-0.51 语境下 0.05 ≈ 10%）。
+    # 族收敛双轨 AND：两线都平才 must_rotate；本键 ≤0 = 尾部线退出判定
+    # （回到 IC 单轨行为）
+    "fam_conv_delta_tail": 0.05,
 }
 
 
@@ -77,16 +84,19 @@ def read_json_list(kind: str, root: str | os.PathLike | None = None) -> list[Any
 
 
 def append_json_entry(kind: str, entry: dict[str, Any], root: str | os.PathLike | None = None) -> dict[str, Any]:
-    entries = read_json_list(kind, root)
-    entries.append(entry)
-    path = _path(kind, root)
-    _atomic_write_json(path, entries)
+    # 写锁内读改写（并行 P0）：无锁的读-追加-重写在多进程下互相覆盖丢条目
+    with state_write_lock(resolve_state_root(root)):
+        entries = read_json_list(kind, root)
+        entries.append(entry)
+        path = _path(kind, root)
+        _atomic_write_json(path, entries)
     return {"kind": kind, "index": len(entries) - 1, "path": str(path)}
 
 
 def write_json(kind: str, entries: list[Any], root: str | os.PathLike | None = None) -> dict[str, Any]:
-    path = _path(kind, root)
-    _atomic_write_json(path, entries)
+    with state_write_lock(resolve_state_root(root)):
+        path = _path(kind, root)
+        _atomic_write_json(path, entries)
     return {"kind": kind, "count": len(entries), "path": str(path)}
 
 
@@ -106,8 +116,19 @@ def read_registry(root: str | os.PathLike | None = None) -> list[Any]:
     return read_json_list("registry", root)
 
 
-def write_registry(entries: list[Any], root: str | os.PathLike | None = None):
+def write_registry(entries: list[Any], root: str | os.PathLike | None = None) -> dict[str, Any]:
     return write_json("registry", entries, root)
+
+
+def append_registry_entry(entry: dict[str, Any], root: str | os.PathLike | None = None) -> dict[str, Any]:
+    """registry 锁内读-追加-写（并行 P5 压测补丁）：「read → append →
+    write_registry」的读在锁外有丢更新窗口（3×8 压测丢一半）。追加一律走本助手。"""
+    with state_write_lock(resolve_state_root(root)):
+        entries = read_json_list("registry", root)
+        entries.append(entry)
+        path = _path("registry", root)
+        _atomic_write_json(path, entries)
+    return {"kind": "registry", "count": len(entries), "path": str(path)}
 
 
 def read_mining_state(root: str | os.PathLike | None = None) -> dict[str, Any]:
@@ -126,26 +147,27 @@ def read_mining_state(root: str | os.PathLike | None = None) -> dict[str, Any]:
 
 def reset_mining_state(root: str | os.PathLike | None = None) -> dict[str, Any]:
     default = dict(MINING_CONFIG, round=0, global_fail_streak=0, candidate_pool=[], finalized=False)
-    path = _path("mining_state", root)
-    _atomic_write_json(path, default)
+    with state_write_lock(resolve_state_root(root)):
+        _atomic_write_json(_path("mining_state", root), default)
     return default
 
 
 def record_round(entry: dict[str, Any], root: str | os.PathLike | None = None) -> dict[str, Any]:
-    st = read_mining_state(root)
-    st["round"] = int(entry.get("round", st["round"] + 1))
-    if entry.get("accepted"):
-        st["global_fail_streak"] = 0
-        st["candidate_pool"].append({
-            "signal": entry.get("signal", ""),
-            "ic_ir_train": entry.get("ic_ir_train"),
-            "accepted_at_round": st["round"],
-            "attribution": entry.get("attribution", ""),
-        })
-    else:
-        st["global_fail_streak"] = int(st.get("global_fail_streak", 0)) + 1
-    path = _path("mining_state", root)
-    _atomic_write_json(path, st)
+    with state_write_lock(resolve_state_root(root)):
+        st = read_mining_state(root)
+        st["round"] = int(entry.get("round", st["round"] + 1))
+        if entry.get("accepted"):
+            st["global_fail_streak"] = 0
+            st["candidate_pool"].append({
+                "signal": entry.get("signal", ""),
+                "ic_ir_train": entry.get("ic_ir_train"),
+                "accepted_at_round": st["round"],
+                "attribution": entry.get("attribution", ""),
+            })
+        else:
+            st["global_fail_streak"] = int(st.get("global_fail_streak", 0)) + 1
+        path = _path("mining_state", root)
+        _atomic_write_json(path, st)
     return check_termination(st)
 
 
@@ -158,9 +180,10 @@ def arc_rounds_bump(root: str | os.PathLike | None = None,
       检测到新试验不接当前尾部链时调用——与 cluster_trials 断链重置同一事件）
     旧 mining_state 无 arc_rounds 字段 → 读作 0（部署即解锁触顶会话）。
     遗留 st["round"]（record_round 维护）仅信息性，不参与停点。"""
-    st = read_mining_state(root)
-    st["arc_rounds"] = 0 if reset else int(st.get("arc_rounds", 0)) + 1
-    _atomic_write_json(_path("mining_state", root), st)
+    with state_write_lock(resolve_state_root(root)):
+        st = read_mining_state(root)
+        st["arc_rounds"] = 0 if reset else int(st.get("arc_rounds", 0)) + 1
+        _atomic_write_json(_path("mining_state", root), st)
     return int(st["arc_rounds"])
 
 

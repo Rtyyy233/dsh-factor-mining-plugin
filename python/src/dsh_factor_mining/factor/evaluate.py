@@ -20,6 +20,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .gates import (
+    blp_sigma as _blp_sigma,
+    dsr_p_from_stats as _dsr_p_from_stats,
+    dsr_sr0 as _dsr_sr0,
+    norm_ppf as _norm_ppf,
+)
 from .registry import cs_rank_corr
 
 H = 20            # 历史默认 horizon（现从 env.calibration.horizon 读取；此处仅作文档）
@@ -359,73 +365,6 @@ def _top_n_excess(F, fwd, pit, env, top_n=None, cost=None, t0=0, t1=None):
         net = gross - turn * 2 * cost
         rows.append((env.dates[ti], gross, net, turn))
     return pd.DataFrame(rows, columns=['date', 'gross', 'net', 'turn'])
-
-
-def _norm_ppf(q: float) -> float:
-    """标准正态分位数（stdlib 实现，无 scipy 依赖）。"""
-    from statistics import NormalDist
-    return NormalDist().inv_cdf(q)
-
-
-def _blp_sigma(n: float) -> float:
-    """B-LP 单侧期望最大值（σ 单位）：(1-γ)Z(1-1/N)+γZ(1-1/(N·e))。
-
-    v2（2026-08-20）门公式。v3（2026-08-21）起门改 E[max|X|] 直算
-    （_LuckSampler）——此函数仅用于旧 trail 条目 n_eff_at_write 章的
-    σ 换算（包络跨版本单调）。保留 v2 数值口径：N≤1 → 0。"""
-    if n <= 1:
-        return 0.0
-    gamma = 0.5772156649015329  # Euler-Mascheroni
-    z1 = _norm_ppf(1.0 - 1.0 / n)
-    z2 = _norm_ppf(1.0 - 1.0 / (n * math.e))
-    return (1.0 - gamma) * z1 + gamma * z2
-
-
-def _dsr_sr0(bar_sigma: float | None, pool_std: float | None) -> tuple[float | None, str]:
-    """选择运气 bar（v3 2026-08-21）：sr0 = E[max|X|]·pool_std。
-
-    bar_sigma = 选择统计量（agent 按 |IC| 挑最优，含符号事后翻转——trail
-    实证：volume_decay_30 以 IC_IR=-0.62 入册）在全局零假设下的期望水平，
-    σ 单位，由 _LuckSampler 从试验相关矩阵 R 直算。双侧：max|X|。
-
-    v2 链条（谱 (Σλ)²/Σλ² → B-LP(N_eff) 单侧）退役，三处失真（74 条真实
-    trail 对照实验）：按长度分组只实测 10.2% 对（F1）；有效自由度统计量
-    ≠ 期望最大值预测器，弥散相关下低估 3.4 倍（F2）；单侧 bar 配 |IC|
-    统计量漏计符号选择（F3）。
-
-    bar_sigma=None/0（直调单检验口径）→ 无折减；任何折减（bar_sigma>0）
-    都需 pool_std，缺 → (None, 拒绝原因)——不给不可信数字。"""
-    if not bar_sigma or bar_sigma <= 0:
-        return 0.0, "单检验口径（无选择折减）"
-    if pool_std is not None and pool_std > 0:
-        sr0 = bar_sigma * pool_std
-        return sr0, (f"pool_std={pool_std:.4f}（E[max|X|]={bar_sigma:.3f}σ "
-                     "选运 bar 的池分布缩放）")
-    return None, ("选择折减需 pool_std（池内 IC_IR 分布尺度）——deflated p 不可信，"
-                  "拒绝给出。需 trail_engine 实测 IC_IR 分布或 null 地形校准。")
-
-
-def _dsr_p_from_stats(sr, g3, g4, n, bar_sigma: float | None,
-                      pool_std: float | None) -> float | None:
-    """充分统计量 → DSR p（A3：registry_submit 提交时重算；v3 bar_sigma 口径）。
-
-    单因子 deflated p 完全由 (sr_hat, skew, kurt, n_obs) 与 (bar_sigma,
-    pool_std) 决定——这四项充分统计量都在 deflated_train 里带着，submit
-    重算无需 IC 序列/env/重评估（纯算术，去耦合设计不破）。样本不足或
-    缺 pool_std（有折减时）→ None。"""
-    try:
-        sr, g3, g4, n = float(sr), float(g3), float(g4), int(n)
-    except (TypeError, ValueError):
-        return None
-    if n < 5:
-        return None
-    denom = 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr * sr
-    denom = max(denom, 1e-8)
-    sr0, _ = _dsr_sr0(bar_sigma, pool_std)
-    if sr0 is None:
-        return None
-    t_stat = (abs(sr) - sr0) * (n - 1) ** 0.5 / denom ** 0.5
-    return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
 
 
 def _tail_aligned_corr(sa: list | None, sb: list | None,
@@ -949,6 +888,70 @@ def evaluate_selection(F, env, verbose=False):
     return result
 
 
+def _read_test_lock(lock_path):
+    try:
+        with open(lock_path, encoding='utf-8') as f:
+            lock = json.load(f)
+        return lock if isinstance(lock, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_test_lock(lock_path, payload):
+    """原子写锁文件（tmp + os.replace——裸 open('w') 崩溃留半截 JSON）。"""
+    tmp = lock_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(lock_path))
+
+
+def claim_test_lock(state_root=None, source_hash=None, fingerprint=None):
+    """test 消费预约（claim-then-compute，并行 P0）。
+
+    原实现「检查→算完 test→写锁」有完整 TOCTOU 窗口：两个进程可同时
+    通过检查各消费一次。现在：写锁内查 consumed / 他进程 live claim →
+    原子写 claim → 计算 → finalize。计算崩溃留下的 claim 不算消费
+    （test 没算出结果就没被烧掉），PID 存活检测回收 stale claim。"""
+    from ..filelock import pid_alive, state_write_lock
+
+    lock_path = _test_lock_path(state_root)
+    with state_write_lock(lock_path.parent):
+        existing = _read_test_lock(lock_path)
+        if existing.get("consumed", False):
+            raise RuntimeError("test 已被消费（test_lock.json）。test 是最终消耗品，禁止反复评估调参。")
+        claim = existing.get("claim") or {}
+        cpid = claim.get("pid")
+        if cpid and int(cpid) != os.getpid() and pid_alive(int(cpid)):
+            raise RuntimeError(
+                f"test 正在被另一进程评估（PID={cpid}，始于 {claim.get('ts', '?')}）——"
+                "等它完成后再试；确认其已崩溃可手动删除 test_lock.json 后重试。")
+        _write_test_lock(lock_path, {
+            "consumed": False,
+            "claim": {"pid": os.getpid(),
+                      "ts": pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                      "source_hash": source_hash, "fingerprint": fingerprint},
+            "note": "test 消费进行中（claim-then-compute）——崩溃残留的 claim "
+                    "不算消费，按 PID 存活检测回收",
+        })
+
+
+def release_test_lock(state_root=None):
+    """释放 claim（数据性失败路径：test 区无有效截面不是消费）。"""
+    from ..filelock import state_write_lock
+
+    lock_path = _test_lock_path(state_root)
+    with state_write_lock(lock_path.parent):
+        _write_test_lock(lock_path, {"consumed": False})
+
+
+def finalize_test_lock(lock_payload: dict, state_root=None):
+    """test 消费落锤（计算成功后调用；payload 带 diagnosis 上下文）。"""
+    from ..filelock import state_write_lock
+
+    lock_path = _test_lock_path(state_root)
+    with state_write_lock(lock_path.parent):
+        _write_test_lock(lock_path, lock_payload)
+
+
 def evaluate_test(F, env, verbose=False, state_root=None, source_hash=None,
                   fingerprint=None):
     F = np.asarray(F, dtype=np.float64)
@@ -956,21 +959,14 @@ def evaluate_test(F, env, verbose=False, state_root=None, source_hash=None,
         raise ValueError(f"factor 输出形状 {F.shape} != (T,N) {(env.T, env.N)}")
     if env.calibration.sel_end is None:
         raise ValueError("三区分界未设置：直调 API 需显式构造 Calibration(dev_end=..., sel_end=...)")
-    lock_path = _test_lock_path(state_root)
-    if lock_path.exists():
-        try:
-            with open(lock_path, encoding='utf-8') as f:
-                lock = json.load(f)
-        except Exception:
-            lock = {}
-        if lock.get("consumed", False):
-            raise RuntimeError("test 已被消费（test_lock.json）。test 是最终消耗品，禁止反复评估调参。")
+    claim_test_lock(state_root, source_hash, fingerprint)
     fwd = _forward_returns(env)
     pit = _pit_mask(env)
     ic_sig = _cross_sectional_ic(F, fwd, pit, env, sig_only=True)
     sel_end = env.calibration.sel_end
     test_sig = ic_sig[ic_sig.index >= pd.Timestamp(sel_end)]
     if len(test_sig) == 0:
+        release_test_lock(state_root)
         return dict(error="test 区无有效截面")
     result = _region_diagnostic(F, fwd, pit, env, test_sig, "test", sel_end, None)
     # 消费上下文（批次1a）：谁、什么口径、什么结果消费了这一次性的 test
@@ -990,8 +986,7 @@ def evaluate_test(F, env, verbose=False, state_root=None, source_hash=None,
                         "sel_end": env.calibration.sel_end,
                         "horizon": env.calibration.horizon},
     }
-    with open(lock_path, 'w', encoding='utf-8') as f:
-        json.dump(lock_payload, f, ensure_ascii=False, indent=2)
+    finalize_test_lock(lock_payload, state_root)
     if verbose:
         _print_region_result(result)
     return result
@@ -1070,18 +1065,30 @@ def _sample_signal_days(F_dict, env):
     return out
 
 
-def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
+def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None,
+                   factors=None):
+    """批量评估 + 批内族口径（E[max|X|]）。
+
+    factors（P3 并行批次）：可注入预计算的成员诊断（worker 进程池路径
+    逐成员并行算 evaluate 后传入；None = 本进程顺序算）。成员级失败用
+    {"error": ...} 标记（部分失败隔离——坏成员不烧整批），error 成员
+    不进家族统计；家族口径（ρ̄/bar_sigma_b/deflated）只在有效成员上算。"""
     train_end = train_end or env.calibration.dev_end
     names = list(F_dict.keys())
-    M = len(names)
+    factors = dict(factors) if isinstance(factors, dict) else {}
+    missing = [n for n in names if not isinstance(factors.get(n), dict)]
+    for n in missing:
+        factors[n] = evaluate(F_dict[n], env, train_end=train_end, horizon=horizon)
+    ok = [n for n in names if not factors[n].get("error")]
+    M = len(ok)
     if M == 0:
-        return {"factors": {}, "batch": {"M": 0}}
+        return {"factors": factors,
+                "batch": {"M": 0, "M_requested": len(names),
+                          "note": "全部成员失败（逐成员 error 见 factors[*].error）"}}
 
     # v2 申报制：整批同一声明 horizon（不同 horizon 的成本/口径不同，混批无意义）
-    factors = {n: evaluate(F_dict[n], env, train_end=train_end, horizon=horizon)
-               for n in names}
     p_single = {}
-    for n in names:
+    for n in ok:
         cp = factors[n].get("column_perm_train") or {}
         p_single[n] = cp.get("p", np.nan)
 
@@ -1090,7 +1097,7 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
         corrs = []
         for i in range(M):
             for j in range(i + 1, M):
-                c = cs_rank_corr(Fs[names[i]], Fs[names[j]])
+                c = cs_rank_corr(Fs[ok[i]], Fs[ok[j]])
                 if np.isfinite(c):
                     corrs.append(abs(c))
         rho_bar = float(np.mean(corrs)) if corrs else 0.0
@@ -1102,7 +1109,7 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
     # N_eff=1+(M-1)(1-ρ̄) 幂校正。同族变体（|ρ|≈0.9 的参数扫描）的
     # 族内选择运气由 max|X| 直接计价，不再经"有效个数"中转。
     sketches = {}
-    for n in names:
+    for n in ok:
         s = factors[n].get("ic_series_train")
         if isinstance(s, (list, tuple)) and len(s) >= 5:
             sketches[n] = s
@@ -1118,7 +1125,7 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
         m_eff = float(M)
 
     deflated = {}
-    for n in names:
+    for n in ok:
         p = p_single[n]
         dp_stats = factors[n].get("deflated_train") or {}
         dp = None
@@ -1136,7 +1143,7 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
 
     best_name = None
     best_ic_ir = -np.inf
-    for n in names:
+    for n in ok:
         ir = factors[n].get("ic_ir_train", np.nan)
         if np.isfinite(ir) and ir > best_ic_ir:
             best_ic_ir = ir
@@ -1146,6 +1153,7 @@ def evaluate_batch(F_dict, env, train_end=None, horizon=None, pool_std=None):
         "factors": factors,
         "batch": {
             "M": M,
+            "M_requested": len(names),
             "rho_bar": rho_bar,
             "N_eff": m_eff,
             "bar_sigma": bar_sigma_b,

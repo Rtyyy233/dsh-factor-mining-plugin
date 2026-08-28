@@ -21,7 +21,7 @@ dependencies = [
 dsh-factor-mining-bridge = "dsh_factor_mining.bridge:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dsh_factor_mining"]
+packages = ["src/dsh_factor_mining", "src/dsh_strategy_lab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
