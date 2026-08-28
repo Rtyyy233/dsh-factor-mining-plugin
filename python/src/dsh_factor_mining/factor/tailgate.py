@@ -55,7 +55,11 @@ def tail_ledger(trail_engine: list) -> list[dict]:
 
     stage 过滤（WS3 2026-08-25）：只收 development/batch/composite——
     test 区尾块（region="test"）绝不进 deflation 计价（test 是一次性
-    消耗品，把它的数字当试验基数 = 泄漏进准入门）。"""
+    消耗品，把它的数字当试验基数 = 泄漏进准入门）。
+
+    cost_model_version 进键（2026-08-28 换手率定价 T5）：成本口径变 →
+    net 系数字不可比 = 新键重计。旧条目缺此字段按 "legacy"——部署后
+    首次重评平行立新键、N_eff 一次性抬升，属保守方向（计价只多不少）。"""
     seen: dict[tuple, dict] = {}
     for e in trail_engine:
         if not isinstance(e, dict):
@@ -65,13 +69,18 @@ def tail_ledger(trail_engine: list) -> list[dict]:
         tail = e.get("tail")
         if not isinstance(tail, dict) or tail.get("error"):
             continue
-        key = (e.get("source_hash"), e.get("horizon"), tail.get("k_frac"))
+        key = (e.get("source_hash"), e.get("horizon"), tail.get("k_frac"),
+               tail.get("cost_model_version") or "legacy")
         seen[key] = {
             "ts": e.get("ts"),
             "source_hash": e.get("source_hash"),
             "horizon": e.get("horizon"),
             "k_frac": tail.get("k_frac"),
+            "cost_model_version": tail.get("cost_model_version"),
             "spread_ir": tail.get("spread_ir"),
+            "net_spread_ir": tail.get("net_spread_ir"),
+            "turn_tail": tail.get("turn_tail"),
+            "break_even_cost": tail.get("break_even_cost"),
             "ic_ir": e.get("ic_ir"),
             "tail_ic": tail.get("tail_ic"),
             "spread_ic_corr": tail.get("spread_ic_corr"),
@@ -243,7 +252,8 @@ def tail_admission(tail_block: dict, ledger: list[dict],
                    spread_noise_z: float | None,
                    s0_emp: float | None = None,
                    placebo_z_gate: float | None = None,
-                   placebo_m: int | None = None) -> dict:
+                   placebo_m: int | None = None,
+                   net_basis: bool = False) -> dict:
     """尾部轨准入判定（纯函数；IC 轨照旧走 _passes_acceptance）。
 
     s0_emp（WS1）：landscape spread 段的经验 s0，bridge 负责读取与指纹
@@ -252,17 +262,32 @@ def tail_admission(tail_block: dict, ledger: list[dict],
     m≥60）；None → 兜底 tail_block 的 evaluate 轻量值并标
     placebo_degraded（σ 相对误差 ~24% 的弱证据——轻 null 不可作硬判据，
     门的重判定必须在 submit 用足样本）。
+    net_basis（2026-08-28 换手率定价 WS-T2）：True 且尾块带 net 字段 →
+    G3 判 net_spread_ir / net_spread_moments（成本后口径——G1 本就 net、
+    G2 的 z 由 bridge 在 net 基下重算，三门口径一致）；缺 net 字段
+    （旧条目/截面不足）→ 回毛口径并标 basis="legacy"——降级不拒判
+    （与 s0 降级同纪律：G1 前置门在场，net 是校准增强不是存在性前提）。
 
     返回 (accepted, reason, 诊断)；诊断含 N_eff/bar（带 s0_source）/
-    placebo（gate 值 + 实际 draws + degraded 标注）——PASS-FAIL 教训：
-    多维报告不坍缩。"""
+    placebo（gate 值 + 实际 draws + degraded 标注）/ basis 与成本口径
+    ——PASS-FAIL 教训：多维报告不坍缩。"""
     if not isinstance(tail_block, dict) or tail_block.get("error"):
         return {"accepted": False,
                 "reason": "tail 块缺失或计算失败——尾部轨准入需要 evaluate 自动尾部诊断"}
-    spread_ir = tail_block.get("spread_ir")
+    _net_ok = (bool(net_basis)
+               and isinstance(tail_block.get("net_spread_ir"), (int, float)))
+    if _net_ok:
+        spread_ir = tail_block["net_spread_ir"]
+        _moments = tail_block.get("net_spread_moments")
+        _basis = "net"
+    else:
+        spread_ir = tail_block.get("spread_ir")
+        _moments = tail_block.get("spread_moments")
+        _basis = "legacy" if net_basis else "gross"
     if not isinstance(spread_ir, (int, float)):
         return {"accepted": False,
                 "reason": "spread_ir 不可计算（截面样本不足）——尾部轨无从判定"}
+    _metric = "net_spread_ir" if _net_ok else "spread_ir"
     topn = tail_block.get("topn") or {}
     placebo_light = topn.get("placebo_z")
     gate_ok = (isinstance(placebo_z_gate, (int, float))
@@ -274,15 +299,21 @@ def tail_admission(tail_block: dict, ledger: list[dict],
     n_days = topn.get("periods")
     n_eff, n_total = tail_n_eff(ledger)
     # G3 deflation（跨轨 Šidák α_track；WS4：spread_moments 在场走
-    # t 分母偏度/峰度修正，缺矩 legacy = 现行公式）
+    # t 分母偏度/峰度修正，缺矩 legacy = 现行公式；net 基下矩用
+    # net_spread_moments——被净掉的序列形状不同，矩必须同口径）
     bar = tail_deflation_bar(max(n_eff, 1), int(n_days or 0), s0_emp=s0_emp,
                              spread_ir=spread_ir,
-                             moments=tail_block.get("spread_moments"))
+                             moments=_moments)
     diag = {"n_eff": n_eff, "n_trials_tail": n_total, "bar": bar,
             "placebo_z": placebo_z, "placebo_draws": m_used,
             "placebo_m": placebo_m if gate_ok else None,
             "placebo_degraded": placebo_degraded,
-            "spread_noise_z": spread_noise_z}
+            "spread_noise_z": spread_noise_z,
+            "basis": _basis,
+            "turn_tail": tail_block.get("turn_tail"),
+            "break_even_cost": tail_block.get("break_even_cost"),
+            "cost_used": tail_block.get("cost_used"),
+            "cost_model_version": tail_block.get("cost_model_version")}
     # G1 placebo：top-N 净超额 vs 随机选股（权威值 = submit 重算；
     # 轻量值兜底时明确标注 degraded——弱证据不冒充门判据）
     _g1_note = (f"，m={m_used}（submit 权威重跑）"
@@ -317,14 +348,14 @@ def tail_admission(tail_block: dict, ledger: list[dict],
                 "reason": f"G3 无法判定：{bar.get('reason')}", "diag": diag}
     if not bar.get("pass_g3", False):
         if bar.get("gate_kind") == "corrected":
-            reason = (f"G3 拒收：spread_ir={spread_ir:.3f}（t_adj="
+            reason = (f"G3 拒收：{_metric}={spread_ir:.3f}（t_adj="
                       f"{bar['t_adj']:.2f} < z_α={bar['z_req']:.2f}，"
                       f"denom={bar['denom']:.3f}，g3={bar['g3']:+.2f}/"
                       f"g4={bar['g4']:.2f} 修正，sr0={bar['bar']:.3f}，"
                       f"N_eff={n_eff}，跨轨 Šidák α_track=0.0253）——"
                       "尾部线多重检验未过")
         else:
-            reason = (f"G3 拒收：spread_ir={spread_ir:.3f} < 门 "
+            reason = (f"G3 拒收：{_metric}={spread_ir:.3f} < 门 "
                       f"{bar['required_spread_ir']:.3f}"
                       f"（E[max|X|]={bar['emax_sigma']:.2f}σ×s0，"
                       f"N_eff={n_eff}，跨轨 Šidák α_track=0.0253）——"
@@ -335,8 +366,8 @@ def tail_admission(tail_block: dict, ledger: list[dict],
                if bar.get("gate_kind") == "corrected"
                else f"门 {bar['required_spread_ir']:.3f}")
     return {"accepted": True,
-            "reason": (f"尾部轨通过：placebo z={placebo_z:.1f}"
+            "reason": (f"尾部轨通过（{_basis} 基）：placebo z={placebo_z:.1f}"
                        f"（{('m=' + str(m_used) + ' 权威重跑') if gate_ok else 'degraded 轻量值'}），"
-                       f"spread_ir={spread_ir:.3f} 过 G3：{_g3_num}，"
+                       f"{_metric}={spread_ir:.3f} 过 G3：{_g3_num}，"
                        f"N_eff={n_eff}，s0={bar.get('s0_source')}）"),
             "diag": diag}

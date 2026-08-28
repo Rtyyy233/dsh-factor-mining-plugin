@@ -37,13 +37,19 @@ def factor(env):
 """
 
 # 慢因子：per-symbol Python 循环的替身（sleep 等比压缩了生产 >300s 的场景）
+# 2026-08-28 修正：固定 25M 迭代在慢机上翻倍（标定机 0.4s → 本机 0.81s，
+# 把 est 推出断言窗并翻转 warn/blocked 分支）——改按 process_time 定向
+# 燃烧 0.45s，perf 断言与机器速度解耦（全部断言过需 cpu ∈ (0.35, 0.6]）
 SLOW_SOURCE = """
 import pandas as pd
+import time as _t
 
 def factor(env):
+    _end = _t.process_time() + 0.45
     _x = 0
-    for _ in range(25_000_000):  # ~0.4s CPU（P4 起 perf 用 CPU 口径，sleep 不烧 CPU）
-        _x += 1
+    while _t.process_time() < _end:
+        for _ in range(1_000_000):
+            _x += 1
     c = pd.DataFrame(env.c)
     return (c / c.shift(20) - 1.0).values
 """

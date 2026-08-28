@@ -105,9 +105,11 @@ def fold_envs(env: FactorEnv, fold: dict) -> tuple[FactorEnv | None, FactorEnv]:
     审计机械保证，不由 apply_env 端点保证——apply 拿折末端点是为了
     在整折上一次性产出权重路径）。
 
-    calibration 的三区分界在截断 env 上语义会漂（dev_end 可能落在
-    截断窗外）——策略层不消费因子层三区（有自己的 wf/registry 语义），
-    分界字段原样携带不重算。"""
+    区域纪律（2026-08-28 修正）：策略层**消费** sel_end 作自己的 dev 区
+    边界（worker._dev_env 在分发层把 dev 侧 env 物理截断到 sel_end；
+    显式 t1_date 越界被拒——因子层 2026-08-18 同型修复的移植）。截断
+    env 上 dev_end 的语义会漂（可能落在窗外）——dev_end 不参与策略层
+    任何判定，字段原样携带不重算。"""
     fit_env = None
     if fold["fit_end_idx"] >= 1:
         fit_env = truncate_env(env, fold["fit_end_idx"] - 1)

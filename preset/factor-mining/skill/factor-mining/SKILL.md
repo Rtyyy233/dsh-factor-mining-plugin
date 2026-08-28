@@ -119,4 +119,5 @@ user-invocable: true
 ## 诚实记录
 
 - trail 记录完整轨迹；explored 只证伪“具体探索”，不证伪“方向”；search_paths 记录试过未结论的变体。
+- 源码外挂库（2026-08-29 起）：每次评估/证伪的因子源码由引擎自动按 `sources/<hash前2位>/<hash>.py` 入库（trail 条目的 source_hash 即键）——查历史任何一次试验的完整源码按哈希取文件即可；`state.reset(mining)` 会连库一并备份清除。
 - 所有产出写在用户 stateRoot，插件仓库不包含任何用户数据、因子库或挖掘结果。

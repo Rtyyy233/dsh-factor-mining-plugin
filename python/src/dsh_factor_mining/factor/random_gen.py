@@ -312,7 +312,7 @@ def light_ic_scan(F, env, spread_ref: dict | None = None):
     （spread_percentile 查表插值）。函数名与既有返回键兼容
     （ic_mean/ic_ir/n 不变，新增键可缺省）。"""
     from .evaluate import _cross_sectional_ic, _forward_returns, _pit_mask
-    from .tail import spread_ir_statistic
+    from .tail import spread_turn_stats
     import numpy as _np
 
     F = _np.asarray(F, dtype=_np.float64)
@@ -333,14 +333,19 @@ def light_ic_scan(F, env, spread_ref: dict | None = None):
         mean, std = float(ic.mean()), float(ic.std(ddof=1))
         out["ic_mean"] = mean
         out["ic_ir"] = mean / std if std > 0 else None
+    # 换手定价（2026-08-28 WS-T3）：一次遍历同出 spread_ir + 换手/c*/
+    # net——explore 的成本平局裁决列表（top_net 按 c* 排序）用 c*
     try:
-        sp = spread_ir_statistic(F, fwd, pit, env.calibration.sample_step,
-                                 t_end=_train_end_of(env))
+        sts = spread_turn_stats(F, fwd, pit, env.calibration.sample_step,
+                                t_end=_train_end_of(env),
+                                cost=float(env.calibration.cost or 0.0))
     except Exception:
-        sp = None
-    out["spread_ir"] = (float(sp)
-                        if isinstance(sp, (int, float)) else None)
+        sts = {}
+    out["spread_ir"] = sts.get("spread_ir")
     out["spread_pct"] = spread_percentile(out["spread_ir"], spread_ref)
+    for _k in ("turn_tail", "break_even_cost", "net_spread_ir"):
+        if sts.get(_k) is not None:
+            out[_k] = sts.get(_k)
     return out
 
 
@@ -393,7 +398,8 @@ def _train_end_of(v) -> int:
 
 
 def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress=None,
-                         env_fingerprint=None, horizons=None):
+                         env_fingerprint=None, horizons=None,
+                         cost_model_version=None, spread_cost=None):
     """null 地形：n 个随机因子的 IC_IR 经验分布，持久化。
 
     返回 dict：分位数 + 元信息。后续因子诊断可引用
@@ -417,6 +423,11 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
     K = round(0.2·n_day)）→ per-horizon spread_ir 经验分布。尾部线 G3 的
     s0 从解析式 1/√n_days 升级为该分布的 std（bridge._landscape_tail_s0）。
     不另跑一批树——同批树保证 spread null 与 IC null 同条件。
+
+    cost_model_version / spread_cost（2026-08-28 换手率定价）：版本戳进
+    landscape（net 段与毛段的地形互不可比，文件级区分）；spread_cost
+    给定时 spread 段按 2·cost·turn 净掉（随机树同样付成本——null 左移，
+    WS1 net 重校的开关；v1 默认 None = 毛口径照旧）。
     """
     from .evaluate import (_cross_sectional_ic, _env_horizon_view,
                            _forward_returns, _pit_mask)
@@ -456,10 +467,12 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
                     if np.isfinite(ir):
                         irs_by_h[h].append(ir)
                         series_by_h[h].append(ic.values)
-                # spread null：与 IC 段同批树、同视图、同 train 边界
+                # spread null：与 IC 段同批树、同视图、同 train 边界；
+                # spread_cost 给定时 = net 段（随机树同样付成本）
                 sp_ir = spread_ir_statistic(F, fwd, pit,
                                             v.calibration.sample_step,
-                                            t_end=_train_end_of(v))
+                                            t_end=_train_end_of(v),
+                                            cost=spread_cost)
                 if sp_ir is not None and np.isfinite(sp_ir):
                     spread_by_h[h].append(sp_ir)
             except Exception:
@@ -534,6 +547,10 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
         "ic_ir": ic_ir_out,
         "spread": spread_out,
         "cross_horizon_corr": cross_h,
+        # 换手定价（2026-08-28）：成本口径戳——net 段与毛段的地形互不
+        # 可比；_landscape_tail_s0 的指纹门只认同版本
+        "cost_model_version": cost_model_version,
+        "spread_cost": spread_cost,
         "interpretation": (
             "经验 null 分布（per-horizon）：随机因子的 IC_IR 集中在 p50 附近。"
             "新因子 IC_IR 超过对应 horizon 的 p95 才值得认真对待；p99 以上是强信号。"

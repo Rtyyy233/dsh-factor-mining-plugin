@@ -225,6 +225,12 @@ def run_request(req: dict) -> dict:
         if params.get("statistic") == "spread":
             from .factor.tail import spread_ir_statistic
             stat = spread_ir_statistic
+            # net 基（2026-08-28 换手率定价 WS-T2）：合成世界的组差同样
+            # 按 2·cost·turn 净掉——G2 与 G3 判定口径一致，一个成本模型
+            if params.get("net_cost") is not None:
+                import functools as _ft
+                stat = _ft.partial(spread_ir_statistic,
+                                   cost=float(params["net_cost"]))
         return noise_test(fn, env, m, base_seed, statistic=stat)
     if method == "factor.tail_placebo":
         # G1 权威 placebo（WS2 2026-08-25）：submit 侧重跑——样本加厚

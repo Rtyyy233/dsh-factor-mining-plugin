@@ -37,17 +37,24 @@ from .env import FactorEnv
 K_FRAC = 0.2
 
 
-def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
-                        *, t_end: int | None = None):
-    """尾部组差 IR 独立统计量（noise/day-perm 的 spread 版共用签名：
-    (F, fwd, pit, step) → float | None）。t_end=None 全区间（无区域概念——
-    噪声世界/置换面板上的区域边界无意义），与 tail_metrics 的 train 区
-    口径的差只影响绝对水平，同轨内比较不受影响；t_end 给定 → 只用
-    [0, t_end) 行（WS1：null 校准的 spread 段与 tail_metrics 同口径，
-    K = round(0.2·n)，行集 arange(0, t_end, sample_step)）。"""
+def spread_turn_stats(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
+                      *, t_end: int | None = None,
+                      cost: float | None = None) -> dict:
+    """spread_ir_statistic 全家福版（2026-08-28 换手率定价规划 WS-T1/T2）：
+    一次遍历同时产出组差 IR、钉死规则换手（相邻 top-K 集对称差 / 2K，
+    单边口径，首期 1.0——与 _top_n_excess 同式）、成本后 net 统计与
+    break-even 成本 c*。evaluate 尾块 / 噪声世界 G2 / null 校准 / 轻量
+    扫描共用此一处实现，杜绝多循环口径漂移。
+
+    cost=None → 毛口径（net_* 缺省，行为与旧版逐位一致）；给定 →
+    net 序列 = spread − 2·cost·turn（单边成本 × 双边 × 单边换手，
+    _top_n_excess 同式）。c* = mean(spread)/(2·mean(turn))（单边 bps）
+    ——每单位换手毛利，免假设可比；毛均 ≤0 或零换手 → None（不可比
+    如实缺省，不造负数误导漏斗排序）。"""
     F = np.asarray(F, dtype=np.float64)
     end = F.shape[0] if t_end is None else min(int(t_end), F.shape[0])
-    spreads = []
+    spreads, turns = [], []
+    prev: set | None = None
     for t in range(0, end, max(int(sample_step), 1)):
         m = pit[t] & np.isfinite(F[t]) & np.isfinite(fwd[t])
         n = int(m.sum())
@@ -55,11 +62,76 @@ def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
             continue
         k = max(1, int(round(k_frac * n)))
         top_idx = np.argsort(F[t][m])[-k:]
+        cols = set(np.where(m)[0][top_idx].tolist())
         spreads.append(float(fwd[t][m][top_idx].mean() - fwd[t][m].mean()))
+        turns.append(1.0 if prev is None else len(cols ^ prev) / (2.0 * k))
+        prev = cols
+    out: dict = {"n_periods": len(spreads)}
     if len(spreads) < 5:
-        return None
-    s = np.std(spreads, ddof=1)
-    return float(np.mean(spreads) / s) if s > 0 else None
+        out["spread_ir"] = None
+        return out
+    sp = np.array(spreads)
+    s = sp.std(ddof=1)
+    out["spread_ir"] = float(sp.mean() / s) if s > 0 else None
+    tn = np.array(turns)
+    out["gross_mean"] = float(sp.mean())
+    out["turn_avg"] = float(tn.mean())
+    if tn.mean() > 0 and sp.mean() > 0:
+        out["break_even_cost"] = round(
+            float(sp.mean() / (2.0 * tn.mean()) * 1e4), 1) + 0.0
+    else:
+        out["break_even_cost"] = None
+    if cost is not None:
+        net = sp - 2.0 * float(cost) * tn
+        out["net_mean"] = float(net.mean())
+        ns = net.std(ddof=1)
+        out["net_spread_ir"] = float(net.mean() / ns) if ns > 0 else None
+    return out
+
+
+def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
+                        *, t_end: int | None = None,
+                        cost: float | None = None):
+    """尾部组差 IR 独立统计量（noise/day-perm 的 spread 版共用签名：
+    (F, fwd, pit, step) → float | None）。t_end=None 全区间（无区域概念——
+    噪声世界/置换面板上的区域边界无意义），与 tail_metrics 的 train 区
+    口径的差只影响绝对水平，同轨内比较不受影响；t_end 给定 → 只用
+    [0, t_end) 行（WS1：null 校准的 spread 段与 tail_metrics 同口径，
+    K = round(0.2·n)，行集 arange(0, t_end, sample_step)）。
+    cost（WS-T2）：net 模式——G2 噪声门在 net 基下把合成世界的组差
+    同样按 2·cost·turn 净掉（与 G3 判定口径一致，一个成本模型）。"""
+    return spread_turn_stats(F, fwd, pit, sample_step, k_frac,
+                             t_end=t_end, cost=cost).get("spread_ir")
+
+
+def rank_autocorr(F, pit, rows, lag: int):
+    """截面秩自相关（t vs t+lag 的秩 Pearson，跨采样行平均）——信号
+    持续性诊断，预测任何组合规则下的换手（rank autocorrelation 超时
+    事故的正名：想法对，实现必须向量化——行内 argsort，生产面板毫秒
+    级）。lag = horizon（持仓期尺度）；有效行 <5 → None。"""
+    F = np.asarray(F, dtype=np.float64)
+    T = F.shape[0]
+    acs = []
+    for t in rows:
+        t2 = int(t) + int(lag)
+        if t2 >= T:
+            break
+        m = pit[t] & pit[t2] & np.isfinite(F[t]) & np.isfinite(F[t2])
+        n = int(m.sum())
+        if n < 8:
+            continue
+        a = F[t][m]
+        b = F[t2][m]
+        ra = np.empty(n)
+        ra[np.argsort(a, kind="stable")] = np.arange(n)
+        rb = np.empty(n)
+        rb[np.argsort(b, kind="stable")] = np.arange(n)
+        if ra.std() == 0 or rb.std() == 0:
+            continue
+        c = float(np.corrcoef(ra, rb)[0, 1])
+        if np.isfinite(c):
+            acs.append(c)
+    return float(np.mean(acs)) if len(acs) >= 5 else None
 
 
 def topn_placebo(F, fwd, pit, env, t_end, draws, seed,
@@ -142,9 +214,14 @@ def _train_end(env: FactorEnv) -> int:
 
 def _topk_block(F, fwd, pit, rows, k_frac):
     """逐采样日：top-K 组差 / top-K 内 IC / 全截面 IC（凸性对照）/
-    top-K 名单 (day, 全局资产列) 对（Phase 5 名单 Jaccard 家族的原料）。"""
+    top-K 名单 (day, 全局资产列) 对（Phase 5 名单 Jaccard 家族的原料）/
+    相邻 top-K 集换手（2026-08-28 换手率定价：对称差 / 2K，单边口径，
+    首期 1.0——无效行跳过时持有集沿用上一有效行，与 _top_n_excess 同
+    纪律）。"""
     spreads, tail_ics, ics, ks = [], [], [], []
     pairs = []
+    turns = []
+    prev_top: set | None = None
     for t in rows:
         m = pit[t] & np.isfinite(F[t]) & np.isfinite(fwd[t])
         n = int(m.sum())
@@ -158,7 +235,11 @@ def _topk_block(F, fwd, pit, rows, k_frac):
         top_r = r[top_idx]
         spreads.append(float(top_r.mean() - r.mean()))
         ks.append(k)
+        top_set = {int(cols[i]) for i in top_idx}
         pairs.extend((int(t), int(cols[i])) for i in top_idx)
+        turns.append(1.0 if prev_top is None
+                     else len(top_set ^ prev_top) / (2.0 * k))
+        prev_top = top_set
         rf = np.empty(n)
         rf[np.argsort(r, kind="stable")] = np.arange(n)
         ff = np.empty(n)
@@ -174,7 +255,7 @@ def _topk_block(F, fwd, pit, rows, k_frac):
             rt = (rt - rt.mean()) / (rt.std() + 1e-12)
             ft = (ft - ft.mean()) / (ft.std() + 1e-12)
             tail_ics.append(float(np.mean(rt * ft)))
-    return spreads, tail_ics, ics, ks, pairs
+    return spreads, tail_ics, ics, ks, pairs, turns
 
 
 def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
@@ -191,7 +272,8 @@ def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
     t_end = _train_end(env)
     rows = np.arange(0, t_end, max(int(env.calibration.sample_step), 1))
 
-    spreads, tail_ics, ics, ks, pairs = _topk_block(F, fwd, pit, rows, k_frac)
+    spreads, tail_ics, ics, ks, pairs, turns = _topk_block(
+        F, fwd, pit, rows, k_frac)
     if len(spreads) < 10:
         return None
 
@@ -219,6 +301,37 @@ def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
             "g4": round(float(np.mean((sp - mu) ** 4)) / sp_std ** 4, 6) + 0.0,
             "n": int(len(sp)),
         }
+
+    # ---- 换手率定价（2026-08-28 规划书 WS-T1/T2 v1 双报）----
+    # v1 判定基照旧毛口径（tail_net_basis=false）；net 三件套陪跑进
+    # 响应/账本/registry（紧凑投影带 c*），WS1 net 段重校后切基。
+    # 成本 = env.calibration.cost（与 _top_n_excess 同源，一个成本模型）；
+    # 版本串来自 MINING_CONFIG——变更 = 尾账本新键（结果不可比，理应重计）。
+    turn_arr = np.array(turns) if turns else np.array([np.nan])
+    turn_tail = float(turn_arr.mean()) if len(turns) else None
+    cost = float(getattr(env.calibration, "cost", 0.0) or 0.0)
+    net_spread_ir = None
+    net_spread_moments = None
+    if sp_std > 0 and len(turns) == len(sp):
+        net = sp - 2.0 * cost * turn_arr
+        ns = net.std(ddof=1)
+        if ns > 0:
+            net_spread_ir = float(net.mean() / ns)
+            nmu = float(net.mean())
+            net_spread_moments = {
+                "g3": round(float(np.mean((net - nmu) ** 3)) / ns ** 3, 6) + 0.0,
+                "g4": round(float(np.mean((net - nmu) ** 4)) / ns ** 4, 6) + 0.0,
+                "n": int(len(net)),
+            }
+    break_even_cost = None
+    if turn_tail is not None and turn_tail > 0 and float(sp.mean()) > 0:
+        break_even_cost = round(
+            float(sp.mean()) / (2.0 * turn_tail) * 1e4, 1) + 0.0
+    try:
+        from ..state import MINING_CONFIG as _MC
+        _cmv = str(_MC.get("cost_model_version", "flat:v1"))
+    except Exception:
+        _cmv = "flat:v1"
 
     # ---- top-N 净超额 + random-N placebo（复用生产 _top_n_excess）----
     # placebo 走公共 topn_placebo（WS2：evaluate 轻量版与 submit 权威版
@@ -261,4 +374,14 @@ def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
         "spread_ic_corr": _r4(spread_ic_corr),
         "selection_mh": selection_minhash(pairs),
         "topn": topn,
+        # 换手定价（WS-T1/T2）：turn/net/c* 陪跑 + 成本口径戳——
+        # 尾块自带口径元数据，账本/registry/审计不需再猜
+        "turn_tail": _r4(turn_tail),
+        "net_spread_ir": _r4(net_spread_ir),
+        "net_spread_moments": net_spread_moments,
+        "break_even_cost": break_even_cost,
+        "rank_autocorr": _r4(rank_autocorr(F, pit, rows,
+                                           int(env.calibration.horizon))),
+        "cost_used": round(cost * 1e4, 1) + 0.0,
+        "cost_model_version": _cmv,
     }

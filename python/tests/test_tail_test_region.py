@@ -109,6 +109,12 @@ def test_full_chain_dev_submit_test(tmp_path):
 
 def test_ledger_excludes_test_stage(tmp_path):
     b = _make_drift_bridge(tmp_path)
+    # 2026-08-28 加固配套：test 只测已入册候选——先入册再消费
+    from dsh_factor_mining.discipline import source_fingerprint
+    from dsh_factor_mining.state import write_registry
+    write_registry([{"name": "tilt", "source_hash": source_fingerprint(TILT_SOURCE),
+                     "accepted": True, "source": TILT_SOURCE}],
+                   root=str(tmp_path / "state"))
     b.dispatch("factor.evaluate", {"envId": "primary", "source": TILT_SOURCE,
                                    "stage": "development"})
     b.dispatch("factor.evaluate", {"envId": "primary", "source": TILT_SOURCE,

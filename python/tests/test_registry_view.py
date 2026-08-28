@@ -87,7 +87,8 @@ def test_registry_get_compact_whitelist(tmp_path):
     assert out["accepted"] == 3, out
     assert out["by_track"] == {"ic": 1, "tail": 1, "dual": 1}, out
     allowed = {"name", "ts", "accepted", "admit_basis", "tracks",
-               "ic_ir", "spread_ir", "reject_kind", "reject_reason"}
+               "ic_ir", "spread_ir", "net_spread_ir", "turn",
+               "break_even_cost", "reject_kind", "reject_reason"}
     for e in out["entries"]:
         assert set(e.keys()) <= allowed, e
     by_name = {e["name"]: e for e in out["entries"]}

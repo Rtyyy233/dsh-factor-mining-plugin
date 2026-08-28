@@ -203,6 +203,13 @@ def test_bridge_test_stage_consumes_lock():
         root = Path(d)
         # 早起点 + 长周期，让 test 区 [2024-01-01, end) 有足够信号日样本
         bridge, _ = _make_bridge(root, T=2600, start="2015-01-05")
+        # 2026-08-28 加固配套：test 只测已入册候选——先入册再消费
+        from dsh_factor_mining.discipline import source_fingerprint
+        from dsh_factor_mining.state import write_registry
+        write_registry([{"name": "baseline_mom",
+                         "source_hash": source_fingerprint(BASELINE_SOURCE),
+                         "accepted": True, "source": BASELINE_SOURCE}],
+                       root=str(root / "state"))
         r1 = bridge.dispatch("factor.evaluate",
                              {"envId": "primary", "source": BASELINE_SOURCE, "stage": "test"})
         assert r1.get("region") == "test", r1

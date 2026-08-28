@@ -841,7 +841,7 @@ def _region_diagnostic(F, fwd, pit, env, region_ic, region_name, t0_date, t1_dat
             sig = np.arange(0, env.T, step)
             rows = sig[(sig >= int(t0))
                        & (sig < (env.T if t1 is None else int(t1)))]
-            spreads, tail_ics, _ics, ks, _pairs = _topk_block(
+            spreads, tail_ics, _ics, ks, _pairs, _turns = _topk_block(
                 F, fwd, pit, rows, K_FRAC)
             tail = None
             if len(spreads) >= 10:

@@ -21,6 +21,8 @@ FILES = {
     "trail": "strategy_trail.json",
     "registry": "strategy_registry.json",
     "test_lock": "test_lock.json",
+    # 因子 select 快照（2026-08-28 用户决策：策略层要有 select 的记录）
+    "factor_select": "factor_select.json",
 }
 
 
