@@ -36,6 +36,45 @@ import numpy as np
 
 from .env import FactorEnv
 
+# ---- 噪声门结构常量（2026-08-26 规划书 W2）----
+# submit 噪声门至少重跑 NOISE_MIN_WORLDS 个世界、预算 NOISE_BUDGET_SECS
+# （给 worker 墙 300s 留头部）——单次 factor(env) 计算 × 下限 > 预算的因子
+# submit 必然事务中止。evaluate 阶段用 factor_perf 提前暴露这个天花板。
+NOISE_MIN_WORLDS = 10
+NOISE_BUDGET_SECS = 240.0
+
+
+def factor_perf(factor_runtime_s: float) -> dict:
+    """单次 factor(env) CPU 计时 → submit 噪声门可行性预警（W2；P4 起
+    CPU 口径——并行会话下墙钟被挤占失真，CPU 是实现的诚实成本）。
+
+    引擎知道 submit 的结构性上限但 agent 不知道：噪声门 ≥10 世界 ×
+    单次计算 > 预算 240s（worker 墙 300s 内跑不完）→ submit 必然
+    事务中止。此字段附在 evaluate 诊断上（经 _wrap_diagnosis 自然并入），
+    agent 第一次 evaluate 就看到天花板，不必等到 submit 烧几分钟。
+    阈值读模块常量于调用时（测试可 monkeypatch 校准）。"""
+    est = NOISE_MIN_WORLDS * float(factor_runtime_s)
+    if est > NOISE_BUDGET_SECS:
+        verdict = "blocked"
+        note = (f"submit 噪声门至少重跑 {NOISE_MIN_WORLDS} 个世界 ≈ {est:.0f}s > "
+                f"预算 {NOISE_BUDGET_SECS:.0f}s，submit 必然事务中止——先向量化"
+                "（df.groupby(\"symbol\") 的 shift/rolling、unstack 到宽表做矩阵"
+                "运算，替代 per-symbol Python 循环）")
+    elif est > NOISE_BUDGET_SECS / 2:
+        verdict = "warn"
+        note = (f"submit 噪声门估算 ≈ {est:.0f}s（已超预算 "
+                f"{NOISE_BUDGET_SECS:.0f}s 的一半）——慢实现有触顶风险，建议向量化")
+    else:
+        verdict = "ok"
+        note = "单次计算在噪声门预算内"
+    return {
+        "factor_runtime_s": round(float(factor_runtime_s), 4),
+        "basis": "cpu_s",
+        "submit_noise_gate_estimate_s": round(est, 4),
+        "verdict": verdict,
+        "note": note,
+    }
+
 
 def _pool_vol(c: np.ndarray, listed: np.ndarray) -> float:
     """全池统一日收益 std（所有已上市 (t,j) 样本的合并估计）。"""
@@ -150,7 +189,7 @@ def noise_world_ic_ir(fn, env: FactorEnv, rng: np.random.Generator,
 
 
 def noise_test(fn, env: FactorEnv, m: int, base_seed: int,
-               budget_secs: float = 240.0,
+               budget_secs: float = NOISE_BUDGET_SECS,
                statistic=None) -> dict:
     """M 个噪声世界的统计量分布 + 硬门判定（worker 内单进程循环）。
 
@@ -178,7 +217,7 @@ def noise_test(fn, env: FactorEnv, m: int, base_seed: int,
         if len(irs) >= 3:
             elapsed = _time.monotonic() - t0
             per = elapsed / len(irs)
-            if elapsed + per > budget_secs and len(irs) >= 10:
+            if elapsed + per > budget_secs and len(irs) >= NOISE_MIN_WORLDS:
                 m_used = len(irs)
                 budget_hit = True
                 break

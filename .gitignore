@@ -25,6 +25,3 @@ build/
 node_modules/
 lib/
 tsconfig.tsbuildinfo
-
-# 内部文档不入公开仓库（交接/审计/总览只留 life-os 私仓）
-docs/internal/

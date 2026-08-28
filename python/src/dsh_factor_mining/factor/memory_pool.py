@@ -157,46 +157,59 @@ class MemoryPool:
     # ---- 入池 ----
     def offer_active(self, F, sig_idx, source: str, name: str, ic_ir: float,
                      fingerprint: str | None = None) -> dict[str, Any]:
-        """强因子入 active 池（强换弱滚动，容量有界）。"""
-        key = source_fingerprint(source)
-        if any(e["key"] == key for e in self._active):
-            return {"admitted": True, "replaced": None, "note": "已在池中（更新）"}
-        if any(e["key"] == key for e in self._falsified):
-            return {"admitted": False, "note": "该因子在证伪池中，拒绝入强池"}
-        if not np.isfinite(ic_ir):
-            return {"admitted": False, "note": "IC_IR 非有限"}
-        entry = {"key": key, "name": name, "ic_ir": float(ic_ir),
-                 "fingerprint": fingerprint, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                 "signature": structure_signature(source)}
-        replaced = None
-        if len(self._active) >= self.cfg["active_capacity"]:
-            self._active.sort(key=lambda e: e.get("ic_ir", -np.inf))
-            weakest = self._active[0]
-            if weakest.get("ic_ir", -np.inf) >= ic_ir:
-                return {"admitted": False, "note": f"弱于池内最弱（{weakest.get('ic_ir')}），不入"}
-            replaced = weakest.get("name")
-            self._active = self._active[1:]
-            self._evict_fp(weakest["key"])
-        self._active.append(entry)
-        self._store_fp(key, self.sample_fingerprint(F, sig_idx))
-        self._save("active", self._active)
-        return {"admitted": True, "replaced": replaced}
+        """强因子入 active 池（强换弱滚动，容量有界）。
+
+        写锁内重读双池再判定（并行 P0）：进程内缓存在多会话/批次池化下
+        可能滞后于磁盘——锁内重读消除「判定用旧池、写入覆盖新池」的丢更新。"""
+        from ..filelock import state_write_lock
+
+        with state_write_lock(self.root):
+            self._active = self._load("active")
+            self._falsified = self._load("falsified")
+            key = source_fingerprint(source)
+            if any(e["key"] == key for e in self._active):
+                return {"admitted": True, "replaced": None, "note": "已在池中（更新）"}
+            if any(e["key"] == key for e in self._falsified):
+                return {"admitted": False, "note": "该因子在证伪池中，拒绝入强池"}
+            if not np.isfinite(ic_ir):
+                return {"admitted": False, "note": "IC_IR 非有限"}
+            entry = {"key": key, "name": name, "ic_ir": float(ic_ir),
+                     "fingerprint": fingerprint, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                     "signature": structure_signature(source)}
+            replaced = None
+            if len(self._active) >= self.cfg["active_capacity"]:
+                self._active.sort(key=lambda e: e.get("ic_ir", -np.inf))
+                weakest = self._active[0]
+                if weakest.get("ic_ir", -np.inf) >= ic_ir:
+                    return {"admitted": False, "note": f"弱于池内最弱（{weakest.get('ic_ir')}），不入"}
+                replaced = weakest.get("name")
+                self._active = self._active[1:]
+                self._evict_fp(weakest["key"])
+            self._active.append(entry)
+            self._store_fp(key, self.sample_fingerprint(F, sig_idx))
+            self._save("active", self._active)
+            return {"admitted": True, "replaced": replaced}
 
     def offer_falsified(self, source: str, name: str, F=None, sig_idx=None) -> dict[str, Any]:
         """正式证伪因子入 falsified 池（record_explored 时调用；LRU 容量滚动）。"""
-        key = source_fingerprint(source)
-        self._falsified = [e for e in self._falsified if e["key"] != key]
-        entry = {"key": key, "name": name,
-                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                 "signature": structure_signature(source)}
-        if F is not None and sig_idx is not None:
-            self._store_fp(key, self.sample_fingerprint(F, sig_idx))
-        if len(self._falsified) >= self.cfg["falsified_capacity"]:
-            evicted = self._falsified.pop(0)
-            self._evict_fp(evicted["key"])
-        self._falsified.append(entry)
-        self._save("falsified", self._falsified)
-        return {"admitted": True}
+        from ..filelock import state_write_lock
+
+        with state_write_lock(self.root):
+            self._falsified = self._load("falsified")
+            self._active = self._load("active")
+            key = source_fingerprint(source)
+            self._falsified = [e for e in self._falsified if e["key"] != key]
+            entry = {"key": key, "name": name,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                     "signature": structure_signature(source)}
+            if F is not None and sig_idx is not None:
+                self._store_fp(key, self.sample_fingerprint(F, sig_idx))
+            if len(self._falsified) >= self.cfg["falsified_capacity"]:
+                evicted = self._falsified.pop(0)
+                self._evict_fp(evicted["key"])
+            self._falsified.append(entry)
+            self._save("falsified", self._falsified)
+            return {"admitted": True}
 
     def stats(self) -> dict[str, Any]:
         return {"active": len(self._active), "falsified": len(self._falsified),

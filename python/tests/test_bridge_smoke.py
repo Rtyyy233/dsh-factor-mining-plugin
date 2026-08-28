@@ -184,9 +184,11 @@ def test_registry_submit_decoupled():
             "diagnosis": diagnosis, "source": BASELINE_SOURCE,
         })
         assert res["accepted"] is True, res
+        # 2026-08-27 紧凑投影：count/accepted/entries（无 agent 侧全量入口）
         got = bridge.dispatch("registry.get", {})
-        assert len(got["registry"]) == 1
-        assert got["registry"][0]["name"] == "candidate_a"
+        assert got["count"] == 1 and got["accepted"] == 1
+        assert got["entries"][0]["name"] == "candidate_a"
+        assert got["entries"][0]["accepted"] is True
         # 缺 diagnosis 应报错（不静默执行 factor）
         try:
             bridge.dispatch("registry.submit", {"name": "bad"})

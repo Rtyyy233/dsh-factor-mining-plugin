@@ -267,13 +267,52 @@ def render_factor_source(tree: Node, name: str) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 # 轻量 IC 扫描（阶段 1：只算 IC 序列，不跑 causality/column-perm/beta）
 # ---------------------------------------------------------------------------
-def light_ic_scan(F, env):
+def spread_percentile(spread_ir, spread_segment: dict | None):
+    """spread_ir 在 landscape spread 段的分位（0-100）。
+
+    廉价查表：对持久化的分位 knots（p10/p25/p50/p75/p90/p95）做分段
+    线性插值，不存原始样本。低于最低 knot → 该 knot 位；高于 p95 →
+    封顶 100（分位查表不冒充尾部外推）。值/knots 不足 → None。"""
+    if (not isinstance(spread_ir, (int, float)) or isinstance(spread_ir, bool)
+            or not np.isfinite(spread_ir)):
+        return None
+    if not isinstance(spread_segment, dict):
+        return None
+    knots = []
+    for pname in ("p10", "p25", "p50", "p75", "p90", "p95"):
+        v = spread_segment.get(pname)
+        if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and np.isfinite(v)):
+            knots.append((float(pname[1:]), float(v)))
+    if len(knots) < 2:
+        return None
+    x = float(spread_ir)
+    if x <= knots[0][1]:
+        return round(knots[0][0], 1)
+    if x >= knots[-1][1]:
+        return 100.0
+    for (q0, v0), (q1, v1) in zip(knots, knots[1:]):
+        if v0 <= x <= v1:
+            if v1 == v0:
+                return round(q1, 1)
+            return round(q0 + (q1 - q0) * (x - v0) / (v1 - v0), 1)
+    return None
+
+
+def light_ic_scan(F, env, spread_ref: dict | None = None):
     """轻量诊断：不重叠口径 IC 序列的 mean/ir/n（development 区）。
 
     与 evaluate 的 _cross_sectional_ic 同口径（sig_only + DEV_END 切分），
     但不含 column-perm / beta / topn / decay 等重计算。
-    """
+
+    2026-08-27 规划书 WS-C：追加尾部线 spread_ir（与 null 校准 spread
+    段同口径：spread_ir_statistic(F, fwd, pit, step, t_end=train 边界)）
+    ——尾部强、IC 平庸的树不再永远浮不上来。spread_ref（landscape
+    spread 段分位 dict；指纹门由调用方把关）在场时附 spread_pct
+    （spread_percentile 查表插值）。函数名与既有返回键兼容
+    （ic_mean/ic_ir/n 不变，新增键可缺省）。"""
     from .evaluate import _cross_sectional_ic, _forward_returns, _pit_mask
+    from .tail import spread_ir_statistic
     import numpy as _np
 
     F = _np.asarray(F, dtype=_np.float64)
@@ -281,6 +320,7 @@ def light_ic_scan(F, env):
         raise ValueError(f"factor 形状 {F.shape} != {(env.T, env.N)}")
     fwd = _forward_returns(env)
     pit = _pit_mask(env)
+    out = {"ic_mean": None, "ic_ir": None, "n": 0}
     ic = _cross_sectional_ic(F, fwd, pit, env, sig_only=True)
     dev_end = env.calibration.dev_end
     if dev_end is None:
@@ -288,10 +328,20 @@ def light_ic_scan(F, env):
         # 既不被三区卡死，也不把 selection/test 段纳入难度基线。
         dev_end = str(pd.DatetimeIndex(env.dates)[int(env.T * 0.6)].date())
     ic = ic[ic.index < pd.Timestamp(dev_end)]
-    if len(ic) < 2:
-        return {"ic_mean": None, "ic_ir": None, "n": len(ic)}
-    mean, std = float(ic.mean()), float(ic.std(ddof=1))
-    return {"ic_mean": mean, "ic_ir": mean / std if std > 0 else None, "n": len(ic)}
+    out["n"] = len(ic)
+    if len(ic) >= 2:
+        mean, std = float(ic.mean()), float(ic.std(ddof=1))
+        out["ic_mean"] = mean
+        out["ic_ir"] = mean / std if std > 0 else None
+    try:
+        sp = spread_ir_statistic(F, fwd, pit, env.calibration.sample_step,
+                                 t_end=_train_end_of(env))
+    except Exception:
+        sp = None
+    out["spread_ir"] = (float(sp)
+                        if isinstance(sp, (int, float)) else None)
+    out["spread_pct"] = spread_percentile(out["spread_ir"], spread_ref)
+    return out
 
 
 # ---------------------------------------------------------------------------

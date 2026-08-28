@@ -170,12 +170,18 @@ def test_registry_update_descriptive_only(tmp_path):
     # 改 signal 成功
     r = b.dispatch("registry.update", {"name": "f1", "signal": "新描述"})
     assert r["ok"] and "signal" in r["changed"]
-    reg = b.dispatch("registry.get", {})["registry"]
-    assert reg[-1]["signal"] == "新描述"
+    # 2026-08-27 registry.get 紧凑投影后，signal/notes 等描述字段只在盘上
+    # 全量条目里（agent 视图 = 投影；验证读 stateRoot/registry.json）
+    import json as _json
+    full = _json.loads((tmp_path / "state" / "registry.json")
+                       .read_text(encoding="utf-8"))
+    assert full[-1]["signal"] == "新描述"
     # note 追加（历史保留）
     r2 = b.dispatch("registry.update", {"name": "f1", "note": "事后复核备注"})
     assert "note(append)" in r2["changed"]
-    assert b.dispatch("registry.get", {})["registry"][-1]["notes"][-1]["note"] == "事后复核备注"
+    full2 = _json.loads((tmp_path / "state" / "registry.json")
+                        .read_text(encoding="utf-8"))
+    assert full2[-1]["notes"][-1]["note"] == "事后复核备注"
     # 禁改 source（铁律域）
     try:
         b.dispatch("registry.update", {"name": "f1", "source": GOOD})

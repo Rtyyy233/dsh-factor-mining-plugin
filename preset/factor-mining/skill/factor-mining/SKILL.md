@@ -20,7 +20,7 @@ user-invocable: true
 
 1. 提新假设前先 `factor_query_paths` 和 `factor_query_library` 查重；**恢复会话/决定下一个方向前先 `factor_trail_summary`**（引擎层 trail 自动记录了每一次评估——包括失败的，瞒不了）。
 2. 写 `factor(env)` 源码；只用过去数据（`shift(正数)`、`rolling`、`expanding`、`cumsum`），输出 `(T,N)` 对齐数组。写法契约与效率规范见 docs/FACTOR_GUIDE.md（向量化优先，引擎会扫描低效模式并警告）。**函数名必须是 `factor`**——`factor_random_generate` 返回的 source 已符合契约，**原样使用不要改名**；手写因子也命名为 factor。批量评估传 `factor_evaluate_batch` 的 `sources`（JSON 对象 `{"名字": "def factor(env): ..."}`，value 是完整源码）。
-3. `factor_check_causality` 是**引擎强制的**：前视因子直接被拒绝评估（无需自觉）。返回附执行计时（慢=疑似非向量化）与 `inefficiency_warning`。
+3. `factor_check_causality` 是**引擎强制的**：前视因子直接被拒绝评估（无需自觉）。**A 类确定性反模式同样硬拒**（2026-08-27 起）：iterrows/itertuples/applymap/apply(lambda)/循环内 np|pd 前缀 concat-concatenate-append——拒绝发生在评估之前（零计算、不计 trial），错误内嵌可直接抄的替换模板；嵌套 for 等仍只是警告。返回附 CPU 计时（慢=疑似非向量化，CPU 口径不受并行会话挤占影响）与 `inefficiency_warning`。
 4. `factor_evaluate(stage: development)`——结果顶层有 **verdict**（pass/fail/needs_review）与 **red_flags**（|IC_IR|>5、净年化>200%、test 显著优于 train 等自动标红）：**有 red_flags 必须先解释再下任何结论**；`deflated_train` 是按已试假设数折减后的 p（试得越多门槛越高）——**p>0.05 是入册硬门**（进 red_flags，选择运气不可排除，不显著不入册；N>1 而引擎报「缺池分布基线」时先跑 null-calibration）；`train_sensitivity` 是分界敏感性（只扰动 dev_end，test 绝不扰动）；`duplicate_suspect`/`method_suspect` 是引擎对记忆池的自动对表（数值重复/方法重复）——命中必须先查 factor_query_paths 或论证本质差异。
 5. 写失败归因 + 下一步假设，并 `factor_record_trail`（**schema 强制**：round/signal/attribution/next_hypothesis/new_information 五要素——new_information 是第一优先级纪律：这一轮引入了什么新信息源）；证伪具体探索用 `factor_record_explored`（**证伪三条件强制**：exploration 精确定义/evidence 引用具体数字/root_cause 根因；带 source 的证伪自动入证伪记忆池防挖坟），试过的变体用 `factor_record_search_path`。
 6. 入册 `factor_registry_submit` 时**带上完整 evaluate 诊断**（引擎校验 receipt：编造数字会被标 verified=false；同一因子换名重复登记、**同一名字重复提交**都被铁律拒绝；red_flags 未清自动拒绝）。描述写错了用 `factor_registry_update` 修正（只许改 signal/note——**不要换名重登、也不要重复 submit，两者都会被拒**）。分享结果用 `factor_export_report`（markdown 结果卡片，含指纹/verdict/null 地形对比）。
@@ -76,6 +76,14 @@ user-invocable: true
 - **test 消费是声明制**：finalize 消费 test 区前，在响应中明确声明「即将消费 test 区（一次性锁死），分界 X~Y」然后执行——test_lock 引擎护栏兜底，无需请示。
 - 里程碑（候选入册/终止）简要汇报，不问。
 - 可以问的例外：**数据路径**（无 config 且工作区找不到可信数据文件——猜数据 = 删库级风险）；以及用户主动问你在做什么时如实回答，但不借机反问决策。
+
+## 并行与多会话纪律（2026-08-27 起，机制已落地）
+
+多会话/多进程并行已受支持（stateRoot 写锁 + test 区原子消费 + CPU 归因超时），纪律三条：
+
+1. **研究家族 = env identity**（数据文件内容哈希 + 口径哈希）：同一 identity 拆多个 stateRoot 稀释 N_eff = 假门，等同 `state.reset` 洗 trail。不同数据面板/不同口径才允许分开 root。
+2. **共享账本诚实记账**：同 root 并行会话的试验全部进同一账本，deflation 门槛自动升高——这是设计内行为（多重检验记账本就是为大量试验设计的），不是惩罚，不要试图绕开。
+3. **并行会话分核**：各会话设 `DSH_FACTOR_JOBS`（默认 cpu−1），多会话加总 ≤ 核数。worker 超时报「机器超订 / CPU 饿死」= infra_failure——直接重试同一因子（未计账），反复出现就降并行；报「CPU 密集 / 修实现不换假设」才是实现慢。`evaluate_batch` 已进程池化（jobs 并行、部分失败隔离：坏成员标 error 不烧整批）。
 
 ## 冷启动（首次使用，按 status 自引导走）
 

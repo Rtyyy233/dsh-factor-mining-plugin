@@ -104,9 +104,10 @@ def test_same_name_resubmit_rejected(tmp_path):
         raise AssertionError("同名不同源码应被拒")
     except BridgeError as e:
         assert "名字" in str(e) or "换" in str(e)
-    # registry 只有一条
-    reg = b.dispatch("registry.get", {})["registry"]
-    assert len([e for e in reg if e["name"] == "f1"]) == 1
+    # registry 只有一条（2026-08-27 紧凑投影：count + entries）
+    got = b.dispatch("registry.get", {})
+    assert got["count"] == 1
+    assert len([e for e in got["entries"] if e["name"] == "f1"]) == 1
     # 正确通道：update 改描述
     upd = b.dispatch("registry.update", {"name": "f1", "signal": "fixed desc"})
     assert upd["ok"]

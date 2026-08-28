@@ -70,7 +70,17 @@ Rules of thumb: `shift(+k)` / `rolling` / `expanding` / `cum*` = safe; `shift(-k
 
 ## 4. Efficiency: vectorize | 效率：向量化（必读）
 
-LLM-written factors that loop are 100–1000× slower on large panels and will hit the worker timeout. The engine scans your source for known anti-patterns (`iterrows`, `apply(lambda)`, nested `for`, `pd.concat` inside loops) and warns before you waste a run.
+LLM-written factors that loop are 100–1000× slower on large panels and will hit the worker timeout. The engine AST-scans your source before evaluation; **Class-A anti-patterns are hard-rejected** (evaluation refused, not counted as a trial, zero compute spent — each rejection message carries a copy-paste replacement template), Class-B patterns warn.
+
+**Class-A (hard reject, 2026-08-27 决策 D3a)**: `iterrows` / `itertuples` / `applymap` / `apply(lambda)` / `np|pd.concat|concatenate|append` inside a loop body. These have no legitimate use in `factor(env)` given the ops library. Class-B (warn): nested `for`, `apply(named_fn)`.
+
+**Measured on a reference 2000×500 panel** (this repo's dev machine, 2026-08-27; your machine scales, the ratios don't shrink):
+
+| 写法 | 实测 CPU | 向量化等价 | 倍率 |
+|---|---|---|---|
+| `iterrows` 逐行回调 | 0.11s | 截面减均值 <0.001s | ~10⁵× |
+| 循环内 `np.concatenate` | 2.50s | `rolling(20).mean()` 0.031s | 80×（且 O(n²)，面板越大恶化越猛） |
+| 嵌套 `for` 逐元素（B 类警告） | 6.97s | 同上矩阵运算 | >200× |
 
 **✗ Slow (loop) → ✓ Fast (vectorized)**:
 
@@ -94,9 +104,23 @@ for t in range(env.T):
 ranks = c.rank(axis=1, pct=True).values
 ```
 
+```python
+# ✗ 循环内重建数组（A 类硬拒，O(n²)）
+for t in range(env.T):
+    out = np.concatenate([out, part])
+
+# ✓ list.append 收集 + 循环外一次性拼接
+parts = []
+for w in (3, 5, 10):            # 小常数窗口集循环本身合法
+    parts.append(c.rolling(w).mean().values)
+out = np.mean(parts, axis=0)
+```
+
 - Prefer column-level ops, `rolling`, `groupby`, `rank(axis=1)` — never per-row/per-cell Python callbacks
 - Accumulate rows in a list and `pd.concat` **once** at the end; never concat inside a loop (rebuilds the whole panel each iteration)
 - If two sub-factors share an expensive intermediate, compute it once
+
+**Runtime cost accounting** (2026-08-27 P4): `factor_evaluate` measures your factor in **CPU seconds** (wall-clock is distorted when sessions run in parallel); the diagnosis `perf` field warns early if the submit noise gate (≥10 worlds × single run) would blow its budget. Registry entries record `cpu_rel` (CPU seconds ÷ this machine's calibrated reference workload) — a slow factor keeps paying that tax at every fingerprint sample, walk-forward fold, and noise gate re-run, so vectorize before submit, not after.
 
 **Reuse the operator library** — `dsh_factor_mining.factor.ops` ships 37 vectorized operators (ts_rank / ts_zscore / ts_corr / cs_rank / sigmoid / ...) usable inside your factor source:
 

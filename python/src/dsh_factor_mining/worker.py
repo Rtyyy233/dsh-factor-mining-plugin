@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,7 @@ from .factor.evaluate import (
     evaluate_test,
     evaluate_walk_forward,
 )
+from .factor.noise import factor_perf
 
 
 def write_env_npz(path, env: FactorEnv) -> None:
@@ -77,6 +79,54 @@ def _compile(source: str):
     return ns["factor"]
 
 
+# ---- P3 并行批次：子进程池（initializer 每子进程加载一次 env npz）----
+
+_BATCH_CHILD_ENV: dict = {}
+
+
+def _batch_child_init(npz_path: str) -> None:
+    _BATCH_CHILD_ENV["env"] = load_env_npz(npz_path)
+
+
+def _batch_child_eval(name: str, src: str, train_end, horizon, pool_std):
+    """子进程任务：算 F + 单成员诊断（与顺序路径同参同口径）。"""
+    env = _BATCH_CHILD_ENV["env"]
+    fn = _compile(src)
+    F = fn(env)
+    diag = evaluate(F, env, train_end=train_end, horizon=horizon)
+    return name, diag, F
+
+
+def _batch_parallel(sources: dict, npz_path: str, env, horizon, pool_std) -> dict:
+    """进程池并行批次（层 1）：env npz 一份共享（子进程各自加载只读），
+    逐成员提交任务，部分失败只标记该成员（{"error": ...}，bridge 侧
+    本就跳过 error 成员记账）。家族统计回到本进程 evaluate_batch。"""
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .procinfo import resolve_jobs
+
+    train_end = env.calibration.dev_end
+    tasks = list(sources.items())
+    jobs = min(resolve_jobs(), len(tasks))
+    F_dict: dict = {}
+    factors: dict = {}
+    with ProcessPoolExecutor(max_workers=jobs,
+                             initializer=_batch_child_init,
+                             initargs=(npz_path,)) as ex:
+        futs = {ex.submit(_batch_child_eval, name, src, train_end, horizon,
+                          pool_std): name for name, src in tasks}
+        for fut, name in futs.items():
+            try:
+                _, diag, F = fut.result()
+                F_dict[name] = F
+                factors[name] = diag
+            except Exception as e:  # noqa: BLE001 — 部分失败隔离
+                factors[name] = {"error": f"{type(e).__name__}: {e}"[:300]}
+                F_dict[name] = np.zeros((env.T, env.N))  # 占位（家族统计只走 ok）
+    return evaluate_batch(F_dict, env, horizon=horizon, pool_std=pool_std,
+                          factors=factors)
+
+
 def run_request(req: dict) -> dict:
     env = load_env_npz(req["npzPath"])
     method = req["method"]
@@ -90,7 +140,18 @@ def run_request(req: dict) -> dict:
         return check_causality(fn, env)
     if method == "factor.evaluate":
         stage = params.get("stage", "development")
+        # W2（2026-08-26 规划书）：单次 factor(env) 计时——慢实现的结构
+        # 天花板（submit 噪声门 ≥10 世界 × 单次 > 预算 240s → 必然事务中止）
+        # 在 evaluate 即暴露，不等 submit 烧几分钟。P1：CPU 秒与墙钟并记
+        # （并行会话下墙钟被挤占失真，CPU 是实现的诚实成本）；只做 agent
+        # 手写源路径，batch/walk_forward（引擎自生成源，快）不加计时
+        _t0 = time.monotonic()
+        _p0 = time.process_time()
         F = fn(env)
+        _wall = time.monotonic() - _t0
+        _cpu = time.process_time() - _p0
+        _perf = {**factor_perf(_cpu), "wall_s": round(_wall, 3),
+                 "cpu_s": round(_cpu, 3)}
         # v3：bar_sigma 为门参数（E[max|X|]，σ 单位）；n_trials 纯遥测
         bar_sigma = params.get("bar_sigma")
         bar_sigma = float(bar_sigma) if isinstance(bar_sigma, (int, float)) else None
@@ -105,24 +166,26 @@ def run_request(req: dict) -> dict:
         except (TypeError, ValueError):
             horizon = None
         if stage == "development":
-            return evaluate(F, env, n_trials=n_trials, pool_std=pool_std,
-                            horizon=horizon, bar_sigma=bar_sigma)
-        if stage == "selection":
-            return evaluate_selection(F, env)
-        if stage == "test":
+            out = evaluate(F, env, n_trials=n_trials, pool_std=pool_std,
+                           horizon=horizon, bar_sigma=bar_sigma)
+        elif stage == "selection":
+            out = evaluate_selection(F, env)
+        elif stage == "test":
             # test 是消耗品：锁写在用户 state_root，worker 子进程写同一文件，跨调用可见
-            return evaluate_test(F, env, state_root=state_root,
-                                 source_hash=params.get("source_hash"))
-        raise ValueError(f"worker 不支持的 stage: {stage}")
+            out = evaluate_test(F, env, state_root=state_root,
+                                source_hash=params.get("source_hash"))
+        else:
+            raise ValueError(f"worker 不支持的 stage: {stage}")
+        if isinstance(out, dict):
+            out["perf"] = _perf
+        return out
     if method == "factor.evaluate_composite":
         parts = {}
         for name, src in (params.get("ingredients") or {}).items():
             parts[name] = _compile(src)(env)
         return evaluate_composite(fn(env), parts, env)
     if method == "factor.evaluate_batch":
-        F_dict = {}
-        for name, src in (params.get("sources") or {}).items():
-            F_dict[name] = _compile(src)(env)
+        sources = params.get("sources") or {}
         horizon = params.get("horizon")
         try:
             horizon = int(horizon) if horizon not in (None, "") else None
@@ -130,7 +193,25 @@ def run_request(req: dict) -> dict:
             horizon = None
         pool_std = params.get("pool_std")
         pool_std = float(pool_std) if isinstance(pool_std, (int, float)) else None
-        return evaluate_batch(F_dict, env, horizon=horizon, pool_std=pool_std)
+        # P3 并行批次：进程池逐成员并行（jobs>=2 且成员>=2 才启用；
+        # 否则退化为原顺序路径）。子进程只算（F + 单成员诊断），家族
+        # 统计（ρ̄/bar_sigma/deflated）由本进程收齐后统一算——语义与
+        # 顺序路径完全一致（evaluate_batch 注入 factors）。
+        from .procinfo import resolve_jobs
+        jobs = resolve_jobs()
+        if len(sources) >= 2 and jobs >= 2:
+            return _batch_parallel(sources, req["npzPath"], env,
+                                   horizon=horizon, pool_std=pool_std)
+        # 顺序路径（P3 起同样做部分失败隔离：坏成员标 error 不烧整批）
+        F_dict, factors = {}, {}
+        for name, src in sources.items():
+            try:
+                F_dict[name] = _compile(src)(env)
+            except Exception as e:  # noqa: BLE001 — 单成员失败标记，其余照评
+                factors[name] = {"error": f"{type(e).__name__}: {e}"[:300]}
+                F_dict[name] = np.zeros((env.T, env.N))  # 占位（家族统计只走 ok 成员）
+        return evaluate_batch(F_dict, env, horizon=horizon, pool_std=pool_std,
+                              factors=factors)
     if method == "factor.walk_forward":
         return evaluate_walk_forward(fn(env), env, n_folds=int(params.get("n_folds", 5)),
                                      t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))

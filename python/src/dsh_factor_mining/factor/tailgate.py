@@ -32,37 +32,15 @@ from __future__ import annotations
 
 import numpy as np
 
-_MH_N = 32          # MinHash 签名长度（与构造指纹同量级）
+from .gates import (
+    MH_N as _MH_N,
+    _stable_hash64,
+    blp_sigma as _blp_sigma,
+    selection_minhash,
+    selection_similarity,
+)
+
 _LINEAGE = 0.25     # 名单 Jaccard 链判定阈（对齐 _FP_LINEAGE_THRESH）
-
-
-def _stable_hash64(s: str) -> int:
-    import hashlib
-
-    return int.from_bytes(
-        hashlib.md5(s.encode("utf-8")).digest()[:8], "big")
-
-
-def selection_minhash(pairs) -> list[int]:
-    """(day_idx, asset_idx) 选择集的 MinHash 签名（确定性，跨进程可复现）。"""
-    import random as _random
-
-    rng = _random.Random(20260826)
-    coeffs = [(rng.randrange(1, 2 ** 31), rng.randrange(0, 2 ** 31))
-              for _ in range(_MH_N)]
-    hs = [_stable_hash64(f"{t}:{j}") for t, j in pairs]
-    if not hs:
-        return [0] * _MH_N
-    return [min(((a * h + b) % (2 ** 31 - 1)) & 0xFFFFFFFF for h in hs)
-            for a, b in coeffs]
-
-
-def selection_similarity(mh_a: list, mh_b: list) -> float:
-    """签名一致率 = Jaccard 无偏估计（与 _fingerprint_similarity 同式）。"""
-    if (not isinstance(mh_a, list) or not isinstance(mh_b, list)
-            or len(mh_a) != len(mh_b) or not mh_a):
-        return 0.0
-    return sum(1 for a, b in zip(mh_a, mh_b) if a == b) / len(mh_a)
 
 
 #: 账本收录的 stage（WS3 防线 a）：test 不是试验——它是消耗品的最终
@@ -89,6 +67,7 @@ def tail_ledger(trail_engine: list) -> list[dict]:
             continue
         key = (e.get("source_hash"), e.get("horizon"), tail.get("k_frac"))
         seen[key] = {
+            "ts": e.get("ts"),
             "source_hash": e.get("source_hash"),
             "horizon": e.get("horizon"),
             "k_frac": tail.get("k_frac"),
@@ -130,18 +109,35 @@ def tail_n_eff(ledger: list[dict]) -> tuple[int, int]:
     return len({find(i) for i in range(n)}), n
 
 
-def _blp_sigma(n: float) -> float:
-    """B-LP 单侧期望最大值 E[max X]（σ 单位）——与 evaluate._blp_sigma
-    同式本地复制（避免跨模块私有导入的循环依赖；两处同步维护）。
-    单侧：准入规则是 spread_ir ≥ bar（单侧），不用双侧 E[max|X|]。"""
-    from statistics import NormalDist
+def tail_near_misses(ledger: list[dict], bar_value: float | None,
+                     window: float = 0.10, limit: int = 3) -> list[dict]:
+    """spread_ir 距 bar 一窗之内的最近条目（loop 尾部遥测用，纯函数）。
 
-    if n <= 1:
-        return 0.0
-    gamma = 0.5772156649015329
-    z = NormalDist()
-    return float((1 - gamma) * z.inv_cdf(1 - 1 / n)
-                 + gamma * z.inv_cdf(1 - 1 / (n * np.e)))
+    入选区间 [bar−window, bar)：已经过线的不算 near miss，差一个窗以上的
+    漆黑一片也不算——给 agent「差一点」的方向感。按 ts 取最近 limit 条
+    （无 ts 的旧条目沉底）。bar 不可计算（None/NaN）→ 空列表。"""
+    if not isinstance(bar_value, (int, float)) or isinstance(bar_value, bool):
+        return []
+    if not np.isfinite(float(bar_value)):
+        return []
+    bar = float(bar_value)
+    cands = []
+    for r in ledger:
+        sp = r.get("spread_ir") if isinstance(r, dict) else None
+        if not isinstance(sp, (int, float)) or isinstance(sp, bool):
+            continue
+        if not np.isfinite(float(sp)):
+            continue
+        if bar - window <= float(sp) < bar:
+            cands.append(r)
+    cands.sort(key=lambda r: str(r.get("ts") or ""))
+    out = []
+    for r in cands[-limit:] if limit > 0 else []:
+        sp = float(r.get("spread_ir"))
+        out.append({"hash_prefix": str(r.get("source_hash") or "")[:12],
+                    "spread_ir": round(sp, 4),
+                    "gap": round(bar - sp, 4)})
+    return out
 
 
 def tail_deflation_bar(n_eff: int, n_days: int,

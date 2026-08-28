@@ -128,47 +128,107 @@ def signature_similarity(a: dict, b: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 低效模式扫描（agent 生成代码的计算效率防御，层 1）
+# 低效模式扫描（agent 生成代码的计算效率防御，层 1；P4 起 AST 分级）
 # ---------------------------------------------------------------------------
 
-# 反模式来自实测教训（历史观测：vectorize-no-nested-loops /
-# cost-bug 等）：逐行 apply、循环内 concat 重建面板、双层 Python 循环、循环内截面调用。
-_INEFFICIENT_PATTERNS: list[tuple[str, str]] = [
-    (r"\.iterrows\s*\(", "iterrows：逐行 Python 回调，比向量化慢 100x+"),
-    (r"\.itertuples\s*\(", "itertuples：逐行迭代，优先向量化"),
-    (r"\.apply\s*\(\s*lambda", "apply(lambda)：逐元素回调，优先列级向量化运算"),
-    (r"\.applymap\s*\(", "applymap：逐格回调，优先向量化"),
-]
+# A 类（确定性反模式，causality 门硬拒——拒绝评估、不计 trial）：在
+# factor(env) 里没有合法用途（ops 向量化算子库存在的前提下）。错拒的
+# 代价 = agent 一次廉价改写；不拒的代价 = 每个垃圾源码先烧分钟级计算，
+# 且并行会话下放大全机竞争（效率四层规划 Tier 1，2026-08-27 拍板 D3a）。
+# B 类保留警告（循环有时确实是对的——如小常数窗口集迭代）。
+_CLASS_A_PATTERNS = {
+    "iterrows": "iterrows：逐行 Python 回调（比向量化慢 100x+）——"
+                "改用 df.groupby(\"symbol\").transform/shift 或 unstack 宽表矩阵运算（ops.ts_*）",
+    "itertuples": "itertuples：逐行迭代——改用 df.groupby(\"symbol\") 的向量化变换（ops.ts_delay/ts_diff）",
+    "applymap": "applymap：逐格回调——改用 numpy 逐元素运算（env.c 等直接矩阵运算）",
+    "apply_lambda": "apply(lambda)：逐元素/逐行回调——改用列级向量化（rolling/rank/numpy）",
+    "loop_concat": "循环内 concat/append 重建数组（O(n²) 元凶）——"
+                   "先 list.append 收集、循环外一次性 np.concatenate / pd.concat，或预分配输出矩阵",
+}
+# 循环体内重建类调用：np/pd 前缀的 concat/concatenate/append（裸
+# list.append 是正确写法，靠 np/pd 前缀区分——文档约定别名）
+_REBUILD_ATTRS = {"concat", "concatenate", "append"}
+_REBUILD_PREFIXES = {"np", "pd", "numpy", "pandas"}
+
 
 def scan_inefficiency(source: str) -> dict[str, Any]:
-    """静态低效模式扫描。返回 warning（不阻断——循环有时是对的，只提醒）。"""
-    hits: list[dict[str, Any]] = []
-    lines = (source or "").splitlines()
-    for ln_no, line in enumerate(lines, 1):
-        for pat, msg in _INEFFICIENT_PATTERNS:
-            if re.search(pat, line):
-                hits.append({"line": ln_no, "pattern": msg})
-    # 双层以上 for 嵌套（近似：缩进递增的两个 for）
-    depth = 0
-    prev_for_indent = -1
-    for ln_no, line in enumerate(lines, 1):
-        if not line.strip():
-            continue
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        if stripped.startswith("for ") and indent > prev_for_indent >= 0:
-            hits.append({"line": ln_no, "pattern": "嵌套 for：疑似 T×N Python 循环，优先向量化（rolling/groupby/rank）"})
-        if stripped.startswith("for "):
-            prev_for_indent = indent
-        # 循环体内 pd.concat（重建面板的元凶）
-    has_concat = any("pd.concat" in l for l in lines)
-    has_for = any(l.lstrip().startswith("for ") for l in lines)
-    if has_concat and has_for:
-        hits.append({"line": 0, "pattern": "for 循环 + pd.concat 共存：循环内重建面板是已知性能元凶，改为先收集再一次性 concat 或预分配"})
+    """AST 低效模式扫描（P4：正则行扫升级 AST——正则漏掉循环体内
+    np.concatenate 二次模式与跨行结构）。
+
+    返回 {ok, hard_reject, hits, class_a, class_b, advice}：
+    - class_a（hard_reject=True）：iterrows / itertuples / applymap /
+      apply(lambda) / 循环体内 np|pd 前缀 concat-concatenate-append
+      ——bridge 因果门硬拒（拒绝评估、不计 trial）
+    - class_b：嵌套 for、apply(具名函数)——警告不阻断
+    解析失败回退正则扫描（老行为兜底，只出警告不硬拒——编译错误由
+    _compile 路径报结构化错误，扫描不越权）。"""
+    import ast as _ast
+    import re as _re
+
+    class_a: list[dict[str, Any]] = []
+    class_b: list[dict[str, Any]] = []
+
+    try:
+        tree = _ast.parse(source or "")
+    except SyntaxError:
+        hits = []
+        for ln_no, line in enumerate((source or "").splitlines(), 1):
+            for pat, msg in ((r"\.iterrows\s*\(", _CLASS_A_PATTERNS["iterrows"]),
+                             (r"\.itertuples\s*\(", _CLASS_A_PATTERNS["itertuples"]),
+                             (r"\.applymap\s*\(", _CLASS_A_PATTERNS["applymap"]),
+                             (r"\.apply\s*\(\s*lambda", _CLASS_A_PATTERNS["apply_lambda"])):
+                if _re.search(pat, line):
+                    hits.append({"line": ln_no, "pattern": msg})
+        return {"ok": not hits, "hard_reject": False, "hits": hits[:8],
+                "class_a": [], "class_b": hits[:8],
+                "advice": "疑似非向量化实现：参考因子写法文档·效率章节"}
+
+    def _hit(kind: str, node, msg: str):
+        (class_a if kind == "a" else class_b).append(
+            {"line": getattr(node, "lineno", 0), "pattern": msg})
+
+    def _rebuild_in_loop(node):
+        """For/While 体内的 np|pd.concat/concatenate/append 调用节点。"""
+        for sub in _ast.walk(node):
+            if (isinstance(sub, _ast.Call) and isinstance(sub.func, _ast.Attribute)
+                    and sub.func.attr in _REBUILD_ATTRS
+                    and isinstance(sub.func.value, _ast.Name)
+                    and sub.func.value.id in _REBUILD_PREFIXES):
+                return sub
+        return None
+
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            fn = node.func
+            if isinstance(fn, _ast.Attribute):
+                if fn.attr in ("iterrows", "itertuples", "applymap"):
+                    _hit("a", node, _CLASS_A_PATTERNS[fn.attr])
+                elif fn.attr == "apply":
+                    arg = node.args[0] if node.args else None
+                    if isinstance(arg, _ast.Lambda):
+                        _hit("a", node, _CLASS_A_PATTERNS["apply_lambda"])
+                    else:
+                        _hit("b", node, "apply(具名函数)：若为逐元素/逐行回调请向量化"
+                              "（列级 rolling/rank/numpy）——B 类警告")
+        if isinstance(node, (_ast.For, _ast.While)):
+            hit = _rebuild_in_loop(node)
+            if hit is not None:
+                _hit("a", hit, _CLASS_A_PATTERNS["loop_concat"])
+            # 嵌套 for（AST 判定，替代旧缩进近似；只报一层避免重复告警）
+            for sub in _ast.walk(node):
+                if sub is not node and isinstance(sub, _ast.For):
+                    _hit("b", sub, "嵌套 for：疑似 T×N Python 循环，优先向量化"
+                          "（rolling/groupby/rank）——B 类警告")
+                    break
+
+    hits = class_a + class_b
     if not hits:
-        return {"ok": True, "hits": []}
-    return {"ok": False, "hits": hits[:8],
-            "advice": "疑似非向量化实现：参考因子写法文档·效率章节；优先复用 dsh_factor_mining.factor.ops 的向量化算子"}
+        return {"ok": True, "hard_reject": False, "hits": [], "class_a": [],
+                "class_b": []}
+    return {"ok": False, "hard_reject": bool(class_a),
+            "hits": hits[:8], "class_a": class_a[:8], "class_b": class_b[:8],
+            "advice": "疑似非向量化实现：参考因子写法文档·效率章节；"
+                      "优先复用 dsh_factor_mining.factor.ops 的向量化算子"}
 
 
 # ---------------------------------------------------------------------------
