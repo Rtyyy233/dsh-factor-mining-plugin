@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-factor-mining-python",
   "description": "Persistent Python JSON-RPC provider for the DeepSeek Harness factor-mining seam",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "publishConfig": {
     "access": "public"
   },

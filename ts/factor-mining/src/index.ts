@@ -15,6 +15,26 @@ import type {
   AuditReport,
   BatchDiagnosis,
   BatchRequest,
+  JournalAppendRequest,
+  JournalAppendResult,
+  JournalDistillRequest,
+  JournalDistillResult,
+  JournalReadRequest,
+  JournalReadResult,
+  JournalStatsRequest,
+  StandbyViewRequest,
+  StandbyViewResult,
+  StandbyCombineRequest,
+  StandbyCombineResult,
+  IncubateEnqueueRequest,
+  IncubateEnqueueResult,
+  IncubateStatusRequest,
+  IncubateStatusResult,
+  IncubateJudgeRequest,
+  IncubateJudgeResult,
+  JournalStatsResult,
+  JournalUpdateRequest,
+  JournalUpdateResult,
   CausalityVerdict,
   CompositeDiagnosis,
   CompositeRequest,
@@ -49,6 +69,7 @@ import type {
   RegistryUpdateResult,
   StateResetRequest,
   StateResetResult,
+  StatusRequest,
   TrailSummaryRequest,
   TrailSummaryResult,
   ExportReportRequest,
@@ -74,8 +95,9 @@ export abstract class FactorMiningService extends Service {
     super(ctx, 'factorMining')
   }
 
-  /** Whole-service status and configured environments. */
-  abstract status(): Promise<FactorMiningStatus>
+  /** Whole-service status and configured environments. `request.lane` scopes
+   *  the embedded loop directive to that parallel lane (2026-08-31 方案 A). */
+  abstract status(request?: StatusRequest): Promise<FactorMiningStatus>
 
   /** Probe one user data file and suggest a column mapping. */
   abstract dataProbe(request: DataProbeRequest): Promise<DataProbeReport>
@@ -137,14 +159,17 @@ export abstract class FactorMiningService extends Service {
   /** Query user explored/search path state. */
   abstract queryPaths(request: PathQueryRequest): Promise<PathQueryResult>
 
-  /** Append one trail entry. */
-  abstract appendTrail(entry: Record<string, unknown>): Promise<AppendResult>
+  /** Append one trail entry. `lane` is the session identity stamped by the
+   *  tool layer (parallel-line isolation); it overrides any lane field the
+   *  model put inside the entry. */
+  abstract appendTrail(entry: Record<string, unknown>, lane?: string): Promise<AppendResult>
 
-  /** Append one falsified-exploration entry. */
-  abstract appendExplored(entry: Record<string, unknown>): Promise<AppendResult>
+  /** Append one falsified-exploration entry (facts layer: reads stay global;
+   *  the lane tag is provenance only). */
+  abstract appendExplored(entry: Record<string, unknown>, lane?: string): Promise<AppendResult>
 
   /** Append one process-level search-path entry. */
-  abstract appendSearchPath(entry: Record<string, unknown>): Promise<AppendResult>
+  abstract appendSearchPath(entry: Record<string, unknown>, lane?: string): Promise<AppendResult>
 
   /** Read the user registry. */
   abstract registryGet(envId?: string): Promise<RegistryGetResult>
@@ -155,6 +180,59 @@ export abstract class FactorMiningService extends Service {
   /** Update descriptive fields (signal/note) of one registry entry. Iron-rule fields rejected. */
   abstract registryUpdate(request: RegistryUpdateRequest): Promise<RegistryUpdateResult>
 
+  /** Reasoning journal (interpretation layer over the engine fact trail,
+   *  per parallel lane): progressive-disclosure read — 0=INDEX, 1=live,
+   *  2=one entry by id from live/arcs. */
+  abstract journalRead(request: JournalReadRequest): Promise<JournalReadResult>
+
+  /** Append entry block(s) to the lane journal live area. First-line
+   *  convention `## <id> <status> <title>`; `registered` requires a
+   *  `ref:<source_hash>` line (the evaluate mirror joins on it). */
+  abstract journalAppend(request: JournalAppendRequest): Promise<JournalAppendResult>
+
+  /** Status transition / note (open→registered→adjudicated→resolved|stale,
+   *  active→retired; a same-status call appends the note). */
+  abstract journalUpdate(request: JournalUpdateRequest): Promise<JournalUpdateResult>
+
+  /** Arc-boundary distillation: the engine snapshots the old live into raw/
+   *  (audit, anti-gaslight), archives dropped terminal entries with epitaphs,
+   *  and auto-keeps dropped active entries. */
+  abstract journalDistill(request: JournalDistillRequest): Promise<JournalDistillResult>
+
+  /** Standby-line derived view: near-miss survivors (rescue channels' sourcing
+   *  surface — re-entry is mechanically triggered, no agent appeal). */
+  abstract standbyView(request: StandbyViewRequest): Promise<StandbyViewResult>
+
+  /** Channel-3: rule-based combination over the standby line (rule registered
+   *  as a dof=1 mechanism-layer hypothesis; composite evaluated via the
+   *  standard pipeline — returns an async job like evaluate_composite). */
+  abstract standbyCombine(request: StandbyCombineRequest): Promise<StandbyCombineResult>
+
+  /** Channel-5: freeze sources and start the incubation window for a cohort. */
+  abstract incubateEnqueue(request: IncubateEnqueueRequest): Promise<IncubateEnqueueResult>
+
+  /** Channel-5: cohort listing (progress/judgment go through incubateJudge). */
+  abstract incubateStatus(request: IncubateStatusRequest): Promise<IncubateStatusResult>
+
+  /** Channel-5: one-shot cohort judgment on the fresh window (needs new data). */
+  abstract incubateJudge(request: IncubateJudgeRequest): Promise<IncubateJudgeResult>
+
+  /** Journal telemetry: entry counts, registration rate, distill stats. */
+  abstract journalStats(request: JournalStatsRequest): Promise<JournalStatsResult>
+
   /** Optional arxiv methodology search. */
   abstract arxivSearch?(request: ArxivSearchRequest): Promise<ArxivSearchResult>
+
+  /** Multi-ledger routing (2026-09-17): return the sub-service bound to the
+   *  given root key (its own bridge process and state root — trail/registry/
+   *  deflation pool are fully separate). Providers that only mount one state
+   *  root leave this unimplemented; callers MUST degrade to `this` then.
+   *  The returned object satisfies this interface structurally but is NOT
+   *  registered on the context (duplicate-service rule). */
+  abstract forRoot?(rootKey: string): FactorMiningService
+
+  /** Configured ledger list for multi-root deployments: the default root
+   *  under key "default" plus one entry per extraRoots config key. Single-root
+   *  providers return [{ key: 'default', stateRoot }]. */
+  abstract listRoots?(): Array<{ key: string; stateRoot: string }>
 }
