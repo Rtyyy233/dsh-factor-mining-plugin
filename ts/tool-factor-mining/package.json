@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-factor-mining",
   "description": "Model-facing tools for the DeepSeek Harness factor-mining capability seam",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "publishConfig": {
     "access": "public"
   },

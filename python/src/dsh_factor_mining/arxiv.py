@@ -13,7 +13,13 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-BASE = "http://export.arxiv.org/api/query"
+# 2026-09-17 传输层修复:arxiv 前端(Google Frontend)按 TLS ClientHello
+# 指纹拒绝 python ssl 栈——实测 urllib 无论 UA/Accept 怎么配恒 406,
+# 同 URL 系统 curl 稳定 200(回源 MISS)。故传输层迁移:curl 优先,
+# urllib 仅作无 curl 环境的兜底。注意:改本文件须重启 bridge 才生效
+# (进程内热改无效——今日 DSH 会话换头全灭误诊'API 弃用'即此因)。
+BASE = "https://export.arxiv.org/api/query"
+_HEADERS = {"User-Agent": "dsh-factor-mining/0.1 (research factor-mining; local single-user)"}
 
 
 def compose_search_url(query: str, max_results: int = 10,
@@ -35,6 +41,29 @@ def compose_search_url(query: str, max_results: int = 10,
     return BASE + "?" + urllib.parse.urlencode(params)
 
 
+def _fetch(url: str, timeout: int = 30):
+    """传输层:curl 优先(python ssl 指纹被 Google Frontend 406),urllib 兜底。"""
+    import shutil as _sh
+    import subprocess as _sp
+    curl = _sh.which("curl")
+    if curl:
+        try:
+            r = _sp.run([curl, "-s", "--max-time", str(timeout), url],
+                        capture_output=True)
+            if r.returncode == 0 and r.stdout:
+                return r.stdout
+            return {"error": f"curl rc={r.returncode}: {r.stderr.decode('utf-8', 'replace')[:200]}"}
+        except Exception as e:
+            pass                        # 落到 urllib 兜底
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "dsh-factor-mining/0.1 (research factor-mining)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def search(query: str, max_results: int = 10, category_filter: str | None = None,
            sort_by: str = "relevance", start: int = 0):
     """检索并解析 Atom feed → [{title, summary, arxiv_id, published}]。
@@ -44,11 +73,13 @@ def search(query: str, max_results: int = 10, category_filter: str | None = None
         return []
     url = compose_search_url(query, max_results, category_filter, sort_by, start)
     ns = {"a": "http://www.w3.org/2005/Atom"}
+    body = _fetch(url)
+    if isinstance(body, dict):          # 传输层失败 {"error": ...}
+        return [body]
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            root = ET.fromstring(resp.read())
+        root = ET.fromstring(body)
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": f"atom parse: {e}"}]
     out = []
     for entry in root.findall("a:entry", ns):
         title = (entry.findtext("a:title", "", ns) or "").strip().replace("\n", " ")

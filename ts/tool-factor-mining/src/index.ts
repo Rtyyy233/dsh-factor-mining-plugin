@@ -796,9 +796,9 @@ export function apply(ctx: Context, config: Config): void {
       },
       output: { schema: { type: 'json' }, render: JSON_RENDER },
       async execute(args, exec) {
-        const arxiv = svcFor(exec).arxivSearch
-        if (arxiv === undefined) throw new Error('arxiv search is not provided by the mounted factor-mining service')
-        return json(arxiv({
+        const svc = svcFor(exec)
+        if (svc.arxivSearch === undefined) throw new Error('arxiv search is not provided by the mounted factor-mining service')
+        return json(svc.arxivSearch({
           query: args.query,
           ...args.max_results !== undefined ? { max_results: args.max_results } : {},
           ...args.category !== undefined ? { category: args.category } : {},
