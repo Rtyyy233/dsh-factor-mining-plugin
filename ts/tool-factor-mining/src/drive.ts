@@ -38,6 +38,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import type { FactorMiningService } from '@deepseek-ai/dsh-factor-mining'
+import { laneOfSession, rootOfSession } from './lane.ts'
 
 /** Injector configuration; every field has a deployment-visible default. */
 export interface DriveConfig {
@@ -45,6 +46,31 @@ export interface DriveConfig {
   delayMs?: number
   /** Max consecutive `continue` injections before yielding to the human. */
   maxConsecutiveSimple?: number
+  /** Mining deadline (ISO 8601, e.g. "2026-09-18T08:00"). While armed the
+   *  deadline REPLACES the consecutive-simple cap as the stop condition; on
+   *  crossing, one wrap-up directive is injected and the drive disarms for
+   *  that session (a real human message still works — only auto-injection
+   *  stops). 方案 B (2026-09-17): continuous mining until a wall-clock. */
+  deadline?: string
+  /** Fallback sweep interval (ms). Periodically re-runs the injection check
+   *  for tracked sessions so a stalled one (no turn/end events reaching us)
+   *  still gets re-ignited. 0 disables the sweep (default). */
+  wakeIntervalMs?: number
+}
+
+/** Runtime control surface for the deadline (2026-09-17 方案 B 追加):
+ * the model sets/inspects the one-shot mining deadline from inside a session
+ * via the factor_drive_deadline tool — the user never edits config files.
+ * A deadline is ephemeral: it fires once (wrap-up injection + disarm) and
+ * does not survive a host restart. */
+export interface DriveHandle {
+  /** Arm/replace the deadline (ISO 8601). Resets per-session wrap-up state
+   *  (a fresh deadline re-arms sessions already wrapped up). Optionally set
+   *  the fallback sweep interval; defaults to 5 min when unset. */
+  setDeadline(iso: string, wakeMs?: number): { ok: boolean; error?: string }
+  /** Disarm the deadline and re-arm normal injection (early call-off). */
+  clearDeadline(): void
+  status(): Record<string, unknown>
 }
 
 /** Strategy payload from the engine loop directive (Python owns the shape). */
@@ -62,6 +88,8 @@ interface DriveState {
   timer: ReturnType<typeof setTimeout> | undefined
   lastKey: string | undefined
   consecutiveSimple: number
+  /** Deadline wrap-up already injected — stay disarmed for this session. */
+  finished: boolean
 }
 
 function renderThrown(value: unknown): string {
@@ -72,13 +100,32 @@ export function applyDrive(
   ctx: Context,
   service: FactorMiningService,
   config: DriveConfig,
-): void {
+): DriveHandle {
   const delayMs = config.delayMs ?? 60_000
   const maxSimple = config.maxConsecutiveSimple ?? 5
+  // 方案 B (2026-09-17): optional wall-clock deadline. Mutable at runtime via
+  // the DriveHandle (factor_drive_deadline tool) — the static config value
+  // is only the initial arm; malformed initial values log once and disarm.
+  let deadlineMs: number | undefined = (() => {
+    if (config.deadline === undefined) return undefined
+    const parsed = Date.parse(config.deadline)
+    if (Number.isNaN(parsed)) {
+      ctx.logger.warn(`factor-mining drive: driveDeadline 无法解析 (${config.deadline})——死线不生效`)
+      return undefined
+    }
+    ctx.logger.info(`factor-mining drive: 死线已武装 ${config.deadline}`
+      + '（连续简单上限让位，到点注入收官后解除自动推进）')
+    return parsed
+  })()
+  let deadlineLabel: string | undefined = config.deadline
+  let wakeMs = config.wakeIntervalMs ?? 0
   /** Sessions that called a factor_* tool in this host run (mining sessions). */
   const factorSessions = new Set<unknown>()
   const states = new Map<unknown, DriveState>()
   const timers = new Set<ReturnType<typeof setTimeout>>()
+  let sweepDisposer: (() => void) | undefined
+  // Assigned once the inject scope arms; a no-op until then (drive inert).
+  let ensureSweep: () => void = () => {}
 
   // Bounded bookkeeping (2026-08-25 review): both containers otherwise grow
   // unbounded over a long host run (one entry per session ever seen). Insertion
@@ -100,7 +147,7 @@ export function applyDrive(
   const stateFor = (id: unknown): DriveState => {
     let s = states.get(id)
     if (s === undefined) {
-      s = { timer: undefined, lastKey: undefined, consecutiveSimple: 0 }
+      s = { timer: undefined, lastKey: undefined, consecutiveSimple: 0, finished: false }
       states.set(id, s)
     }
     return s
@@ -135,13 +182,62 @@ export function applyDrive(
           if (agent.status !== 'idle') return
           const inbox = agent.inbox
           if (inbox !== undefined
-            && ((Array.isArray(inbox.nextTurn) && inbox.nextTurn.length > 0)
+              && ((Array.isArray(inbox.nextTurn) && inbox.nextTurn.length > 0)
               || (Array.isArray(inbox.nextStep) && inbox.nextStep.length > 0))) {
             return
           }
+          // 方案 B (2026-09-17): deadline wrap-up. Checked after the idle /
+          // inbox guards (a busy agent must not be interrupted) but before
+          // the engine status query — wrap-up does not depend on the loop
+          // state. One-shot per session, then permanently disarmed.
+          if (deadlineMs !== undefined) {
+            if (state.finished) return
+            if (Date.now() >= deadlineMs) {
+              try {
+                await scoped.sessions?.flush?.(agent.session)
+              } catch { /* checkpoint failure is non-fatal for the injection */ }
+              const text = '[引擎推进][deadline] 挖掘死线已到（'
+                + `${deadlineLabel}）。请立即收官，不要再发起新试验：`
+                + '汇总本会话的试验数/入册/near-miss 与账本状态，'
+                + '写一份收官战报后结束。'
+              let message: any
+              try {
+                message = {
+                  id: (globalThis.crypto?.randomUUID?.()
+                        ?? `drive-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+                  role: 'user',
+                  content: [{ type: 'text', text }],
+                  source: { kind: 'plugin', plugin: 'dsh-tool-factor-mining/drive' },
+                }
+              } catch (e) {
+                ctx.logger.warn(`factor-mining drive: 收官消息构造失败: ${renderThrown(e)}`)
+                return
+              }
+              agent.followup(message)
+              state.finished = true
+              state.lastKey = 'deadline'
+              ctx.logger.info(`factor-mining drive: 死线收官已注入 msg.id=${message.id}`
+                + '——本会话自动推进解除，交还用户')
+              return
+            }
+          }
           let loop: any
           try {
-            const status = await service.status()
+            // 2026-08-31 方案 A：status 按本会话的 lane 查——注入器推的
+            // 必须是该会话自己的 pending/族链/预算，不是别的并行线的
+            // 2026-09-17 双线：会话绑定过账本(factor_root_use)则查该
+            // 账本的 loop——stock 会话与 etf 会话各推各的引擎指令
+            const rootKey = rootOfSession(sessionId)
+            const svc = rootKey !== undefined && service.forRoot !== undefined
+              ? (() => {
+                  try {
+                    return service.forRoot!(rootKey)
+                  } catch {
+                    return service
+                  }
+                })()
+              : service
+            const status = await svc.status({ lane: laneOfSession(sessionId) })
             loop = (status as unknown as Record<string, any>)?.loop
           } catch (e) {
             ctx.logger.warn(`factor-mining drive: status 查询失败（不注入）: ${renderThrown(e)}`)
@@ -169,9 +265,13 @@ export function applyDrive(
           // 但受连续上限约束（用户决策 2：简单 push ≤5 连续）。
           if (sameKey && !isSimple) return
           if (isSimple && state.consecutiveSimple >= maxSimple) {
-            ctx.logger.info(`factor-mining drive: 连续简单注入达上限 ${maxSimple}，`
-              + '暂停自动推进，等待真人指示')
-            return
+            // 方案 B (2026-09-17): an armed deadline REPLACES the simple cap
+            // as the stop condition — without one the original fuse holds.
+            if (deadlineMs === undefined) {
+              ctx.logger.info(`factor-mining drive: 连续简单注入达上限 ${maxSimple}，`
+                + '暂停自动推进，等待真人指示')
+              return
+            }
           }
           // Durability checkpoint before driving (goal-round-driver discipline).
           try {
@@ -252,11 +352,77 @@ export function applyDrive(
             ctx.logger.warn(`factor-mining drive: 事件处理异常: ${renderThrown(e)}`)
           }
         })
+
+      // 方案 B (2026-09-17): fallback sweep, armed lazily — by an initial
+      // wakeIntervalMs config OR by a runtime setDeadline (default 5 min).
+      // Event-driven injection only fires on turn/end — a session that
+      // stalls without emitting events would never be re-ignited. The sweep
+      // periodically re-runs the guarded driveNow for tracked sessions;
+      // pending turn/end timers are respected (skip while set).
+      ensureSweep = (): void => {
+        if (sweepDisposer !== undefined || wakeMs <= 0) return
+        try {
+          const sweep = (ctx as unknown as Record<string, any>).interval(() => {
+            for (const id of factorSessions) {
+              const s = states.get(id)
+              if (s === undefined || s.timer !== undefined) continue
+              void driveNow(id)
+            }
+          }, wakeMs)
+          sweepDisposer = typeof sweep?.dispose === 'function' ? () => sweep.dispose() : () => {}
+          ctx.logger.info(`factor-mining drive: 兜底唤醒已武装 (每 ${wakeMs}ms`
+            + `${deadlineMs !== undefined ? `，死线 ${deadlineLabel}` : ''})`)
+        } catch (e) {
+          sweepDisposer = undefined
+          ctx.logger.warn(`factor-mining drive: 兜底唤醒不可用（timer 服务缺失?）: ${renderThrown(e)}`)
+        }
+      }
+      if (wakeMs > 0) ensureSweep()
     })
+
+  const handle: DriveHandle = {
+    setDeadline(iso: string, wake?: number): { ok: boolean; error?: string } {
+      const parsed = Date.parse(iso)
+      if (Number.isNaN(parsed)) {
+        return { ok: false, error: `无法解析时刻: ${iso}（需要 ISO 8601，如 2026-09-18T08:00）` }
+      }
+      deadlineMs = parsed
+      deadlineLabel = iso
+      if (typeof wake === 'number' && wake > 0) wakeMs = wake
+      if (wakeMs <= 0) wakeMs = 300_000
+      // Fresh deadline re-arms every session (including wrapped-up ones).
+      for (const s of states.values()) s.finished = false
+      ensureSweep()
+      ctx.logger.info(`factor-mining drive: 死线已由会话设置 ${iso}`
+        + `（兜底唤醒 ${wakeMs}ms；到点注入收官后解除自动推进）`)
+      return { ok: true }
+    },
+    clearDeadline(): void {
+      deadlineMs = undefined
+      deadlineLabel = undefined
+      for (const s of states.values()) s.finished = false
+      ctx.logger.info('factor-mining drive: 死线已由会话清除——恢复常规自动推进（连续简单上限重新生效）')
+    },
+    status(): Record<string, unknown> {
+      const wrapped = [...states.values()].filter((s) => s.finished).length
+      return {
+        deadline: deadlineLabel,
+        deadlineEpochMs: deadlineMs,
+        wrapUpInjectedSessions: wrapped,
+        wakeIntervalMs: wakeMs > 0 ? wakeMs : null,
+        trackedSessions: factorSessions.size,
+        note: deadlineMs === undefined
+          ? '未设死线：常规自动推进（连续简单注入上限生效）'
+          : `死线 ${deadlineLabel}：连续简单上限让位，到点注入一次收官后自动解除；一次性，重启即失`,
+      }
+    },
+  }
+  return handle
 
   ctx.effect(() => () => {
     for (const t of timers) clearTimeout(t)
     timers.clear()
     states.clear()
+    sweepDisposer?.()
   })
 }
