@@ -84,16 +84,13 @@ def test_search_body_executes(monkeypatch):
         "<published>2025-11-15T00:00:00Z</published></entry>"
         "</feed>")
 
-    class _Resp:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def read(self): return atom.encode("utf-8")
-
-    def fake_urlopen(url, timeout=30):
+    # 2026-09-18 传输层迁移 curl-first 后,urlopen 不再是必经路径——
+    # mock _fetch(两种传输共用的出口)保持该测试的防回归语义。
+    def fake_fetch(url, timeout=30):
         assert "search_query=" in url
-        return _Resp()
+        return atom.encode("utf-8")
 
-    monkeypatch.setattr(arxiv_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(arxiv_mod, "_fetch", fake_fetch)
     out = arxiv_mod.search("momentum", 5, "(cat:q-fin.ST)", "relevance", 0)
     assert isinstance(out, list) and out[0]["arxiv_id"].endswith("2511.12490v1")
     assert out[0]["title"] == "Momentum Factor"
@@ -234,5 +231,8 @@ def test_literature_seed_rotation():
     assert s1["type"] == "literature" and s2["type"] == "literature"
     assert s1["directive"] != s2["directive"]
     assert "种子查询" in s1["directive"] and "papers" in s1["directive"]
-    s_wrap = _pick_strategy(**base, lit_search_count=14)
-    assert s_wrap["directive"] == s1["directive"]
+    # 2026-09-01 D2 轮转：lit_search_count % 3 == 2 → random（原 14 回位点
+    # 现是轮转槽）；15 % 14 = 1 → 回到 s2 的种子
+    s_wrap = _pick_strategy(**base, lit_search_count=15)
+    assert s_wrap["type"] == "literature"
+    assert s_wrap["directive"] == s2["directive"]

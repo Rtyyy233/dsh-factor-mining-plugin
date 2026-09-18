@@ -404,7 +404,8 @@ def test_strategy_query_on_accepted_milestone(tmp_path):
     ], ensure_ascii=False), encoding="utf-8")
     loop = b._loop_directive()
     assert loop["strategy"]["type"] == "query", loop["strategy"]
-    assert loop["strategy"]["key"] == "query:3"
+    # 2026-09-18 死锁修复:query key 并入 agent_rounds(accepted 冻结时仍保新鲜)
+    assert loop["strategy"]["key"].startswith("query:3:"), loop["strategy"]
 
 
 def test_strategy_none_only_on_silent_terminals(tmp_path):
