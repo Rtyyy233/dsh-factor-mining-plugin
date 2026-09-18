@@ -9,13 +9,17 @@ factor library, and user state.  It never reads or writes files outside:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import os
+import time
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -41,8 +45,8 @@ from .discipline import (
 )
 from .factor import audit as audit_mod
 from .factor.causality import check_causality
+from .factor.eval_cache import cache_read, eval_key_from_parts
 from .factor.evaluate import (
-    _blp_sigma,
     _dsr_p_from_stats,
     _LuckSampler,
     evaluate,
@@ -54,6 +58,16 @@ from .factor.evaluate import (
 )
 from .library.contract import LibraryError, UserLibrary, query_entries
 from .filelock import pid_alive, state_write_lock
+from .lane import (
+    current_lane,
+    entry_lane,
+    normalize_lane,
+    own_entries,
+    reset_request_lane,
+    resolve_request_lane,
+    set_request_lane,
+    strip_lane_params,
+)
 from .procinfo import (
     attach_worker_limits,
     cpu_seconds,
@@ -68,12 +82,19 @@ from .procinfo import (
 from .state import (
     MINING_CONFIG,
     append_explored,
+    factor_source_path,
     factor_source_stats,
     store_factor_source,
     append_search_path,
     append_trail,
     arc_rounds_bump,
     check_termination,
+    inspiration_declare,
+    lane_arc_rounds,
+    lane_decl_seen_update,
+    lane_explore_hashes_extend,
+    lane_random_used,
+    random_emit_count,
     read_json_list,
     read_mining_state,
     read_registry,
@@ -267,6 +288,45 @@ def _fingerprint_similarity(sig_a: list, sig_b: list) -> float:
     return sum(1 for a, b in zip(sig_a, sig_b) if a == b) / len(sig_a)
 
 
+# ---- 探索相似性防线（2026-09-04，analysis/exploration_similarity 01/04 产品化） ----
+# 审计实证：26 对双双 pass 的同构重交全部集中在反重复机制上线前
+# （|IC_IR| 差中位 0.008，零信息增量，双双入册 0 对）；42% 的「新方向」
+# 宣言轮旗舰与先例近重复（H4）而变体宣言轮均值反而最低（0.319）；
+# prompt 干预双盲实验阴性 = 生成层无缺陷。病灶在信息流：重复的代价在
+# 提交瞬间不可见、叙事与结构不对账。防线只修信息流，不动生成。
+_NOVELTY_GATE_SIM = 0.80          # S1 结构相似拦截线（先例源码可核对常量时）
+_NOVELTY_GATE_SIM_NOCODE = 0.95   # 先例源码缺失时的保守拦截线
+_DECL_INFO_MARKERS = ("新信息源", "新维度", "首次引入")
+_DECL_CONSTRUCT_MARKERS = ("新构造", "新方向", "新机制")
+_DECL_FLAGSHIP_MAX_SIM = 0.6      # S2「新构造」宣称的旗舰相似上限
+
+_ENV_ATTR_RE = re.compile(
+    r"env\.([A-Za-z_]\w*)"
+    r"|env(?:\.data)?\[\s*['\"](\w+)['\"]\s*\]"
+    r"|env\.get\(\s*['\"](\w+)")
+_NUM_LIT_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)")
+
+
+def _env_attrs(source: str) -> "set[str]":
+    """L1 数据列引用集合（S2 新信息源判据——审计 02 文档：口径/文献/
+    机制叙事都不是信息源，只有数据列增量是）。env.data/env.get 的
+    访问器本身不算列。"""
+    attrs: set[str] = set()
+    for a, b, c in _ENV_ATTR_RE.findall(source):
+        attrs |= {x for x in (a, b, c) if x and x not in ("data", "get")}
+    return attrs
+
+
+def _numeric_literals(source: str) -> "list[float]":
+    """去 docstring/注释后的数值常量多重集（S1 参数扫描判据：结构相似
+    但常量有变 = 合法深挖（I1 证无边际衰减），放行计遥测；常量未变 =
+    同构重交，拦截）。启发式刻意偏「误放不误拦」。"""
+    src = re.sub(r'"""[\s\S]*?"""', "", source)
+    src = re.sub(r"'''[\s\S]*?'''", "", src)
+    src = re.sub(r"#[^\n]*", "", src)
+    return sorted(float(x) for x in _NUM_LIT_RE.findall(src))
+
+
 def _entries_linked(a: dict, b: dict) -> bool:
     """两试验条目是否同族（v5 血缘 + v3 IC 双信号 OR，对称谓词）。
 
@@ -326,6 +386,26 @@ _LITERATURE_SEEDS = (
 _ARXIV_ID_RE = re.compile(r"(?:arxiv\.org/abs/)?(abs/)?(\d{4}\.\d{4,5})(v\d+)?$")
 
 
+# 灵感重置声明（2026-09-01 规划书 WS-B/D1）：next_hypothesis 前缀语法。
+# 判定序在 _surrender_match 之前——换源宣言不是停笔宣言，理由里出现
+# 「无新假设」等措辞不该被连坐拒收。半/全角冒号都收。
+_INSPIRATION_RESET_RE = re.compile(
+    r"^\s*\[灵感重置[:：](?P<mode>literature|random)\]\s*(?P<reason>.+)$",
+    re.DOTALL)
+
+
+def _inspiration_decl_match(text: Any):
+    """合法声明 → (mode, reason)；无前缀/模式名不在枚举/理由为空 → None
+    （按普通 next_hypothesis 处理，不给 ACK——换源必须说清为什么，
+    空理由的声明只是换了包装的停笔）。"""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    m = _INSPIRATION_RESET_RE.match(text.strip())
+    if m and m.group("reason").strip():
+        return m.group("mode"), m.group("reason").strip()
+    return None
+
+
 # ---- 策略指令选择器（2026-08-24：31 次手动 push 的实证策略机械化） ----
 # session.jsonl 全轨迹配对分析（用户 push 类型 × 当时引擎状态）推导的优先级
 # 规则表。设计原则与 v3 停点一致：判断收进引擎，机械信号驱动，散文不参与。
@@ -339,6 +419,12 @@ _STRATEGY_DIRECTIVES = {
     "literature": ("从文献找灵感：用 factor_arxiv_search 检索方法论论文"
                    "（数学结构/微观结构/时间序列建模），提取一个可迁移的"
                    "构造思路，自己改进后验证。"),
+    "random": ("随机因子探索：用 factor_random_generate(mode='explore') 生成"
+               "一批随机因子（省略 seed 走运行时派生），三列表（top/top_tail/"
+               "top_net）幸存者逐个走标准管线（causality→evaluate→"
+               "evaluate_batch deflation）。幸存者是选择不是结论——未超 "
+               "null p95 或门链未过的如实入账；对幸存者的改造（换窗口/换"
+               "算子/加条件）按普通假设驱动试验推进。"),
     "compose": ("做中阶合成：从 trail 中挑已验证但未入册的单因子，构造"
                 "正交组合（目标截面相关 < 0.7），用 factor_evaluate_composite 验证。"),
     "query": ("正交性审计：计算最近入册因子与既有入册因子的截面相关性，"
@@ -350,22 +436,31 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
                    pending_rejected, frozen: bool, plateau: bool,
                    pass_unadmitted: int, accepted_n: int, agent_rounds: int,
                    n_trials: int, lit_search_count: int = 0,
-                   family_marginal: dict | None = None) -> dict | None:
+                   family_marginal: dict | None = None,
+                   inspiration_reset: dict | None = None,
+                   random_available: bool = True) -> dict | None:
     """下一轮方向类型选择（纯函数，供注入器与 loop 指令共用）。
 
     停点分流（2026-08-25 arc 化 + 2026-08-26 v8 族收敛）：
     - stop_kind ∈ {finalize, fail_streak} → None（真终态，注入器静默——
       交还用户；convergence 已退役：全局/族内枯竭都只做换向信号）
+    - inspiration_reset（2026-09-01 灵感源规划书 WS-B/D1：agent 声明
+      [灵感重置:literature|random] 且配额已扣）→ 强制挂对应策略，
+      优先于 direction_budget 与 R1-R8——声明本身就是换源换向动作；
+      random 配额在声明受理时已查（D3），此处不再判 random_available
     - stop_kind == direction_budget（arc/簇上限/族内收敛）→ 强制
-      rotate/literature（族边际 <-0.10 用 literature），跳过 R3-R8——
-      预算耗尽/族收敛的方向不允许 continue/refine 原地续推；换向断链
-      自动重置预算，注入器照常推进
+      rotate/literature/random（双枯竭时经 _exhausted_source 轮转，
+      族边际 <-0.10 偏 literature），跳过 R3-R8——预算耗尽/族收敛的
+      方向不允许 continue/refine 原地续推；换向断链自动重置预算，
+      注入器照常推进
     - stop_kind == None（running）→ 常规优先级
 
     常规优先级（v6 2026-08-25：家族升级改边际收益驱动，删 streak 绝对阈值；
     2026-08-27 双轨化：R1/R2 与族收敛同口径——**两线都枯竭**才触发，单线
     枯竭只出 escalation（IC 平但尾部有苗头的方向不被强制换向））：
-    R1 IC 与尾部线边际都严重枯竭（<-0.10）→ literature
+    R1 IC 与尾部线边际都严重枯竭（<-0.10）→ _exhausted_source
+       （D2 轮转：lit_search_count % 3 == 2 且 random 配额可用 → random，
+       否则 literature——文献连注两发仍未破局时给无先验探索一次机会）
     R2 IC 与尾部线边际都枯竭（<-0.05）→ rotate
     R3 streak≥3 且族内平台 plateau → refine（有最优载体+边际枯竭
        → 深挖载体特性补正强化）
@@ -392,23 +487,51 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
             return False
         return (not tail_ok) or tail_m < level
 
+    def _exhausted_source(lead: str, close: str) -> tuple[str, str]:
+        """双严重枯竭（-0.10 档）的换源选择（D2 轮转）：每第 3 次
+        （lit_search_count % 3 == 2）换 random——确定性轮转，无随机数，
+        与 _LITERATURE_SEEDS 同一可复现原则；random 配额尽（本方向段
+        已发射过）回落 literature 并如实说明。lead/close 拼接原文案；
+        random 分支不拼 close（换族语义由 direction_budget 后缀覆盖）。"""
+        mtxt = (f"（IC {fam_m:+.3f}"
+                + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
+                + "）")
+        if lit_search_count % 3 == 2 and random_available:
+            return ("random",
+                    f"{lead}边际均严重枯竭{mtxt}——文献检索累计 "
+                    f"{lit_search_count} 次，轮转到无先验探索"
+                    "（随机因子空间不依赖假设源是否枯竭）")
+        if lit_search_count % 3 == 2:
+            return ("literature",
+                    f"{lead}边际均严重枯竭{mtxt}——本应轮转随机探索但本方向段 "
+                    "random 配额已用，仍走文献注入" + close)
+        return ("literature",
+                f"{lead}边际均严重枯竭{mtxt}——内生假设源枯竭，必须文献注入"
+                + close)
+
     t = None
-    if stop_kind == "direction_budget":
+    if inspiration_reset is not None:
+        # WS-B/D4 冷启动语义：当前方向整体作废——强制换源，跳过全部
+        # 常规优先级；与 direction_budget 并存时声明优先（都是换向动作，
+        # 断链重置语义一致，direction_budget 的后缀照常拼接）
+        _reason = str(inspiration_reset.get("reason") or "")[:120]
+        if inspiration_reset.get("mode") == "random":
+            t = "random"
+            why = (f"灵感重置（agent 声明）：{_reason}"
+                   "——当前方向整体作废，从随机因子探索重启")
+        else:
+            t = "literature"
+            why = (f"灵感重置（agent 声明）：{_reason}"
+                   "——当前方向整体作废，从文献冷启动")
+    elif stop_kind == "direction_budget":
         # 方向预算耗尽：族边际决定换向强度；无论边际如何都不允许原地续推
         if _both_exhausted(-0.10):
-            t = "literature"
-            why = (f"方向段预算耗尽且 IC/尾部线边际均严重枯竭"
-                   f"（IC {fam_m:+.3f}"
-                   + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
-                   + "）——内生假设源枯竭，必须文献注入后换族")
+            t, why = _exhausted_source("方向段预算耗尽且 IC/尾部线", "后换族")
         else:
             t = "rotate"
             why = "方向段预算耗尽（轮次/簇试验上限）——必须换向，断链后预算自动重置"
     elif _both_exhausted(-0.10):
-        t = "literature"
-        why = (f"IC 与尾部线边际均严重枯竭（IC {fam_m:+.3f}"
-               + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
-               + "）——内生假设源枯竭，必须文献注入")
+        t, why = _exhausted_source("IC 与尾部线", "")
     elif _both_exhausted(-0.05):
         t = "rotate"
         why = (f"IC 与尾部线边际均枯竭（IC {fam_m:+.3f}"
@@ -434,7 +557,12 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
         t = "continue"
         why = "无异常信号——惯性延续"
     if t == "query":
-        key = f"query:{accepted_n}"
+        # 2026-09-18 死锁修复:query 里程碑 key 若只含 accepted 数——R6 条件
+        # (accepted 为 3 的倍数)在 AI 停止后持续满足而 accepted 不再变化 →
+        # key 冻结 → 注入器 sameKey 去重永久拦截(实测 stock 账本 36 只恰为
+        # 3 的倍数,双线夜挖 stock 会话停摆即此)。并入 agent_rounds 与其他
+        # 类型对齐:审计写 trail → round 递增 → key 新鲜,accepted 语义保留。
+        key = f"query:{accepted_n}:{agent_rounds}"
     else:
         key = f"{t}:{agent_rounds}:{n_trials}"
     directive = _STRATEGY_DIRECTIVES[t]
@@ -446,6 +574,16 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
                      + f"引擎轮转种子查询（与当前族正交）：「{seed}」。"
                        "用它或自己的查询都可以，但论文必须未被标 exhausted，"
                        "且假设来源论文写入 trail 的 papers 字段。")
+    if inspiration_reset is not None:
+        # D4 冷启动语义（区别于普通 literature 注入）：方向整体作废，
+        # pending 已作废不回显，papers 字段对 literature 必填
+        directive = (directive
+                     + "（灵感重置已确认：当前方向整体作废，上一方向的 "
+                       "next_hypothesis 不再回显——断链后方向段预算自动重置；"
+                       + ("新假设必须来自未被标 exhausted 的新论文，trail 的 "
+                          "papers 字段必填" if t == "literature" else
+                          "幸存者走标准管线验证，试验将以 origin=random 入账")
+                       + "；同族参数微调不算换源。）")
     if stop_kind == "direction_budget":
         directive = (directive
                      + "（本方向段轮次/簇试验预算已耗尽：新因子必须与当前族"
@@ -455,10 +593,96 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
             "directive": directive}
 
 
+def _novelty_corr(sa, sb):
+    """两条 light-IC 序列的尾对齐相关(短/缺 → None=按独立计)。"""
+    import numpy as _np
+    if not isinstance(sa, (list, tuple)) or not isinstance(sb, (list, tuple)):
+        return None
+    k = min(len(sa), len(sb))
+    if k < 20:
+        return None
+    a = _np.asarray(sa[-k:], dtype=_np.float64)
+    b = _np.asarray(sb[-k:], dtype=_np.float64)
+    if not (_np.isfinite(a).all() and _np.isfinite(b).all()):
+        return None
+    ea, eb = a.std(), b.std()
+    if ea <= 0 or eb <= 0:
+        return None
+    return float(((a - a.mean()) * (b - b.mean())).mean() / (ea * eb))
+
+
+def _novelty_greedy(cands, score_of, series_of, top_k, hist, lam=0.3):
+    """P0a 反同质化贪心选种(2026-09-13,生产端标定 λ=0.3)。
+
+    score = rank(score_of) ∈[0,1] + λ·(1 − max|ρ| vs 已选∪历史)。纯
+    argmax(λ=0)是 AlphaSAGE 批评的同质化入口;标定:λ=0.3 买 54%/40%
+    选种去相关付 10%/7% IC 牺牲。返回 (选中列表, 组内平均两两|ρ|)。
+    """
+    import numpy as _np
+    pool = [c for c in cands if score_of(c) is not None]
+    pool.sort(key=lambda c: -score_of(c))
+    n = len(pool)
+    if n == 0:
+        return [], None
+    rk = {id(c): (n - 1 - i) / max(1, n - 1) for i, c in enumerate(pool)}
+    chosen, chosen_series = [], list(hist or [])
+    for _ in range(min(top_k, n)):
+        best, bs = None, -9e9
+        for c in pool:
+            if any(c is x for x in chosen):
+                continue
+            mx = 0.0
+            s = series_of(c)
+            for u in chosen_series:
+                r = _novelty_corr(s, u)
+                if r is not None:
+                    mx = max(mx, abs(r))
+            v = rk[id(c)] + lam * (1.0 - mx)
+            if v > bs:
+                bs, best = v, c
+        if best is None:
+            break
+        chosen.append(best)
+        s = series_of(best)
+        if isinstance(s, (list, tuple)) and len(s) >= 20:
+            chosen_series.append(list(s))
+    inner = []
+    for i in range(len(chosen)):
+        for j in range(i + 1, len(chosen)):
+            r = _novelty_corr(series_of(chosen[i]), series_of(chosen[j]))
+            if r is not None:
+                inner.append(abs(r))
+    return chosen, (float(_np.mean(inner)) if inner else None)
+
+
 class Bridge:
+    # C2（修正案 A 2026-08-28）：重方法 = 成本乘数/并行池所在——run 目录
+    # 保留 out.json；异步作业并发上限（防单线程桥自淹没）
+    _HEAVY_METHODS = frozenset({"factor.evaluate_composite",
+                                "factor.evaluate_batch",
+                                "factor.audit"})
+    _MAX_KEPT_RUNS = 20
+    _MAX_ASYNC_JOBS = 2  # 退役：仅作旧配置读取兼容展示（见 _slot_capacity）
+    _ASYNC_STAGE = {"factor.evaluate_composite": "composite"}
+    # R25：batch 不在 _ASYNC_STAGE——批信封不是单因子 diagnosis，走
+    # _async_result 的专用后处理分支（_postprocess_batch_result，R24）
+    # 层 1（2026-08-31 计算利用 PLAN）：权重并发槽 + 真队列。
+    # 权重防超订（R3）：batch 内部还吃 cpu-1 核池——按当量计容量，
+    # evaluate/audit=1、composite=2、batch=4，接受轻度超订（墙钟按 jobs
+    # 伸缩已兜底）。容量/深度 env 可调（DSH_FACTOR_SLOTS / _QUEUE）。
+    _JOB_WEIGHT = {"factor.evaluate": 1, "factor.audit": 1,
+                   "factor.evaluate_composite": 2, "factor.evaluate_batch": 4}
+
+    # 效率编译层（2026-09-01）：烟测门只管会执行 factor(env) 的方法
+    _SMOKE_METHODS = {
+        "factor.check_causality", "factor.evaluate", "factor.evaluate_composite",
+        "factor.evaluate_batch", "factor.walk_forward", "factor.noise_test",
+        "factor.tail_placebo", "factor.day_perm_test", "factor.flatness_test",
+        "factor.audit"}
+
     def __init__(self, state_root: str | None = None, data_config_path: str | None = None,
                  library_spec: dict[str, Any] | None = None, execution_mode: str = "worker",
-                 worker_timeout_ms: int = 300_000):
+                 worker_timeout_ms: int | None = None):
         self.state_root = str(state_root) if state_root else os.environ.get(
             "DSH_FACTOR_MINER_STATE_ROOT", str(Path.cwd() / ".factor-mining"))
         _sr = Path(self.state_root).resolve()
@@ -486,11 +710,51 @@ class Bridge:
         # v3（2026-08-21）选择运气采样器：CRN 状态跨调用持久——增量条件采样
         # O(M²)/新试验；trail 内容寻址（keys 前缀失配 → 全量重建）
         self._luck = _LuckSampler()
+        # 批次1(2026-09-13 方案B 影子):机制层(registered)独立采样器——
+        # 与全局 CRN 状态分离,层内子集的 E[max|X|] 增量维护
+        self._luck_mech = _LuckSampler()
         self._pool_instance = None                                 # MemoryPool 惰性初始化（需要 state_root）
         self._on_progress = None                          # main() 注册：进度 notification 回调
         # 执行安全（DESIGN §10）：默认 worker 子进程隔离；in_process 仅受信调试
         self.execution_mode = execution_mode if execution_mode in ("worker", "in_process") else "worker"
-        self.worker_timeout_ms = int(worker_timeout_ms or 300_000)
+        # 墙钟 base（2026-08-31 计算利用 PLAN R1）：300s→600s——全A个股面板
+        # 单评 150-322s 实测，300s 线会杀掉合法慢因子；jobs 伸缩公式不变。
+        # env DSH_FACTOR_MINER_WORKER_TIMEOUT_MS 可覆盖（部署侧调优用）
+        self.worker_timeout_ms = int(
+            worker_timeout_ms
+            or int(os.environ.get("DSH_FACTOR_MINER_WORKER_TIMEOUT_MS") or 0)
+            or 600_000)
+        # 效率编译层（2026-09-01）：α 烟测门 + 自动 njit + LLM 重写。
+        # 烟测门 fail-open（门自身任何异常放行——新层绝不破坏既有流程）；
+        # 重写层在不可用（无 key/显式关）时静默降级为纯拒绝消息。
+        self._smoke_enabled = os.environ.get("DSH_FACTOR_SMOKE", "1") != "0"
+        self._smoke_min_cells = int(
+            os.environ.get("DSH_FACTOR_SMOKE_MIN_CELLS") or 200_000)
+        self._smoke_cache: dict[tuple, dict] = {}   # (src_fp, env_fp|cells) -> 原始烟测
+        # 并发复审（2026-09-01）F1/F2 修复：同 key 烟测在途事件表（后到者
+        # 等待先来者结果，不重复 spawn）；烟测/验证子进程并发信号量（burst
+        # 下瞬时 smoke worker 数有界，防权重核算外的进程超订）
+        self._smoke_inflight: dict[tuple, threading.Event] = {}
+        self._smoke_spawn_sem = threading.Semaphore(2)
+        self._rewrite_inflight: set[str] = set()    # source_fp -> 重写作业在途
+        self._optimizer_lock = threading.Lock()
+        self._optimizer_cache: dict | None = None   # 惰性加载 optimizer_cache.json
+        # C2（修正案 A 2026-08-28）：重方法异步作业——单线程桥不被长计算
+        # 绑架；层 1（2026-08-31 计算利用 PLAN）升级为权重槽 + 真队列：
+        # 槽满不再拒绝而是入队，dispatch 永远秒回
+        self._async_lock = threading.Lock()
+        self._slot_capacity = max(1, int(os.environ.get("DSH_FACTOR_SLOTS") or 6))
+        self._queue_capacity = max(0, int(os.environ.get("DSH_FACTOR_QUEUE") or 20))
+        self._async_queue = collections.deque()   # 待启动作业（层 1）
+        self._async_weight_active = 0
+        self._async_lane_last = None              # 层 3 公平出队游标
+        self._async_dedup: dict[Any, str] = {}    # 层 2：在途键 → run_id
+        self._async_dedup_rev: dict[str, Any] = {}
+        # 提交即登记（job.json 由 _async_submit 入队即落盘——R5 消灭提交/
+        # 轮询竞态；此字典降级为内存快查）
+        self._async_jobs: dict[str, str] = {}
+        # 启动收尸（R6）：上一进程留下的 queued/running 作业标 failed
+        self._reap_orphan_jobs()
         if Path(self.data_config_path).exists():
             # 启动失败不致命：保留 configError 上报，服务保持可用（状态可自愈）。
             self._reload_config_file()
@@ -592,6 +856,30 @@ class Bridge:
             ok = isinstance(ddp, dict) and all(ddp.get(k) == v for k, v in ds.items())
         return ok
 
+    def _inspiration_origin(self, source_hash: str | None, lane: str) -> str:
+        """WS-C 灵感源判定（2026-09-01 规划书）：证据强度排序——
+
+        - random：source_hash 命中本线 explore 幸存者哈希台账（生成器
+          返回的原文直进管线；agent 改造过的哈希不同，如实回落——
+          改造即假设驱动）
+        - literature：本线最新叙事 trail 条目 papers 非空（写入口已
+          校验合法 arxiv_id 列表——文献驱动假设的可审计标记；族内
+          变体继承标记，直到新的无 papers 叙事条目出现）
+        - hypothesis：缺省（含旧条目无键的回读口径）
+        判定失败静默回落 hypothesis（标注不阻断账本）。"""
+        try:
+            if source_hash:
+                bucket = ((read_mining_state(self.state_root).get("lanes") or {})
+                          .get(lane) or {})
+                if source_hash in set(bucket.get("explore_hashes") or []):
+                    return "random"
+            own = own_entries(read_json_list("trail", self.state_root), lane)
+            if own and isinstance(own[-1], dict) and own[-1].get("papers"):
+                return "literature"
+        except Exception:
+            pass
+        return "hypothesis"
+
     def _append_engine_trail(self, env_id: str, source_hash: str, stage: str,
                              result: dict[str, Any], suspects: dict[str, Any] | None):
         """引擎层强制 trail（evaluate 自动记录硬事实，按 (hash, stage, horizon) 去重更新）。
@@ -619,11 +907,15 @@ class Bridge:
                     entries = []
             fp = self._env_full_fingerprint(env_id)
             main_h = self._main_horizon(env_id)
+            # 本线 lane（方案 A 2026-08-31）：条目打标 + 断链检测只对
+            # 本线尾部——双线交错时外线条目既不接链也不截断本线链
+            my_lane = current_lane()
             new_entries = []
-            # 断链检测（2026-08-25 arc 化）：新试验不接当前尾部链 = 机械
-            # 换向事件 → 方向段轮次（arc_rounds）归零。簇试验计数
-            # （cluster_trials=streak）读时计算，断链自然断——两个计数
-            # 器在同一事件上重置，判定谓词同为 _entries_linked。
+            # 断链检测（2026-08-25 arc 化；2026-08-31 lane 化）：新试验
+            # 不接本线尾部链 = 机械换向事件 → 本线方向段轮次（arc_rounds）
+            # 归零。簇试验计数（cluster_trials=streak）读时按线过滤，
+            # 断链自然断——两个计数器在同一事件上重置，判定谓词同为
+            # _entries_linked。
             chain_broke = False
             for source_hash, stage, result, suspects in items:
                 sketch = None
@@ -644,10 +936,21 @@ class Bridge:
                         # (-0.00004,4)=-0.0 曾让 factor_trail_summary 整体
                         # 报错（生产 trail_engine 实测 66 个 -0.0 字面量）
                         sketch = [round(float(x), 4) + 0.0 for x in s]
+                origin = self._inspiration_origin(source_hash, my_lane)
                 entry = {
                     "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
                     "envId": env_id, "source_hash": source_hash, "stage": stage,
                     "horizon": horizon,
+                    "lane": my_lane,
+                    # WS-C 灵感源标注（2026-09-01）：random/literature/
+                    # hypothesis——归因分析可区分假设驱动 vs 随机幸存 vs
+                    # 文献迁移；旧条目无此键读作 hypothesis
+                    "origin": origin,
+                    # S4 署名（2026-09-04 探索相似性防线）：authored =
+                    # 非 random——审计教训 stage≠署名（batch 是工具通道
+                    # 非生成器），origin 的 explore_hashes 台账才是真判据。
+                    # 旧条目无此键读作 True（hypothesis/literature 均手写）
+                    "authored": origin != "random",
                     "fingerprint": fp,
                     "engine_version": __version__,
                     "ic_ir": result.get("ic_ir_train", result.get("ic_ir")) if isinstance(result, dict) else None,
@@ -696,9 +999,25 @@ class Bridge:
                         eh = main_h
                     return eh == norm_new
 
+                prior = [e for e in entries if _same_trial(e)]
                 entries = [e for e in entries if not _same_trial(e)]
-                if entries and isinstance(entries[-1], dict) \
-                        and not _entries_linked(entries[-1], entry):
+                if prior:
+                    # R26（2026-08-31 隔离复审）：重评已有试验（含跨线重评）
+                    # ——条目保留首创线的 lane（B 线重评不改写 A 线的视图/
+                    # 链尾），且重评不是新试验、不参与断链判定（否则 B 线
+                    # 重抽 A 线尾部条目后 A 续写会伪断链、arc 误归零——
+                    # 隔离评审可复现实证）。计价层 (hash,stage,horizon) 全局
+                    # 去重语义不变：同试验全局仍只计一次
+                    entry["lane"] = (prior[-1].get("lane") if isinstance(prior[-1], dict)
+                                     and prior[-1].get("lane") else my_lane)
+                    own_tail = None
+                else:
+                    # 断链只对本线判定：全局尾部是外线条目时不参与——否则
+                    # 双线交错每条新试验都「断链」，arc 归零风暴 + 预算失效
+                    own_tail = next((e for e in reversed(entries)
+                                     if entry_lane(e) == my_lane), None)
+                if own_tail is not None and isinstance(own_tail, dict) \
+                        and not _entries_linked(own_tail, entry):
                     chain_broke = True
                 entries.append(entry)
                 new_entries.append(entry)
@@ -726,9 +1045,10 @@ class Bridge:
             os.replace(str(tmp), str(p))
             if chain_broke:
                 # arc 归零在写盘成功之后（写失败不断链）；归零失败不阻断
-                # trail（下次断链或 reset 补——arc 少归一次零只会更保守）
+                # trail（下次断链或 reset 补——arc 少归一次零只会更保守）。
+                # 只归本线（方案 A）：A 线换向不解锁 B 线预算
                 try:
-                    arc_rounds_bump(self.state_root, reset=True)
+                    arc_rounds_bump(self.state_root, reset=True, lane=my_lane)
                 except Exception:
                     pass
         except Exception as e:
@@ -850,6 +1170,96 @@ class Bridge:
                                             "nu": stats.get("nu"),
                                             "signal_detector": detector,
                                             "recomputed_at_trail": True}
+        # 推理日志镜像（构造面 v7 2026-09-12）：development 评估完成后按
+        # source_hash 机械关联本线 registered 预期条目——引擎只做并置
+        # （预期原文 vs 实测关键数字），不判定；结算由模型 update 写。
+        # journal 任何失败不阻断评估（日志是解释层，评估是事实层）。
+        if stage == "development":
+            try:
+                from . import journal as _journal
+                _journal.note_eval(self.state_root)
+                _dp = result.get("deflated_train")
+                _m = _journal.mirror_hook(
+                    self.state_root, source_hash,
+                    {"ic_ir": result.get("ic_ir_train", result.get("ic_ir")),
+                     "verdict": result.get("verdict"),
+                     "deflated_p": (_dp.get("p") if isinstance(_dp, dict)
+                                    else None),
+                     "red_flags": result.get("red_flags") or None})
+                if _m:
+                    result["journal_mirror"] = _m
+                    # 方案B 批次1(2026-09-13):注册台账落盘——机制层成员资格
+                    # + 时机证据(registered_ts ≤ eval_ts)+ 复杂度指纹。
+                    # 独立于 journal 生命周期(reset 不动),jsonl 追加
+                    try:
+                        import ast as _ast
+                        _tree = _ast.parse(source)
+                        _ops = sum(1 for _n in _ast.walk(_tree)
+                                   if isinstance(_n, _ast.Call))
+                        _d = 0
+
+                        def _dep(n, k):
+                            nonlocal _d
+                            _d = max(_d, k)
+                            for _c in _ast.iter_child_nodes(n):
+                                _dep(_c, k + 1)
+                        _dep(_tree, 0)
+                        _rows = [{
+                            "ts_registered": e.get("registered_ts"),
+                            "ts_eval": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "source_hash": source_hash,
+                            "journal_id": e.get("id"),
+                            "ops": _ops, "depth": _d,
+                            "journal_lane": _journal.resolve_journal_lane(),
+                        } for e in _m.get("entries", [])]
+                        _lp = Path(self.state_root) / "registered_ledger.jsonl"
+                        with state_write_lock(self.state_root):
+                            with open(_lp, "a", encoding="utf-8") as _f:
+                                for _r in _rows:
+                                    _f.write(json.dumps(
+                                        _r, ensure_ascii=False) + "\n")
+                    except Exception as _le:
+                        try:
+                            sys.stderr.write(
+                                f"[registered_ledger] 落盘失败(不阻断评估): {_le}\n")
+                        except Exception:
+                            pass
+                # 方案B 批次1 影子(2026-09-13):注册候选附机制层价——只算只报,
+                # 门不变(翻转待影子期分布审查)。α_layer=0.0253(层间 Šidák)。
+                # 放在台账落盘之后:首评即有层成员资格(镜像命中=注册证据)
+                try:
+                    if source_hash in self._registered_hashes():
+                        _dp = result.get("deflated_train")
+                        _h = result.get("horizon")
+                        _h = int(_h) if isinstance(_h, (int, float)) and _h > 0 else None
+                        if isinstance(_dp, dict) and _dp.get("sr_hat") is not None:
+                            st_m, tsd_m = self._trial_stats(
+                                source_hash, _h, env_id, stratum="mechanism")
+                            pool_m, _det = self._resolve_pool_std(env_id, tsd_m, _h)
+                            if pool_m:
+                                p_m = _dsr_p_from_stats(
+                                    _dp.get("sr_hat"), _dp.get("skew"), _dp.get("kurt"),
+                                    _dp.get("n_obs"), st_m["bar_sigma"], pool_m)
+                                _dp["shadow_stratum"] = {
+                                    "p_mechanism": p_m,
+                                    "bar_sigma_mechanism": float(st_m["bar_sigma"]),
+                                    "n_trials_mechanism": int(st_m["n_trials"]),
+                                    "pool_std": pool_m,
+                                    "alpha_layer": 0.0253,
+                                    "note": ("影子口径(批次1):journal 预注册候选的机制层"
+                                             "价——M 按台账注册试验计。当前不进门;翻转"
+                                             "由影子期分布审查拍板"),
+                                }
+                except Exception as _se:
+                    try:
+                        sys.stderr.write(f"[shadow_stratum] 失败(不阻断): {_se}\n")
+                    except Exception:
+                        pass
+            except Exception as _e:
+                try:
+                    sys.stderr.write(f"[journal] 镜像失败(不阻断评估): {_e}\n")
+                except Exception:
+                    pass
         # 自主性停走指令（2026-08-21）：evaluate 响应必带——agent 在评估
         # 后的"总结/停顿"倾向最强，loop.state=running 时必须继续内循环
         try:
@@ -939,6 +1349,17 @@ class Bridge:
             "registry.submit": self._registry_submit,
             "registry.update": self._registry_update,
             "report.export": self._report_export,
+            "book.backfill": self._book_backfill,
+            "journal.read": self._journal_read,
+            "journal.append": self._journal_append,
+            "journal.update": self._journal_update,
+            "journal.distill": self._journal_distill,
+            "journal.stats": self._journal_stats,
+            "standby.view": self._standby_view,
+            "standby.combine": self._standby_combine,
+            "incubate.enqueue": self._incubate_enqueue,
+            "incubate.status": self._incubate_status,
+            "incubate.judge": self._incubate_judge,
             "arxiv.search": self._arxiv_search,
         }
         fn = table.get(method)
@@ -947,19 +1368,37 @@ class Bridge:
         return fn
 
     def dispatch(self, method: str, params: dict[str, Any]) -> Any:
-        fn = self._method(method)
+        # lane（2026-08-31 方案 A）：请求级并行线身份（共享 bridge 下
+        # = dsh 会话 id；TS 工具层盖入）。意图层状态（pending/族链/arc
+        # 预算）按它隔离，计价层不受影响。单线程 dispatch 内 contextvar
+        # 请求生命周期安全；异步重方法的 trail 写入在轮询请求内完成，
+        # 同样被覆盖。
+        _lane_tok = set_request_lane(resolve_request_lane(params))
+        params = strip_lane_params(params or {})
+        # journal 线名(2026-09-12 双入口修复):DSH 会话 lane=UUID 会把
+        # 日志切成每会话一本;journal_lane 由 TS 层从插件配置盖(基础设施
+        # 事实,非模型可声明),镜像/读写同链解析。剥离防严格参数校验炸
+        from .journal import (reset_request_journal_lane as _rj,
+                              set_request_journal_lane as _sj)
+        _jl = params.pop("journal_lane", None)
+        _jl_tok = _sj(_jl if isinstance(_jl, str) and _jl.strip() else None)
         try:
-            return _lossless(fn(params or {}))
-        except DataError as e:
-            # 用户数据/配置错误统一映射到域错误码（调用方无需感知异常类型）
-            raise BridgeError(-32002, str(e)) from None
-        except BridgeError as e:
-            # W3（2026-08-26 规划书）：infra 失败（-32005 worker 超时/无输出）
-            # 入台账——loop 指令超时纠偏声道的数据源。纯附加遥测：异常原样
-            # re-raise，异常语义零变化
-            if e.code == -32005:
-                self._record_infra_failure(method)
-            raise
+            fn = self._method(method)
+            try:
+                return _lossless(fn(params or {}))
+            except DataError as e:
+                # 用户数据/配置错误统一映射到域错误码（调用方无需感知异常类型）
+                raise BridgeError(-32002, str(e)) from None
+            except BridgeError as e:
+                # W3（2026-08-26 规划书）：infra 失败（-32005 worker 超时/无输出）
+                # 入台账——loop 指令超时纠偏声道的数据源。纯附加遥测：异常原样
+                # re-raise，异常语义零变化
+                if e.code == -32005:
+                    self._record_infra_failure(method)
+                raise
+        finally:
+            _rj(_jl_tok)
+            reset_request_lane(_lane_tok)
 
     def _record_infra_failure(self, method: str) -> None:
         """-32005 基础设施失败台账（stateRoot/tool_failures.json，有界 100、原子写）。
@@ -1041,6 +1480,7 @@ class Bridge:
             "executionMode": self.execution_mode,
             "pythonExecutable": sys.executable,
             "bridgeModulePath": str(Path(__file__).resolve()),
+            "workerRuns": self._recent_runs(),
         }
         if loop is not None:
             result["loop"] = loop
@@ -1265,20 +1705,167 @@ class Bridge:
                 "已符合契约原样使用；手写因子请命名为 factor）")
         return fn
 
-    def _run_worker(self, method: str, source: str, params: dict[str, Any], env) -> Any:
+    def _cached_env_npz(self, env, params: dict) -> Path:
+        """env.npz 内容寻址缓存（层 0b，2026-08-31 计算利用 PLAN）。
+
+        面板不可变——每次评估重复压缩全面板（个股 root 267MB 产物/0.5GB
+        原始，zlib 单线程数十秒）纯浪费且占死 bridge 线程。键 = env 全指纹
+        （数据内容+口径+引擎版本；trail 条目每评必算，无新增成本）。
+        写序：meta 先、npz 后（npz 存在性即读方 commit 判据）；tmp+replace
+        原子，并发写幂等（同字节，store_factor_source 同款）。写成功后清
+        非当前指纹文件（R9 防积累，占用中的删除失败跳过）。指纹不可得 →
+        回退一次性 npz（行为同旧版，用后即删）。"""
+        fp = None
+        try:
+            env_id = self._resolve_env_id(params.get("envId", "primary"))
+            fp = self._env_full_fingerprint(env_id)
+        except Exception:
+            fp = None
+        cache_dir = Path(self.state_root) / "worker_env"
+        from .worker import write_env_npz
+        if not fp:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            npz = cache_dir / f"ephemeral-{os.urandom(6).hex()}.npz"
+            write_env_npz(str(npz), env)
+            return npz
+        # 指纹形如 hash:hash:version——冒号是 Windows 非法文件名字符，清洗
+        fp_file = re.sub(r"[^A-Za-z0-9._-]", "-", str(fp))[:48]
+        npz = cache_dir / f"{fp_file}.npz"
+        meta = cache_dir / f"{fp_file}.npz.meta.json"
+        if not npz.exists():
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                tmp_base = cache_dir / f".tmp-{os.urandom(4).hex()}.npz"
+                write_env_npz(str(tmp_base), env)
+                os.replace(str(tmp_base.with_suffix(
+                    tmp_base.suffix + ".meta.json")), str(meta))
+                os.replace(str(tmp_base), str(npz))   # npz 最后 = commit
+            except Exception:
+                # 缓存写失败不阻断评估：退回一次性 npz
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                ephem = cache_dir / f"ephemeral-{os.urandom(6).hex()}.npz"
+                write_env_npz(str(ephem), env)
+                return ephem
+        # R9 清扫（无条件跑——只在写缓存时扫会让 ephemeral/tmp 无限滞留）：
+        # 非当前指纹缓存即时清；ephemeral-*/.tmp-* 可能正被并发 worker 读，
+        # 按 1h 年龄清；占用删除失败跳过（下次再清）
+        try:
+            now = time.time()
+            for f in cache_dir.iterdir():
+                if f in (npz, meta):
+                    continue
+                try:
+                    name = f.name
+                    if name.endswith(".smoke.npz") or name.endswith(".smoke.npz.meta.json"):
+                        # 效率编译层（2026-09-01）：烟测子面板缓存——不随
+                        # 全量指纹清扫（不同 env 的 smoke npz 按 1 天年龄清）
+                        if now - f.stat().st_mtime > 86400:
+                            f.unlink()
+                        continue
+                    if name.startswith(".tmp-") or name.startswith("ephemeral-"):
+                        if now - f.stat().st_mtime > 3600:
+                            f.unlink()
+                    elif f.suffix == ".npz" or name.endswith(".npz.meta.json"):
+                        f.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        return npz
+
+    # ---- 效率编译层（2026-09-01）：α 烟测门 + 自动 njit + LLM 重写 ----
+    # 设计依据 tmp/numba-spike/spike-report.md（生产面板实测）：
+    # 纯标量嵌套循环 njit 36-797x、等价 4/4；算法慢类（T^2*N）njit 负优化、
+    # α 拟合可识别；mimo-v2.5 严格等价重写 T3 一发过、谎报 EXACT 被验证兜住。
+
+    def _smoke_env_npz(self, env, params: dict) -> Path | None:
+        """小子面板 npz（512x128，~0.5MB）按 env 指纹缓存（worker_env/
+        <fp>.smoke.npz）。烟测/重写验证共用；写失败返回 None=门放行。"""
+        try:
+            env_id = self._resolve_env_id(params.get("envId", "primary"))
+            fp = self._env_full_fingerprint(env_id)
+        except Exception:
+            fp = None
+        from .smoke import SMOKE_COLS, SMOKE_ROWS, env_subsample
+        from .worker import write_env_npz
+        cache_dir = Path(self.state_root) / "worker_env"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if not fp:
+            npz = cache_dir / f"ephemeral-smoke-{os.urandom(6).hex()}.npz"
+            try:
+                write_env_npz(str(npz), env_subsample(env, SMOKE_ROWS, SMOKE_COLS))
+            except Exception:
+                return None
+            return npz
+        fp_file = re.sub(r"[^A-Za-z0-9._-]", "-", str(fp))[:48]
+        npz = cache_dir / f"{fp_file}.smoke.npz"
+        if not npz.exists():
+            try:
+                sub = env_subsample(env, SMOKE_ROWS, SMOKE_COLS)
+                tmp = cache_dir / f".tmp-smoke-{os.urandom(4).hex()}.npz"
+                write_env_npz(str(tmp), sub)
+                # npz 后写 = commit（write_env_npz 同步产出 meta，一并挪走）
+                os.replace(str(tmp.with_suffix(tmp.suffix + ".meta.json")),
+                           str(npz) + ".meta.json")
+                os.replace(str(tmp), str(npz))
+            except Exception:
+                return None
+        return npz
+
+    def _run_worker(self, method: str, source: str, params: dict[str, Any], env,
+                    run_id: str | None = None, run_meta: dict | None = None,
+                    async_mode: bool = False,
+                    run_dir: Path | None = None,
+                    timeout_s: float | None = None) -> Any:
         """在独立 worker 子进程执行用户 factor 代码（隔离 + 超时）。
 
-        序列化 env → npz → 子进程 run_request → 结构化结果回传。
-        超时杀进程（Windows 用 taskkill /T 杀进程树）；结果文件解析失败 = INFRASTRUCTURE 错误。
+        序列化 env → npz（层 0b 起为指纹缓存复用）→ 子进程 run_request →
+        结构化结果回传。超时杀进程（Windows 用 taskkill /T 杀进程树）；
+        结果文件解析失败 = INFRASTRUCTURE 错误。
+        run_dir：异步队列路径传入提交时已建好的 worker_runs/<job_id>/
+        （job.json 已入队落盘）；同步路径不传 → mkdtemp 如旧。
+        timeout_s：可选墙钟覆盖（烟测调用 60s——兼抓死循环实现）。
         """
+        # 效率编译层入口钩子（2026-09-01）：①严格等价重写透明换用（所有
+        # 执行的单一 choke point——同步/异步/因果门内嵌全覆盖；hash 与
+        # registry 语义锚定 agent 的原源码，重写只是引擎侧加速实现，溯源
+        # 走 diagnosis.perf.rewrite_provenance）②烟测门（fail-open）。
+        if method != "factor.smoke":
+            source = self._apply_rewrite(method, source, params)
+            self._smoke_gate(method, source, params, env)
         run_root = Path(self.state_root) / "worker_runs"
         run_root.mkdir(parents=True, exist_ok=True)
-        wdir = Path(tempfile.mkdtemp(dir=str(run_root)))
+        if run_dir is not None:
+            wdir = Path(run_dir)
+            wdir.mkdir(parents=True, exist_ok=True)
+        else:
+            wdir = Path(tempfile.mkdtemp(dir=str(run_root)))
+        # C2（修正案 A）：重方法（composite/batch）成功后保留 run 目录
+        # （out.json 可收尸——客户端超时/弃单不丢结果，2026-08-28 事故
+        # 的直接止血）；异步作业连失败墓志也保留。轻方法维持即用即删。
+        if run_id is None and method in self._HEAVY_METHODS:
+            run_id = f"sync-{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}"
+        keep_run = False
+        if run_id:
+            try:
+                self._job_json_write(wdir, {
+                    "job_id": run_id, "method": method, "status": "running",
+                    "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "mode": "async" if async_mode else "sync",
+                    # R32 补（当夜轨迹审计发现）：此重写用全新 dict——若不
+                    # 显式盖 phase 会把因果门留下的 causality_check 抹掉，
+                    # 轮询侧又看不到阶段了
+                    "phase": "evaluating",
+                    "pid": os.getpid(),
+                    **(run_meta or {})})
+            except Exception:
+                run_id = None
         job = None
         try:
-            from .worker import write_env_npz
-            npz = wdir / "env.npz"
-            write_env_npz(str(npz), env)
+            # factor.smoke 用小子面板 npz（bridge 侧已切好），绝不为烟测
+            # 序列化全量面板
+            npz = (Path(params["_smoke_npz"]) if params.get("_smoke_npz")
+                   else self._cached_env_npz(env, params))
 
             req = {
                 "method": method,
@@ -1302,8 +1889,11 @@ class Bridge:
             if "site-packages" not in src_dir:
                 env_os["PYTHONPATH"] = src_dir + os.pathsep + env_os.get("PYTHONPATH", "")
 
-            # P1/D3：墙钟上限按声明份额伸缩（jobs=DSH_FACTOR_JOBS，默认满核≈base）
-            timeout_s = effective_wall_timeout(base_s=self.worker_timeout_ms / 1000.0)
+            # P1/D3：墙钟上限按声明份额伸缩（jobs=DSH_FACTOR_JOBS，默认满核≈base）；
+            # 效率编译层：timeout_s 显式覆盖（烟测 60s）
+            timeout_s = (float(timeout_s) if timeout_s
+                         else effective_wall_timeout(
+                             base_s=self.worker_timeout_ms / 1000.0))
             # P3：batch 的 CPU 预算按并行度放大——JOB_TIME/RLIMIT 是进程
             # 树累计（N 个池子进程各烧一份），不放大会被提前击杀；
             # 墙钟上限不放大（并行本就是为了在墙钟内装更多计算）
@@ -1317,6 +1907,15 @@ class Bridge:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, env=env_os, cwd=str(run_root),
+                # R31（2026-08-31 生产双实证）：worker 绝不继承宿主控制台——
+                # 控制台上的 Ctrl+C/控制事件（宿主重启、宿主侧 pwsh 等待被
+                # 取消）会打到同控制台的每个进程，两次击杀在途 worker
+                # （rc=0xC000013A STATUS_CONTROL_C_EXIT + KeyboardInterrupt
+                # traceback）。CREATE_NO_WINDOW = 无控制台可被打：worker 是
+                # 纯计算进程，stdio 全走管道，宿主重启时由 Job Object
+                # KILL_ON_JOB_CLOSE 兜底（那是干净的生命周期语义）
+                creationflags=(subprocess.CREATE_NO_WINDOW
+                               if sys.platform == "win32" else 0),
                 preexec_fn=posix_limit_preexec(cpu_s=cpu_budget,
                                                mem_bytes=worker_mem_bytes()))
             # P2：OS 级硬限额（父进程被饿死时仍确定性击杀；内存限额防
@@ -1359,17 +1958,31 @@ class Bridge:
                         "降低并行（设 DSH_FACTOR_JOBS，多会话加总 ≤ 核数）。"
                         "这是基础设施事件——不修实现、不换假设，也不作为对因子的判定。")
                 # 真慢（cpu_dense/borderline/数据不可读保守处理）：四要素
-                # 错误（W1 2026-08-26）——存活/零写入/根因修法/纪律
+                # 错误（W1 2026-08-26）——存活/零写入/根因修法/纪律。
+                # 根因按方法分流（2026-08-29 生产事故：audit 超时被硬指
+                # 「因子实现慢」，agent 对照 6.5s 的 evaluate 后白重写了
+                # 两遍源码——audit 的重头是方法自身的多遍面板机器）。
+                if method == "factor.evaluate":
+                    cause = (f"最可能根因：factor(env) 单次计算超过 {timeout_s:.0f}s，"
+                             "典型是 per-symbol Python 循环；修法 = 向量化"
+                             "（df.groupby(\"symbol\") 的 shift/rolling，或 unstack "
+                             "到宽表做矩阵运算）。")
+                else:
+                    cause = (f"根因分流：{method} 的成本 = factor(env) × 方法自身的"
+                             "多遍面板机器（audit ≈ 因果探针 + 200 次列置换 + 内嵌"
+                             "全量 evaluate；noise_test = m 个噪声世界重算因子）。"
+                             "先用 factor.evaluate 的 perf.factor_runtime_s 对照："
+                             "evaluate 也慢 → 因子实现慢，向量化；evaluate 快而"
+                             "本方法超时 → 是机器遍历成本，勿重写因子——拆小验证"
+                             "（减置换/减世界）或 async 提交。")
                 cpu_note = (f"（实测 CPU {verdict['cpu_s']:.1f}s / 墙钟 {timeout_s:.0f}s"
                             f"——{verdict['note']}）" if verdict["ratio"] is not None else "")
                 raise BridgeError(
                     -32005,
                     f"worker 超时（>{timeout_s:.0f}s）——{method} 的 worker 子进程已终止"
                     "并清理；bridge 本体未受影响，无需等待恢复，可立即重试。本次调用"
-                    "零写入（registry/trail 均未动，不烧名）。最可能根因：factor(env) "
-                    f"单次计算超过 {timeout_s:.0f}s，典型是 per-symbol Python 循环；"
-                    "修法 = 向量化（df.groupby(\"symbol\") 的 shift/rolling，或 unstack "
-                    "到宽表做矩阵运算）。这是基础设施事件，不是对因子/研究方向的判定"
+                    f"零写入（registry/trail 均未动，不烧名）。{cause}"
+                    "这是基础设施事件，不是对因子/研究方向的判定"
                     f"——修实现，不换假设。{cpu_note}")
 
             if not out_path.exists():
@@ -1385,6 +1998,18 @@ class Bridge:
                 if "pathlib" in tail or "from collections import" in tail:
                     hint = ("｜疑似 site-packages 的 stdlib backport（如 pathlib 1.0.1）遮蔽内置库："
                             "pip uninstall pathlib 后重启会话")
+                # R32（2026-08-31 生产双实证）：0xC000013A=STATUS_CONTROL_C_EXIT
+                # ——worker 被宿主控制台事件击杀（重启宿主/取消 pwsh 等待时
+                # Ctrl+C 泄漏到同控制台进程），伴随 KeyboardInterrupt traceback
+                # 即实锤。不是内存/限额/因子问题——先于 limit_note 给出，防
+                # agent 误诊（当日实测被误读成「内存问题」）
+                if proc.returncode == 0xC000013A or "KeyboardInterrupt" in tail:
+                    hint = ("｜worker 被宿主控制台事件终止（rc=0xC000013A/"
+                            "KeyboardInterrupt——宿主重启或宿主侧终端操作 Ctrl+C "
+                            "泄漏所致，R31 起 worker 已隔离控制台，新代码下不应"
+                            "再现）。不是因子实现/内存/限额问题；本次零写入，"
+                            "原样重试同一因子即可")
+                    limit_note = ""
                 raise BridgeError(
                     -32005,
                     f"worker 无结果输出(rc={proc.returncode}): {tail}{hint}{limit_note}"
@@ -1397,13 +2022,1000 @@ class Bridge:
                 if "test 已被消费" in str(msg) or "not supported" in str(msg):
                     raise BridgeError(-32003, str(msg))
                 raise BridgeError(-32603, str(msg))
+            if run_id:
+                self._finalize_kept_run(wdir, run_id, method)
+                keep_run = True
             return result["result"]
         finally:
             # P2：释放 job 句柄（job 内已无进程，无副作用；父崩溃时 OS 按
-            # KILL_ON_JOB_CLOSE 兜底杀残余）
+            # KILL_ON_JOB_CLOSE 兜底杀残余）。C2：保目录的分支不删——
+            # async_mode 连失败墓志都保留（由 _async_run 补记 failed）
             detach_worker_limits(job)
-            import shutil
-            shutil.rmtree(str(wdir), ignore_errors=True)
+            if not keep_run and not async_mode:
+                shutil.rmtree(str(wdir), ignore_errors=True)
+
+    # ---- C2（修正案 A 2026-08-28）：重方法异步化 + run 目录收尸 ----
+
+    def _dedup_key(self, method: str, source: str, params: dict):
+        """层 2 在途去重键：方法+环境+源指纹+阶段+horizon。同键在途 → 复用
+        同一 job_id（消灭「超时→重试」风暴的重复计算；同因子=同试验，
+        trail 归提交线、n_trials 不变——跨线去重是特性不是泄漏）。"""
+        try:
+            src_key = source_fingerprint(source) if source else ""
+            if not src_key:
+                # batch 的 source 恒为空串（多 source 方法）——不去重键里
+                # 放 sources 指纹的话，所有 batch 提交共用一个键：第二个
+                # batch 在途时会并入第一个的作业、拿到错误结果（全量排查
+                # 2026-08-31 发现）
+                srcs = params.get("sources")
+                if isinstance(srcs, dict):
+                    src_key = "batch:" + source_fingerprint(json.dumps(
+                        srcs, sort_keys=True, ensure_ascii=False))
+            # composite 的成分表在 params 不在 source（R22，2026-08-31 复审
+            # 发现）：同 overlay 不同成分 = 不同经济赌注——键里不并成分指纹
+            # 的话，成分扫描（固定 overlay 换成分表，C1/C2 的标准工作流）
+            # 里第二个 composite 会并入第一个的作业、拿到错误成分的结果
+            ing = params.get("ingredients")
+            if isinstance(ing, dict) and ing:
+                src_key = (f"{src_key}|ing:{source_fingerprint(json.dumps(ing, sort_keys=True, ensure_ascii=False))}"
+                           if src_key else
+                           "ing:" + source_fingerprint(json.dumps(ing, sort_keys=True, ensure_ascii=False)))
+            return (method,
+                    self._resolve_env_id(params.get("envId", "primary")),
+                    src_key,
+                    str(params.get("stage", "development")),
+                    str(params.get("horizon", "")))
+        except Exception:
+            return None
+
+    def _dedup_release(self, run_id: str) -> None:
+        with self._async_lock:
+            key = self._async_dedup_rev.pop(run_id, None)
+            if key is not None and self._async_dedup.get(key) == run_id:
+                del self._async_dedup[key]
+
+    def _job_json_write(self, run_dir: Path, payload: dict) -> None:
+        """job.json 原子写（tmp+replace）——入队即落盘（R5）后，轮询永不扑空。
+        replace 带重试：Windows 下目标正被并发读者打开（轮询 read_text /
+        status 扫描）时 os.replace 立即 PermissionError，重试几十毫秒内让开
+        （2026-08-31 实证：撞上一次 = 作业永卡 running + job.json.tmp 残留）。"""
+        jp = run_dir / "job.json"
+        tmp = jp.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        last_err: Exception | None = None
+        for _ in range(10):
+            try:
+                os.replace(str(tmp), str(jp))
+                return
+            except PermissionError as e:
+                last_err = e
+                time.sleep(0.02)
+        raise last_err if last_err else RuntimeError("job.json replace 失败")
+
+    # ---- 效率编译层（2026-09-01）：门 / 重写调度 / optimizer 缓存 ----
+
+    def _optimizer_load(self) -> dict:
+        if self._optimizer_cache is None:
+            try:
+                p = Path(self.state_root) / "optimizer_cache.json"
+                self._optimizer_cache = (json.loads(p.read_text(encoding="utf-8"))
+                                         if p.exists() else {})
+            except Exception:
+                self._optimizer_cache = {}
+        return self._optimizer_cache
+
+    def _optimizer_put(self, fp: str, entry: dict) -> None:
+        c = self._optimizer_load()
+        c[fp] = entry
+        while len(c) > 128:          # FIFO 有界（eval_cache 惯例）
+            c.pop(next(iter(c)))
+        try:
+            p = Path(self.state_root) / "optimizer_cache.json"
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(p))
+        except Exception:
+            pass
+        self._optimizer_cache = c
+
+    def _maybe_rewrite_source(self, source: str) -> tuple[str, dict | None]:
+        """optimizer cache 命中严格等价重写时换用（引擎侧透明加速）。hash/
+        registry/eval_cache 语义全部锚定 agent 的原源码——重写与 njit 同类：
+        验证过的等价实现变换，不是语义变更。返回 (source, provenance|None)。"""
+        if not source:
+            return source, None
+        try:
+            from .discipline import source_fingerprint
+            fp = source_fingerprint(source)
+        except Exception:
+            return source, None
+        with self._optimizer_lock:
+            entry = self._optimizer_load().get(fp)
+        if (isinstance(entry, dict) and entry.get("status") == "ok"
+                and entry.get("rewritten_source")):
+            prov = {"rewritten_from": fp, "rewritten_fp": entry.get("rewritten_fp"),
+                    "verifier": "allclose(rtol=1e-6)", "model": entry.get("model"),
+                    "engine": "rewrite:llm-v1"}
+            return entry["rewritten_source"], prov
+        return source, None
+
+    def _apply_rewrite(self, method: str, source: str, params: dict) -> str:
+        """_run_worker 入口的统一换用点：单源 + batch sources + composite
+        ingredients。fail-open：任何异常原样放行。"""
+        try:
+            source, prov = self._maybe_rewrite_source(source)
+            if prov:
+                params["engine_rewrite"] = prov
+            srcs = params.get("sources")
+            if isinstance(srcs, dict) and srcs:
+                for k in list(srcs):
+                    s2, p2 = self._maybe_rewrite_source(str(srcs[k]))
+                    if p2:
+                        srcs[k] = s2
+                        params.setdefault("engine_rewrites", {})[k] = p2
+            ings = params.get("ingredients")
+            if isinstance(ings, dict) and ings:
+                for k in list(ings):
+                    if isinstance(ings[k], str):
+                        s2, p2 = self._maybe_rewrite_source(ings[k])
+                        if p2:
+                            ings[k] = s2
+            return source
+        except Exception:
+            return source
+
+    def _run_smoke_worker(self, source: str, sp: dict, env, timeout_s: float):
+        """烟测/验证 worker 的统一出口（并发复审 F2）：并发信号量（2）限
+        瞬时 smoke 子进程数——burst 下不超出权重核算的进程超订；等待上限
+        120s，超时抛 infra 错（调用侧 fail-open 放行）。"""
+        if not self._smoke_spawn_sem.acquire(timeout=120.0):
+            raise BridgeError(-32005, "烟测并发位繁忙（等 120s 未获得）——本次跳过烟测")
+        try:
+            return self._run_worker("factor.smoke", source, sp, env,
+                                    timeout_s=timeout_s)
+        finally:
+            self._smoke_spawn_sem.release()
+
+    @staticmethod
+    def _member_label(source: str, sources) -> str | None:
+        """批成员名反查（复审 F5）：按源码字符串精确匹配 sources dict 的
+        value。同名源码多成员时返回首个——足够点名用。"""
+        if isinstance(sources, dict):
+            s = str(source)
+            for k, v in sources.items():
+                if str(v) == s:
+                    return str(k)
+        return None
+
+    def _enforce_causality_member(self, source: str, env, env_id, sources):
+        """批成员因果门包裹：A 类硬拒/烟测门拒绝带上成员名——批量场景下
+        agent 需要知道是哪个成员被拒（复审 F5）。单源路径不经过此包裹。"""
+        try:
+            return self._enforce_causality(source, env, env_id)
+        except BridgeError as e:
+            lbl = self._member_label(source, sources)
+            if lbl:
+                raise BridgeError(e.code, f"批成员「{lbl}」: {e}") from None
+            raise
+
+    def _smoke_gate(self, method: str, source: str, params: dict, env) -> None:
+        """α 烟测门（fail-open——门自身任何异常放行，新层绝不破坏既有评估）：
+        双尺寸实测外推超预算 → -32003 零烧名拒绝（附实测数字/循环行号/
+        向量化指导/自动重写状态）；njit 可救 → params["smoke_engine"]。
+        并发语义（复审 F1）：同 key 后到者等待先来者的烟测结果（Event），
+        不重复 spawn；先来者失败后到者放行。"""
+        if not self._smoke_enabled:
+            return
+        try:
+            if method not in self._SMOKE_METHODS:
+                return
+            cells = int(getattr(env, "T", 0) or 0) * int(getattr(env, "N", 0) or 0)
+            if cells < self._smoke_min_cells or not source:
+                return
+            from .discipline import source_fingerprint
+            from .smoke import SMOKE_TIMEOUT_S, classify_gate
+            src_fp = source_fingerprint(source)
+            try:
+                env_fp = self._env_full_fingerprint(
+                    self._resolve_env_id(params.get("envId", "primary")))
+            except Exception:
+                env_fp = None
+            key = (src_fp, env_fp if env_fp else cells)
+            ev: threading.Event | None = None
+            owner = False
+            with self._optimizer_lock:
+                raw = self._smoke_cache.get(key)
+                if raw is None:
+                    ev = self._smoke_inflight.get(key)
+                    if ev is None:
+                        ev = threading.Event()
+                        self._smoke_inflight[key] = ev
+                        owner = True
+            if raw is None and not owner:
+                ev.wait(timeout=SMOKE_TIMEOUT_S + 60.0)
+                raw = self._smoke_cache.get(key)
+                if raw is None:
+                    return   # 先来者未产出结果（失败/被杀）——fail-open 放行
+            if raw is None:
+                assert ev is not None
+                try:
+                    smoke_npz = self._smoke_env_npz(env, params)
+                    if smoke_npz is None or not Path(smoke_npz).exists():
+                        return
+                    sp = {"mode": "gate", "envId": params.get("envId", "primary"),
+                          "full_cells": cells, "_smoke_npz": str(smoke_npz)}
+                    try:
+                        raw = self._run_smoke_worker(source, sp, env, SMOKE_TIMEOUT_S)
+                    except BridgeError as e:
+                        if "worker 超时" in str(e):
+                            # 烟测自身超时 = 死循环/极端非向量化（60s 小面板没跑完）
+                            raw = {"timeout": True}
+                        else:
+                            return   # 含并发位繁忙/基础设施问题——fail-open
+                    if len(self._smoke_cache) > 256:
+                        self._smoke_cache.clear()
+                    self._smoke_cache[key] = raw
+                finally:
+                    with self._optimizer_lock:
+                        self._smoke_inflight.pop(key, None)
+                    ev.set()
+            if raw.get("interp_error"):
+                return   # 小面板跑不起来（窗口长度等）——放行让正式调用报真错
+            budget_s = effective_wall_timeout(base_s=self.worker_timeout_ms / 1000.0)
+            if raw.get("timeout"):
+                verdict = {"verdict": "reject", "reason": "hang", "alpha": None,
+                           "est_full_s": None, "mult": None,
+                           "projected_s": None, "budget_s": round(budget_s)}
+            else:
+                verdict = classify_gate(raw, method, params, budget_s)
+            slim = {k: verdict.get(k) for k in
+                    ("verdict", "alpha", "est_full_s", "projected_s", "budget_s")
+                    if verdict.get(k) is not None}
+            if slim:
+                params["smoke_telemetry"] = slim
+            if verdict["verdict"] == "njit":
+                params["smoke_engine"] = "njit"
+                return
+            if verdict["verdict"] == "pass":
+                return
+            # 复审 F3：先入队拿到真实状态，再拼拒绝消息（消息与作业状态一致）
+            rw_status = self._maybe_enqueue_rewrite(source, raw, verdict, env,
+                                                    params, method)
+            raise BridgeError(-32003,
+                              self._smoke_reject_message(source, raw, verdict,
+                                                         rw_status))
+        except BridgeError:
+            raise
+        except Exception:
+            return   # fail-open：门 bug 不阻断评估
+
+    def _smoke_reject_message(self, source: str, raw: dict, v: dict,
+                              rw_status: str) -> str:
+        parts = ["拒绝评估（烟测门·实测超预算——零大面板计算、零 trial、不烧名）："]
+        if raw.get("timeout"):
+            parts.append("小子面板 60s 内未完成——实现疑似死循环或极端非向量化。")
+        else:
+            alpha = v.get("alpha")
+            alg = ("（α>1.4：算法复杂度超线性——向量化救不了，必须重排算法，"
+                   "如把逐步重算改为前缀/缓存结构）" if (alpha or 0) > 1.4
+                   else "（常数慢——向量化即可）")
+            parts.append(f"实测 {raw.get('small_cells')} 格 {raw.get('t_small_s')}s / "
+                         f"{raw.get('smoke_cells')} 格 {raw.get('t_smoke_s')}s → "
+                         f"缩放指数 α={alpha}{alg}")
+            parts.append(f"全面板外推单次 ≈{v.get('est_full_s')}s × 本方法需跑 "
+                         f"{v.get('mult')} 遍 ≈ {v.get('projected_s')}s > "
+                         f"预算 {v.get('budget_s')}s")
+        nj = raw.get("njit") or {}
+        if nj.get("compiled") and not nj.get("equiv"):
+            parts.append("numba 自动编译可编译但与解释版数值不等价——已弃用。")
+        elif nj.get("available") and not nj.get("compiled"):
+            parts.append(f"numba 不可编译（{str(nj.get('error'))[:80]}）——含 "
+                         "numba 不支持的写法（pandas 对象/nan 系算子等）。")
+        try:
+            from .discipline import scan_inefficiency
+            ineff = scan_inefficiency(source)
+            if ineff.get("class_b"):
+                lines = ", ".join(f"L{h.get('line')}" for h in ineff["class_b"][:4])
+                parts.append(f"检测到的循环：{lines}——优先 rolling/ewm/shift/"
+                             "cumsum/矩阵广播替代逐 cell 循环")
+        except Exception:
+            pass
+        parts.append(self._rewrite_status_text(source, rw_status))
+        parts.append("这是实现效率问题，不是对研究方向的判定——修正后重交同一假设即可。")
+        return "\n".join(parts)
+
+    def _rewrite_status_text(self, source: str, status: str) -> str:
+        """拒绝消息里的重写层状态段。status 来自 _maybe_enqueue_rewrite 的
+        真实返回（复审 F3：消息不再先斩后奏）。"""
+        from . import rewrite as rw
+        if status == "disabled" or rw.rewrite_config() is None:
+            return ("引擎自动重写层未配置（需 DSH_FACTOR_REWRITE_API_KEY 或 "
+                    "OPENCODE_GO_API_KEY）——请自行向量化后重交。")
+        if status == "submit_failed":
+            return ("自动重写作业提交失败（队列可能已满——status 的 workerRuns "
+                    "可查在途/排队）——请自行向量化后重交；稍后重交本源码会重新触发。")
+        if status == "inflight":
+            return ("自动重写进行中（约 1-3 分钟）——稍后**原样重交本源码**，"
+                    "引擎将透明换用严格等价的向量化版本。")
+        try:
+            from .discipline import source_fingerprint
+            fp = source_fingerprint(source)
+        except Exception:
+            fp = None
+        with self._optimizer_lock:
+            entry = self._optimizer_load().get(fp) if fp else None
+        if status == "cached":
+            # 缓存已有结论仍被拒 = 换用后的重写版对本方法（乘数更高）也超预算
+            if isinstance(entry, dict) and entry.get("status") == "ok":
+                return ("本源码已有严格等价的重写版，但对当前方法仍超预算——"
+                        "重交无益，请进一步重排算法（消除超线性/减少计算量）。")
+            return (f"自动重写已试未果（{str((entry or {}).get('note'))[:120]}）——"
+                    "请自行重写：向量化（rolling/ewm/广播）或重排算法消除超线性。")
+        # enqueued / unknown
+        return ("已自动提交重写作业（强模型重写+严格等价验证，约 1-3 分钟）——"
+                "稍后原样重交本源码即可；或自行向量化立即重交。")
+
+    def _maybe_enqueue_rewrite(self, source, raw, verdict, env, params,
+                               method: str) -> str:
+        """C-verdict 时自动排重写作业（权重 1 走现有队列；网络等待为主不
+        占核）。在途/已有结论（ok/failed）不重复烧模型。
+        返回真实状态（复审 F3）：enqueued / inflight / cached（含 ok/failed
+        细节由 _rewrite_status_text 再查）/ disabled / submit_failed /
+        unknown——调用方按此拼拒绝消息。"""
+        from . import rewrite as rw
+        if rw.rewrite_config() is None:
+            return "disabled"
+        try:
+            from .discipline import source_fingerprint
+            fp = source_fingerprint(source)
+        except Exception:
+            return "unknown"
+        with self._optimizer_lock:
+            if fp in self._rewrite_inflight:
+                return "inflight"
+            if isinstance(self._optimizer_load().get(fp), dict):
+                return "cached"
+            self._rewrite_inflight.add(fp)
+        try:
+            profile = (f"实测 {raw.get('small_cells')} 格 {raw.get('t_small_s')}s / "
+                       f"{raw.get('smoke_cells')} 格 {raw.get('t_smoke_s')}s，"
+                       f"alpha={verdict.get('alpha')}，全面板外推单次 "
+                       f"{verdict.get('est_full_s')}s；触发方法 {method}")
+            env_id = params.get("envId", "primary")
+            self._async_submit(
+                "engine.rewrite", source,
+                {"envId": env_id, "rewrite_profile": profile,
+                 "rewrite_method": method},
+                env, env_id,
+                extra_meta={"rewrite": True, "orig_fp": fp,
+                            "lane": current_lane()})
+            return "enqueued"
+        except Exception:
+            with self._optimizer_lock:
+                self._rewrite_inflight.discard(fp)
+            return "submit_failed"
+
+    def _run_rewrite_job(self, item: dict) -> None:
+        """engine.rewrite 作业主体（_async_run 分支进入，不走 _run_worker）：
+        LLM 重写（≤2 次尝试，失败带错误反馈重试）→ 安全扫描 → 烟测 worker
+        子进程内严格等价验证 → 投影进预算才采纳（仍超预算的重写会被门再拒
+        = 死循环，不采纳）→ optimizer_cache；失败也记录（同类源码不重烧）。"""
+        from . import rewrite as rw
+        from .smoke import extrapolate, fit_alpha, method_cost, noise_budget_s
+        from .discipline import source_fingerprint
+        run_id = item["run_id"]
+        run_dir = Path(item["run_dir"])
+        source = item["source"]
+        params = item["params"]
+        env = item["env"]
+        fp = (item["run_meta"].get("orig_fp") or source_fingerprint(source))
+        summary: dict = {"orig_fp": fp, "model": None}
+        ok = False
+        try:
+            cfg = rw.rewrite_config()
+            if cfg is None:
+                summary["status"] = "disabled"
+            else:
+                summary["model"] = cfg["model"]
+                base_msg = rw.build_user_message(
+                    source, str(params.get("rewrite_profile") or ""))
+                feedback = None
+                for attempt in (1, 2):
+                    content, usage = rw.call_llm(
+                        cfg, base_msg if feedback is None
+                        else base_msg + "\n\n---\n" + feedback)
+                    declare, code, note = rw.parse_reply(content)
+                    summary[f"a{attempt}"] = {
+                        "declare": declare,
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "note": note[:160]}
+                    if code is None or declare == "CANNOT_PRESERVE":
+                        feedback = f"未给出可用的严格等价重写（declare={declare}）——请再试"
+                        continue
+                    problems = rw.safety_scan(code)
+                    if problems:
+                        feedback = (f"安全扫描拒绝：{problems}——只准 np/pd/math、"
+                                    "禁 import/系统调用")
+                        continue
+                    try:
+                        smoke_npz = self._smoke_env_npz(env, params)
+                        if smoke_npz is None:
+                            vres = {"run_error": "烟测面板不可用"}
+                        else:
+                            vres = self._run_smoke_worker(
+                                code,
+                                {"mode": "verify", "orig_source": source,
+                                 "full_cells": int(env.T) * int(env.N),
+                                 "envId": params.get("envId", "primary"),
+                                 "_smoke_npz": str(smoke_npz)},
+                                env, 120.0)
+                    except BridgeError as e:
+                        vres = {"run_error": str(e)[:200]}
+                    if vres.get("equiv") is True:
+                        alpha_n = fit_alpha(
+                            float(vres.get("t_small_s") or 0.0),
+                            float(vres.get("t_smoke_s") or 0.0),
+                            int(vres.get("small_cells") or 0),
+                            int(vres.get("smoke_cells") or 0))
+                        est_n = extrapolate(
+                            float(vres.get("t_smoke_s") or 0.0),
+                            int(vres.get("smoke_cells") or 0),
+                            int(vres.get("full_cells") or 0), alpha_n)
+                        mult, share = method_cost(
+                            str(params.get("rewrite_method")
+                                or "factor.evaluate"), params)
+                        budget_s = effective_wall_timeout(
+                            base_s=self.worker_timeout_ms / 1000.0)
+                        eff = (noise_budget_s() if share is None
+                               else budget_s * share)
+                        summary["est_full_rewritten_s"] = round(est_n, 1)
+                        if est_n * mult <= eff:
+                            with self._optimizer_lock:
+                                self._optimizer_put(fp, {
+                                    "status": "ok",
+                                    "rewritten_source": code,
+                                    "rewritten_fp": source_fingerprint(code),
+                                    "declare": declare, "model": cfg["model"],
+                                    "est_full_s": round(est_n, 1),
+                                    "verified_at": time.strftime(
+                                        "%Y-%m-%dT%H:%M:%S")})
+                            try:
+                                store_factor_source(code, self.state_root)
+                            except Exception:
+                                pass
+                            summary["status"] = "ok"
+                            ok = True
+                            break
+                        feedback = (f"重写仍超预算（外推 {est_n:.1f}s × {mult} > "
+                                    f"{eff:.0f}s）——需要更彻底的算法重排，请再试")
+                    else:
+                        why = (vres.get("run_error") or vres.get("verify_error")
+                               or (f"等价性失败 shape={vres.get('shape')}"
+                                   if vres.get("equiv") is False
+                                   else str(vres)[:150]))
+                        feedback = (f"你上一版重写未通过验证：{why}——请修正后"
+                                    "重新给出完整重写")
+                if not ok:
+                    summary["status"] = "failed"
+                    note_txt = str((summary.get("a2") or {}).get("note")
+                                   or (summary.get("a1") or {}).get("note")
+                                   or "")[:200]
+                    with self._optimizer_lock:
+                        self._optimizer_put(fp, {
+                            "status": "failed", "note": note_txt,
+                            "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        except Exception as e:  # noqa: BLE001 — 作业线程兜底：失败留痕不炸线程
+            summary["status"] = "error"
+            summary["error"] = f"{type(e).__name__}: {e}"[:200]
+            try:
+                with self._optimizer_lock:
+                    self._optimizer_put(fp, {
+                        "status": "failed", "note": summary["error"],
+                        "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+            except Exception:
+                pass
+        finally:
+            with self._optimizer_lock:
+                self._rewrite_inflight.discard(fp)
+            # done 墓志 + out.json（镜像 _run_worker 成功路径，轮询可见）
+            try:
+                (run_dir / "out.json").write_text(
+                    json.dumps({"ok": True, "result": summary},
+                               ensure_ascii=False), encoding="utf-8")
+                self._finalize_kept_run(run_dir, run_id, "engine.rewrite")
+            except Exception:
+                pass
+
+    def _async_submit(self, method: str, source: str, params: dict, env,
+                      env_id, extra_meta: dict | None = None) -> dict:
+        """层 1 提交口：在途去重（层 2）→ 权重槽判定 → 直接启动或入队。
+        槽满不拒绝：入队返回 queued+位置（Q 满才拒绝）。job.json 入队即
+        落盘（status=submitted/queued + pid——R5 竞态 + R6 收尸的数据源）。"""
+        weight = self._JOB_WEIGHT.get(method, 1)
+        try:
+            env_meta = {"envId": self._resolve_env_id(env_id)}
+        except Exception:
+            env_meta = {"envId": env_id}
+        run_meta = {**env_meta, "source": source,
+                    # 提交者的线随作业落盘：轮询者可能不是提交者（异步
+                    # 取回时 trail 写入归提交线，2026-08-31 方案 A）
+                    "lane": current_lane(),
+                    **(extra_meta or {})}
+        run_id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}"
+        run_dir = Path(self.state_root) / "worker_runs" / run_id
+        with self._async_lock:
+            dkey = self._dedup_key(method, source, params)
+            if dkey is not None and dkey in self._async_dedup:
+                return {"job_id": self._async_dedup[dkey],
+                        "status": "in_flight", "dedup": True,
+                        "note": "同参数作业在途——复用同一 job_id 轮询取结果"
+                                "（在途去重，层 2）：running=未完，queued=排队中"}
+            start_now = (self._async_weight_active + weight
+                         <= self._slot_capacity)
+            if not start_now and len(self._async_queue) >= self._queue_capacity:
+                raise BridgeError(
+                    -32003,
+                    f"作业队列已满（深度 {self._queue_capacity}，槽容量 "
+                    f"{self._slot_capacity}）——status 的 workerRuns 查在途/"
+                    "排队作业，取回结果（本方法传 job_id）后再提交")
+            if dkey is not None:
+                self._async_dedup[dkey] = run_id
+                self._async_dedup_rev[run_id] = dkey
+            item = {"run_id": run_id, "method": method, "source": source,
+                    "params": params, "env": env, "run_meta": run_meta,
+                    "weight": weight, "run_dir": run_dir}
+            if start_now:
+                self._async_weight_active += weight
+                self._async_jobs[run_id] = "submitted"
+                # 公平游标（层 3）：直接启动的作业同样推进 lane_last——
+                # 否则首个 pump 会按 FIFO 取同线作业，公平性失效
+                self._async_lane_last = run_meta.get("lane")
+                position = None
+            else:
+                self._async_queue.append(item)
+                self._async_jobs[run_id] = "queued"
+                position = len(self._async_queue)
+        # 锁外写盘（提交即落盘，R5——首次轮询必有 job.json；pid 供 R6 收尸）
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            self._job_json_write(run_dir, {
+                "job_id": run_id, "method": method,
+                "status": "submitted" if start_now else "queued",
+                "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "mode": "async", "pid": os.getpid(),
+                "weight": weight, **run_meta})
+        except Exception:
+            pass  # 落盘失败不阻断：内存登记仍在，线程启动后会补写
+        if start_now:
+            self._async_start(item)
+            return {"job_id": run_id, "status": "submitted",
+                    "note": "后台 worker 执行中——本方法传 job_id 轮询取结果"
+                            "（running=未完）；status 的 workerRuns 列进度。"
+                            "run 目录保留 out.json：客户端超时/弃单不丢结果"}
+        return {"job_id": run_id, "status": "queued",
+                "queue_position": position,
+                "queue_depth": len(self._async_queue),
+                "note": f"槽满入队（第 {position} 位）——本方法传同一 job_id "
+                        "轮询取结果；status 的 workerRuns 列队列进度。"
+                        "run 目录保留 out.json：客户端超时/弃单不丢结果"}
+
+    def _async_start(self, item: dict) -> None:
+        # R29（2026-08-31 隔离复审）：启动失败必须回滚——权重/dedup 键/
+        # 内存登记都在提交侧先行登记，线程没起来就永不释放（槽永久缩水、
+        # 同参提交永并入死作业、队列永卡）。回滚后落 failed 墓志，不向上
+        # 抛（pump 批量启动不被单个失败炸断）
+        try:
+            self._job_json_write(item["run_dir"], {
+                "job_id": item["run_id"], "method": item["method"],
+                "status": "running",
+                "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "mode": "async", "pid": os.getpid(),
+                "weight": item["weight"], **item["run_meta"]})
+        except Exception as e:
+            self._rollback_started_item(item, f"启动失败(job.json): {e}")
+            return
+        try:
+            th = threading.Thread(target=self._async_run, args=(item,),
+                                  daemon=True, name=f"async-{item['run_id']}")
+            th.start()
+        except Exception as e:  # 线程资源耗尽等
+            self._rollback_started_item(item, f"启动失败(thread): {e}")
+
+    def _stamp_run_phase(self, run_dir, phase: str) -> None:
+        """job.json 追加 phase 标记（R32）——只读改写 status 之外的可见性
+        字段，失败静默（墓志/status 语义不受影响）。"""
+        try:
+            jp = Path(run_dir) / "job.json"
+            j = json.loads(jp.read_text(encoding="utf-8"))
+            j["phase"] = phase
+            self._job_json_write(Path(run_dir), j)
+        except Exception:
+            pass
+
+    def _rollback_started_item(self, item: dict, why: str) -> None:
+        with self._async_lock:
+            self._async_jobs.pop(item["run_id"], None)
+            self._async_weight_active = max(
+                0, self._async_weight_active - item["weight"])
+        self._dedup_release(item["run_id"])
+        try:
+            self._finalize_kept_run(item["run_dir"], item["run_id"],
+                                    item["method"], error=why,
+                                    error_code=-32005)
+        except Exception:
+            pass
+        try:
+            import sys as _sys
+            _sys.stderr.write(f"[async_start] {why} — 已回滚 {item['run_id']}\n")
+        except Exception:
+            pass
+
+    def _async_pump(self) -> None:
+        """槽释放后出队（层 1）：扫描所有放得下的作业（防大作业头部阻塞
+        小作业）；公平性（层 3）：放得下的候选里优先与最近启动不同的 lane
+        ——A 线的扫描不饿死 B 线的交互调用。"""
+        starts = []
+        with self._async_lock:
+            while True:
+                fittable = [j for j, it in enumerate(self._async_queue)
+                            if (self._async_weight_active + it["weight"]
+                                <= self._slot_capacity)]
+                if not fittable:
+                    break
+                pi = fittable[0]
+                lane_last = self._async_lane_last
+                if lane_last is not None:
+                    for j in fittable:
+                        cand = self._async_queue[j]
+                        if (cand["run_meta"] or {}).get("lane") != lane_last:
+                            pi = j
+                            break
+                pick = self._async_queue[pi]
+                del self._async_queue[pi]
+                self._async_weight_active += pick["weight"]
+                self._async_lane_last = (pick["run_meta"] or {}).get("lane")
+                self._async_jobs[pick["run_id"]] = "submitted"
+                starts.append(pick)
+        for it in starts:
+            self._async_start(it)
+
+    def _async_run(self, item: dict):
+        run_id = item["run_id"]
+        try:
+            # 因果门随作业执行（2026-08-31 计算利用 PLAN）：提交路径不做
+            # 同步 worker 调用——新源码的因果检测（大面板 30-270s）会把
+            # 「秒回提交」变回阻塞。语义不变：FUTURE_LEAK 在轮询时以作业
+            # 失败文案送达（含同样的整改指引）。R25：batch 携多源清单
+            # （causality_sources）逐成员过门——与同步路径全覆盖对齐。
+            # R32：门阶段写 phase 进 job.json——大面板上门可达数分钟，
+            # 不留痕会被误读成「排队中/卡死」（2026-08-31 20:25 生产实证：
+            # agent 观测 bridge CPU 近零后误判 waiting in queue）
+            if item["method"] == "engine.rewrite":
+                # 效率编译层（2026-09-01）：重写作业在 bridge 侧执行
+                # （LLM 调用网络等待为主 + 烟测验证子进程），不走 _run_worker
+                self._stamp_run_phase(item["run_dir"], "rewriting")
+                self._run_rewrite_job(item)
+            else:
+                if item["run_meta"].get("causality_gate"):
+                    self._stamp_run_phase(item["run_dir"], "causality_check")
+                    multi = item["run_meta"].get("causality_sources")
+                    if multi:
+                        _srcs = item["params"].get("sources")
+                        for s in multi:
+                            self._enforce_causality_member(
+                                str(s), item["env"],
+                                item["run_meta"].get("envId", "primary"), _srcs)
+                    else:
+                        self._enforce_causality(
+                            item["source"], item["env"],
+                            item["run_meta"].get("envId", "primary"))
+                    self._stamp_run_phase(item["run_dir"], "evaluating")
+                self._run_worker(item["method"], item["source"], item["params"],
+                                 item["env"], run_id=run_id,
+                                 run_meta=item["run_meta"], async_mode=True,
+                                 run_dir=item["run_dir"])
+        except BridgeError as e:
+            self._mark_run_failed(run_id, str(e), code=e.code)
+        except Exception as e:  # noqa: BLE001 — 线程内兜底：墓志必须留下
+            self._mark_run_failed(run_id, f"{type(e).__name__}: {e}")
+        finally:
+            self._async_jobs.pop(run_id, None)
+            self._dedup_release(run_id)
+            with self._async_lock:
+                self._async_weight_active = max(
+                    0, self._async_weight_active - item["weight"])
+            self._async_pump()
+
+    def _reap_orphan_jobs(self) -> None:
+        """启动收尸（R6，2026-08-31 计算利用 PLAN）：上一桥进程留下的
+        queued/running 作业——worker 随桥死（Job Object KILL_ON_JOB_CLOSE），
+        排队作业只在死进程内存里。job.json 记 pid：pid 不活即标 failed
+        （零入账，agent 可重试）。无 pid 字段的旧文件保守跳过。"""
+        try:
+            root = Path(self.state_root) / "worker_runs"
+            if not root.exists():
+                return
+            for d in root.iterdir():
+                jp = d / "job.json"
+                if not jp.exists():
+                    continue
+                try:
+                    j = json.loads(jp.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if j.get("status") not in ("queued", "running", "submitted"):
+                    continue
+                pid = j.get("pid")
+                if (isinstance(pid, int) and pid != os.getpid()
+                        and not pid_alive(pid)):
+                    j["status"] = "failed"
+                    j["error"] = ("bridge 进程已退出（启动收尸 R6）——零入账，"
+                                  "可原样重试")
+                    j["reaped_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    try:
+                        tmp = jp.with_suffix(".json.tmp")
+                        tmp.write_text(json.dumps(j, ensure_ascii=False),
+                                       encoding="utf-8")
+                        os.replace(str(tmp), str(jp))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _async_result(self, job_id: str):
+        found = self._find_run(job_id)
+        if found is None:
+            # 内存登记兜底：job.json 读侧瞬态竞态（如陈旧句柄/半写文件的
+            # 极窄窗口——写侧已原子化，此为第二道保险）不升级为硬错误
+            mem = self._async_jobs.get(job_id)
+            if mem:
+                return {"job_id": job_id,
+                        "status": "queued" if mem == "queued" else "running",
+                        "note": "仍在执行——稍后再传同一 job_id 取结果"}
+            raise BridgeError(
+                -32602,
+                f"未知 job_id: {job_id}——status 的 workerRuns 列最近 run"
+                f"（有界保留 {self._MAX_KEPT_RUNS} 个，过期作业只能重跑）")
+        d, j = found
+        status = j.get("status")
+        if status in ("queued", "submitted"):
+            pos = None
+            with self._async_lock:
+                for i, it in enumerate(self._async_queue):
+                    if it["run_id"] == job_id:
+                        pos = i + 1
+                        break
+            return {"job_id": job_id, "status": "queued",
+                    "queue_position": pos,
+                    "queue_depth": len(self._async_queue),
+                    "note": "槽满排队中——稍后再传同一 job_id 取结果"
+                            "（status 的 workerRuns 列队列进度）"}
+        if status == "running":
+            return {"job_id": job_id, "status": "running",
+                    "note": "仍在执行——稍后再传同一 job_id 取结果"}
+        if status == "failed":
+            # R27（2026-08-31 隔离复审）：按作业内原始错误码重现——worker
+            # 域错误（-32603 因子错误/-32003 test 已消费）不再统一改报
+            # infra 的 -32005（错误分类契约失真 + dispatch 对 -32005 记
+            # infra 台账，重复轮询同一失败作业会刷屏污染 loop 超时纠偏
+            # 声道）；真 infra 作业无码回落 -32005
+            try:
+                _code = int(j.get("error_code", -32005))
+            except (TypeError, ValueError):
+                _code = -32005
+            raise BridgeError(_code, f"异步作业失败: {j.get('error', '?')}")
+        if j.get("method") == "engine.rewrite":
+            # 复审 F4：引擎内部重写作业被轮询到（job_id 可从 workerRuns 列表
+            # 看到）——返回信息性摘要而非伪 diagnosis，防 agent 把它当评估对象
+            try:
+                _rw = json.loads((d / "out.json").read_text(encoding="utf-8"))
+                _summ = _rw.get("result") or {}
+            except Exception:
+                _summ = {}
+            return {"job_id": job_id, "engine_rewrite": _summ,
+                    "note": "这是引擎内部重写作业（非评估结果）——原样重交"
+                            "原源码即可透明换用其产物"}
+        try:
+            result = json.loads((d / "out.json").read_text(encoding="utf-8"))
+        except Exception as e:
+            raise BridgeError(-32005, f"作业标 done 但 out.json 不可读: {e}")
+        if not result.get("ok"):
+            err = (result.get("error") or {}).get("message", "结果无效")
+            raise BridgeError(-32603, str(err))
+        method = j.get("method", "")
+        if method == "factor.evaluate_batch":
+            # R24/R25：批信封不是单因子 diagnosis——走与同步路径同一的
+            # _postprocess_batch_result（成员 A1 入账/deflated 重算/loop
+            # 指令）。diagnosis.json 快照幂等（R23 同款：重复轮询不重复
+            # 入账、不挪条目）。sources/horizon 从 run 目录的 request.json
+            # 还原（提交时已注入 horizon/pool_std）
+            diag_path = d / "diagnosis.json"
+            if diag_path.exists():
+                try:
+                    return json.loads(diag_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            try:
+                req = json.loads((d / "request.json").read_text(encoding="utf-8"))
+                rp = req.get("params") or {}
+                b_sources = rp.get("sources") or {}
+                b_h = rp.get("horizon")
+                if not isinstance(b_h, int):
+                    b_h = None
+            except Exception:
+                b_sources, b_h = {}, None
+            _tok = set_request_lane(normalize_lane(j.get("lane")))
+            try:
+                out = self._postprocess_batch_result(
+                    j.get("envId", "primary"), b_h, b_sources, result["result"])
+            finally:
+                reset_request_lane(_tok)
+            try:
+                tmp = diag_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(out, ensure_ascii=False),
+                               encoding="utf-8")
+                os.replace(str(tmp), str(diag_path))
+            except Exception:
+                pass  # 快照落盘失败不阻断返回（下次轮询重做后处理）
+            return out
+        stage = self._ASYNC_STAGE.get(method)
+        if stage is None:
+            # evaluate 的 stage 随请求变（development/selection/test）——
+            # 提交时存进 job.json（层 0c）；audit 等本就不包装的方法返回裸结果
+            stage = j.get("stage")
+        if stage is None:
+            return result["result"]
+        # wrap 幂等（R23，2026-08-31 复审发现）：_wrap_diagnosis 带 trail
+        # 写入副作用——每次对 done 作业的轮询都重跑 wrap 会把该试验条目
+        # 挪到 trail 队尾（污染 latest5/断链判定：同线已有更新试验时重轮询
+        # 旧作业会伪断链 + arc 误归零）。首次 wrap 的快照落 diagnosis.json，
+        # 后续轮询（含去重并入者）直接取快照——同一试验永远同一份入账数字
+        diag_path = d / "diagnosis.json"
+        if diag_path.exists():
+            try:
+                return json.loads(diag_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass  # 快照损坏 → 走下方重算 wrap（副作用同旧版）
+        # trail 写入归提交线（job.json 的 lane），轮询者的 contextvar
+        # 不参与——防 A 提交 B 轮询时条目被记到 B 线
+        _tok = set_request_lane(normalize_lane(j.get("lane")))
+        try:
+            out = self._wrap_diagnosis(j.get("envId", "primary"),
+                                       j.get("source", ""), stage,
+                                       result["result"])
+        finally:
+            reset_request_lane(_tok)
+        try:
+            tmp = diag_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(out, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(str(tmp), str(diag_path))
+        except Exception:
+            pass  # 快照落盘失败不阻断返回（下次轮询重 wrap，退回旧版行为）
+        return out
+
+    def _find_run(self, job_id: str):
+        root = Path(self.state_root) / "worker_runs"
+        if not root.exists():
+            return None
+        for d in root.iterdir():
+            jp = d / "job.json"
+            if not jp.exists():
+                continue
+            try:
+                j = json.loads(jp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if j.get("job_id") == job_id:
+                return d, j
+        return None
+
+    def _mark_run_failed(self, run_id: str, msg: str,
+                         code: int | None = None) -> None:
+        found = self._find_run(run_id)
+        if found is None:
+            # R27：失败墓志一个都不能少——job.json 缺失时 stderr 留痕
+            # （此前静默 no-op，轮询者只会看到「未知 job_id」）
+            try:
+                import sys as _sys
+                _sys.stderr.write(f"[job_failed] 墓志缺失 {run_id}: {msg[:200]}\n")
+            except Exception:
+                pass
+            return
+        d, j = found
+        self._finalize_kept_run(d, run_id, j.get("method", ""), error=msg,
+                                error_code=code)
+
+    def _finalize_kept_run(self, wdir: Path, run_id: str, method: str,
+                           error: str | None = None,
+                           error_code: int | None = None) -> None:
+        """成功/失败墓志写入 + 有界清理。容错但可见——收尸失败必须留痕：
+        静默吞错会让作业永卡 running（2026-08-31 实证：replace 撞上并发
+        读者）。error_code（R27）：失败的原生错误码（域错误 vs infra），
+        轮询侧重现时保持分类。"""
+        try:
+            j: dict = {}
+            try:
+                j = json.loads((wdir / "job.json").read_text(encoding="utf-8"))
+            except Exception:
+                j = {}
+            j.update({"job_id": run_id, "method": method,
+                      "status": "failed" if error else "done",
+                      "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+            if error:
+                j["error"] = str(error)[:600]
+            if error and error_code is not None:
+                j["error_code"] = int(error_code)
+            self._job_json_write(wdir, j)
+        except Exception as e:
+            try:
+                import sys as _sys
+                _sys.stderr.write(f"[job_finalize] 墓志写入失败 "
+                                  f"{run_id}: {type(e).__name__}: {e}\n")
+            except Exception:
+                pass
+        # env.npz 在个股面板上是数百 MB——结果/墓志留下，数据体删掉
+        for junk in ("env.npz", "env.npz.meta.json"):
+            try:
+                (wdir / junk).unlink()
+            except Exception:
+                pass
+        self._prune_kept_runs()
+
+    def _prune_kept_runs(self) -> None:
+        try:
+            root = Path(self.state_root) / "worker_runs"
+            if not root.exists():
+                return
+            entries = []
+            for d in root.iterdir():
+                jp = d / "job.json"
+                try:
+                    if not jp.exists():
+                        continue
+                    # R28（2026-08-31 隔离复审）：非终态目录永不剪——排队
+                    # 作业的 job.json mtime=提交时刻恰是最老，纯按 mtime 剪
+                    # 会把在跑/排队作业的目录删掉（丢 source/lane/envId 致
+                    # 轮询侧错账，或 pump 启动即炸）
+                    try:
+                        st = json.loads(jp.read_text(encoding="utf-8")).get("status")
+                    except Exception:
+                        st = None
+                    if st in ("queued", "running", "submitted", None):
+                        continue
+                    entries.append((jp.stat().st_mtime_ns, d))
+                except OSError:
+                    continue
+            entries.sort(reverse=True)
+            for _, d in entries[self._MAX_KEPT_RUNS:]:
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _recent_runs(self) -> list:
+        try:
+            root = Path(self.state_root) / "worker_runs"
+            if not root.exists():
+                return []
+            out = []
+            for d in root.iterdir():
+                jp = d / "job.json"
+                if not jp.exists():
+                    continue
+                try:
+                    j = json.loads(jp.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                out.append({"jobId": j.get("job_id"), "method": j.get("method"),
+                            "status": j.get("status"), "mode": j.get("mode"),
+                            "submittedAt": j.get("submitted_at"),
+                            "finishedAt": j.get("finished_at"),
+                            "error": (j.get("error") or None)
+                            if j.get("status") == "failed" else None})
+            out.sort(key=lambda r: str(r.get("submittedAt") or ""), reverse=True)
+            return out[:self._MAX_KEPT_RUNS]
+        except Exception:
+            return []
 
     def _run_factor(self, method: str, source: str, params: dict[str, Any], env) -> Any:
         """统一执行入口：worker 模式 → 子进程；in_process 模式 → 当前进程（调试用）。
@@ -1414,6 +3026,16 @@ class Bridge:
         """
         if self.execution_mode == "worker":
             return self._run_worker(method, source, params, env)
+        # in_process（仅受信本地调试）：效率编译层同覆盖（烟测探针仍走
+        # 子进程；in_process 的解释执行无超时保护——DESIGN §10 既有风险）
+        if method != "factor.smoke":
+            try:
+                source = self._apply_rewrite(method, source, params)
+                self._smoke_gate(method, source, params, env)
+            except BridgeError:
+                raise
+            except Exception:
+                pass
         # in_process 仅受信本地调试（DESIGN §10 标注风险）
         fn = self._compile_factor(source) if (source and method != "factor.evaluate_batch") else None
         if method == "factor.check_causality":
@@ -1487,12 +3109,13 @@ class Bridge:
             stat = None
             if params.get("statistic") == "spread":
                 from .factor.tail import spread_ir_statistic
-                stat = spread_ir_statistic
-                # net 基（2026-08-28 WS-T2）：与 worker.run_request 同口径
-                if params.get("net_cost") is not None:
-                    import functools as _ft
-                    stat = _ft.partial(spread_ir_statistic,
-                                       cost=float(params["net_cost"]))
+                # R30（2026-08-31 隔离复审）：G2 统计量绑环境口径 tail_k——
+                # k_frac 可配化（8d87a0c）后唯独此门漏绑，恒用默认 0.2，
+                # 门在检验另一个口径的统计量（生产 k_frac=0.1 下 top-20%
+                # 组差 vs 处处 top-10%）。G2 恒毛口径（dc6a42a）不变
+                import functools as _ft
+                stat = _ft.partial(spread_ir_statistic,
+                                   k_frac=float(env.calibration.tail_k))
             return noise_test(fn, env,
                               int(params.get("m", 100) or 100),
                               int(params.get("base_seed", 0) or 0),
@@ -1579,6 +3202,250 @@ class Bridge:
             env_key = env_id or ""
         return f"{source_fingerprint(source)}:{env_key}"
 
+    # ---- S1 拒绝即信息门（探索相似性防线 2026-09-04） ----
+
+    def _novelty_index(self) -> "dict[str, tuple[list, dict]]":
+        """trail_engine 的 {hash: (construction_fp, 首见条目)} 索引
+        （mtime 缓存，写盘后自动失效）。旧条目无 fp 的不入索引——与
+        _entries_linked「无信号条目是单例族」语义一致。"""
+        p = Path(self.state_root) / "trail_engine.json"
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            self._novelty_idx_cache = None
+            return {}
+        cache = getattr(self, "_novelty_idx_cache", None)
+        if cache and cache[0] == mtime:
+            return cache[1]
+        idx: "dict[str, tuple[list, dict]]" = {}
+        try:
+            for e in json.loads(p.read_text(encoding="utf-8")):
+                fp, h = e.get("construction_fp"), e.get("source_hash")
+                if (isinstance(fp, list) and len(fp) == _FP_N_HASHES
+                        and h and h not in idx):
+                    idx[h] = (fp, e)   # 首见 = 最早先例
+        except Exception:
+            idx = {}
+        self._novelty_idx_cache = (mtime, idx)
+        return idx
+
+    def _novelty_gate_log(self, event: dict) -> None:
+        """防线遥测（S1/S2 共用 novelty_gate.jsonl；写失败静默）。"""
+        try:
+            with open(Path(self.state_root) / "novelty_gate.jsonl", "a",
+                      encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **event},
+                    ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _enforce_novelty_gate(self, source: str, env_id: str,
+                              member: "str | None" = None) -> None:
+        """拒绝即信息门：提交侧零成本拦截同构重交（零 trial，同因果门
+        路径哲学）。
+
+        判据（审计校准）：对本环境先例的最大 MinHash 相似 ≥0.80 且数值
+        常量未变（先例源码缺失退 ≥0.95 保守线）。拦截消息携带先例完整
+        结果——浪费的算力变免费信息，确有增量会被「说明本质差异」逼出
+        来。常量有变 = 参数扫描（合法深挖，I1 证无边际衰减），放行仅记
+        遥测。作用域：仅新提案（development/batch 提交路径）；同 hash
+        重评 / selection / test / composite 复评不经此门；跨环境同码
+        （换数据重挖）不拦——那是新研究。模式：DSH_FACTOR_NOVELTY_GATE
+        = enforce（默认）/ shadow（只记不拦）/ off。fail-open：门自身
+        故障绝不阻断评估（与烟测门同哲学）。"""
+        mode = os.environ.get("DSH_FACTOR_NOVELTY_GATE", "enforce").strip().lower()
+        if mode == "off":
+            return
+        try:
+            h = source_fingerprint(source)
+            idx = self._novelty_index()
+            if not idx:
+                return
+            # 同 hash 在本环境已有条目 = 复评（eval_cache 域），非本门职责
+            hit = idx.get(h)
+            if hit is not None and hit[1].get("envId") == env_id:
+                return
+            fp = _construction_fingerprint(source)
+            best_sim, best_h, best_e = 0.0, None, None
+            for ph, (pfp, pe) in idx.items():
+                if ph == h or pe.get("envId") != env_id:
+                    continue
+                s = _fingerprint_similarity(fp, pfp)
+                if s > best_sim:
+                    best_sim, best_h, best_e = s, ph, pe
+            if best_h is None or best_sim < _NOVELTY_GATE_SIM:
+                return
+            # 常量核对：先例源码可取才启用 0.80 线，否则保守 0.95
+            twin_src = None
+            try:
+                pp = factor_source_path(best_h, self.state_root)
+                if pp.exists():
+                    twin_src = pp.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                twin_src = None
+            base = {"gate": "novelty", "hash": h, "twin": best_h,
+                    "sim": round(best_sim, 3), "member": member, "env": env_id}
+            if twin_src is not None:
+                if _numeric_literals(source) != _numeric_literals(twin_src):
+                    self._novelty_gate_log({**base,
+                                            "decision": "allow_parameter_sweep"})
+                    return
+            elif best_sim < _NOVELTY_GATE_SIM_NOCODE:
+                self._novelty_gate_log(
+                    {**base, "decision": "allow_below_nocode_threshold"})
+                return
+            # 先例未 pass 的重交 = 修 bug/换实现的合法迭代（历史校准：无此
+            # 条件时 8 个入册会被误拦，其中多为「v1 失败→微修→v2 入册」；
+            # 加条件后误拦降为 4 且均有补救路径）。浪费的实锤形态是
+            # 「先例已 pass 还原样重交」（26 对双通过对）——只拦这种。
+            if best_e.get("verdict") != "pass":
+                self._novelty_gate_log({**base,
+                                        "decision": "allow_twin_not_passed"})
+                return
+            acc = any(isinstance(r, dict) and r.get("source_hash") == best_h
+                      and r.get("accepted")
+                      for r in read_registry(self.state_root))
+            ev = (f"先例 {best_h[:12]}（{best_e.get('ts', '?')}，"
+                  f"lane={str(best_e.get('lane', '?'))[:24]}，"
+                  f"IC_IR={best_e.get('ic_ir')}，verdict={best_e.get('verdict')}"
+                  f"{'，已入册' if acc else ''}）")
+            self._novelty_gate_log({**base, "decision": f"block_{mode}"})
+            if mode == "shadow":
+                return
+            who = f"成员 {member!r}" if member else "因子"
+            raise BridgeError(
+                -32003,
+                f"同构重交拦截（{who}，对先例结构相似 {best_sim:.2f}，数值常量"
+                f"未变）：{ev}。同构造重评是零信息增量（审计实证：26 对双双"
+                "pass 的近重复对 |IC_IR| 差中位 0.008）。拒绝发生在评估之前："
+                "零计算、零 trial。出路三选一：(1)确有本质差异→修改构造或"
+                "常量后重交；(2)本轮本就是变体→在 trail 里如实以「变体」"
+                "记录（变体是合法深挖，不会被拦）；(3)只是要复评同一因子→"
+                "原 hash 结果可直接查（eval_cache/trail_summary）。")
+        except BridgeError:
+            raise
+        except Exception:
+            self._novelty_gate_log({"gate": "novelty", "decision": "error_open",
+                                    "err": traceback.format_exc(limit=2)})
+
+    # ---- S2 宣言分型校验（探索相似性防线 2026-09-04） ----
+
+    def _source_of(self, source_hash: "str | None") -> "str | None":
+        """按哈希取源码（带进程级缓存；缺文件返回 None）。"""
+        if not source_hash:
+            return None
+        cache = getattr(self, "_attrs_src_cache", None)
+        if cache is None:
+            cache = self._attrs_src_cache = {}
+        if source_hash in cache:
+            return cache[source_hash]
+        try:
+            p = factor_source_path(source_hash, self.state_root)
+            src = p.read_text(encoding="utf-8", errors="replace") if p.exists() else None
+        except Exception:
+            src = None
+        cache[source_hash] = src
+        return src
+
+    def _declaration_gate(self, entry: dict) -> None:
+        """「新」宣称与结构对账（H4 实证：42% 的「新方向」轮旗舰与先例
+        近重复，而变体宣言轮均值全场最低 0.319——标注能力在，失真集中
+        在「新」字滥用）。
+
+        - 宣称 新信息源/新维度/首次引入 → 本轮（上次 record_trail 以来
+          本线引擎条目）的 L1 数据列相对本环境先例必须有增量。
+        - 宣称 新构造/新方向/新机制 → 旗舰对先例最大指纹相似 <0.6 或
+          L1 有增量；否则应记「变体」。
+        防寒蝉：证据不足（本轮无可对账条目/源码缺失/无先例）一律放行。
+        DSH_FACTOR_DECL_GATE=off 可关。拒收走穷尽宣告同款写入口错误
+        （agent 改写后重记，五要素不变）。fail-open：校验故障只记遥测。"""
+        if os.environ.get("DSH_FACTOR_DECL_GATE", "on").strip().lower() == "off":
+            return
+        text = f"{entry.get('new_information', '')}|{entry.get('signal', '')}"
+        claims_info = any(m in text for m in _DECL_INFO_MARKERS)
+        claims_construct = any(m in text for m in _DECL_CONSTRUCT_MARKERS)
+        p = Path(self.state_root) / "trail_engine.json"
+        engine: list = []
+        if p.exists():
+            try:
+                engine = json.loads(p.read_text(encoding="utf-8")) or []
+            except Exception:
+                engine = []
+        lane = current_lane()
+        own = own_entries(engine, lane)
+        bucket = ((read_mining_state(self.state_root).get("lanes") or {})
+                  .get(lane) or {})
+        seen = int(bucket.get("decl_seen_engine") or 0)
+        rnd = [e for e in own[seen:]
+               if isinstance(e.get("construction_fp"), list)
+               and len(e.get("construction_fp")) == _FP_N_HASHES]
+        # 游标无条件推进（每条 record_trail = 一轮结束，无论有无「新」宣称
+        # ——否则无宣称轮的条目会泄进下一轮的对账范围）
+        try:
+            lane_decl_seen_update(self.state_root, lane, seen=len(own),
+                                  previous=seen)
+        except Exception:
+            pass
+        if not (claims_info or claims_construct):
+            return
+        if not rnd:
+            return   # 本轮无可对账条目：想法宣言，放行（防寒蝉）
+        env_ids = {e.get("envId") for e in rnd if e.get("envId")}
+        round_hashes = {e.get("source_hash") for e in rnd}
+        prior = [e for e in engine
+                 if isinstance(e.get("construction_fp"), list)
+                 and len(e.get("construction_fp")) == _FP_N_HASHES
+                 and e.get("envId") in env_ids
+                 and e.get("source_hash") not in round_hashes]
+        # L1 增量（源码缺失 = 证据不足 → 放行）
+        round_attrs: set = set()
+        for e in rnd:
+            src = self._source_of(e.get("source_hash"))
+            if src is None:
+                self._novelty_gate_log({"gate": "declaration",
+                                        "decision": "allow_missing_source"})
+                return
+            round_attrs |= _env_attrs(src)
+        prior_attrs: set = set()
+        for e in prior:
+            src = self._source_of(e.get("source_hash"))
+            if src is not None:
+                prior_attrs |= _env_attrs(src)
+        l1_inc = bool(round_attrs - prior_attrs)
+        # 旗舰 = 本轮对先例最大相似
+        flagship_sim = 0.0
+        for e in rnd:
+            fp = e["construction_fp"]
+            for q in prior:
+                s = _fingerprint_similarity(fp, q["construction_fp"])
+                flagship_sim = max(flagship_sim, s)
+        evt = {"gate": "declaration", "round_n": len(rnd),
+               "claims": ("info" if claims_info else "") +
+                         ("+construct" if claims_construct else ""),
+               "flagship_sim": round(flagship_sim, 3), "l1_increment": l1_inc,
+               "round_attrs": sorted(round_attrs)}
+        if claims_info and not l1_inc:
+            evt["decision"] = "reject_no_l1_increment"
+        elif claims_construct and flagship_sim >= _DECL_FLAGSHIP_MAX_SIM and not l1_inc:
+            evt["decision"] = "reject_flagship_near_dup"
+        else:
+            evt["decision"] = "allow"
+            self._novelty_gate_log(evt)
+            return
+        self._novelty_gate_log(evt)
+        raise BridgeError(
+            -32602,
+            f"new_information 宣言被拒收（宣称{('新信息源' if claims_info else '新构造')}"
+            f"，但结构对账不符）：本轮 {len(rnd)} 个试验的数据列 "
+            f"{sorted(round_attrs)} 相对先例无新增"
+            + (f"，且旗舰构造对先例最大相似 {flagship_sim:.2f}（≥0.6）" if flagship_sim else "")
+            + "。口径/文献引用/机制叙事都不构成新信息源（审计实证：42% 的"
+            "「新方向」宣言轮旗舰与先例近重复）。改写三选一：(1)如实记为"
+            "「变体」——变体是合法深挖，不会被拒；(2)确有新数据列/新构造"
+            "→修正宣言措辞为可对账描述后重记；(3)先补充说明与先例的本质"
+            "结构差异再宣称「新」。")
+
     def _factor_check_causality(self, params):
         env_id = params.get("envId", "primary")
         env = self._require_panel_env(env_id)
@@ -1639,9 +3506,10 @@ class Bridge:
            agent 按 |IC| 挑最优含符号事后翻转）。v2 谱 (Σλ)²/Σλ² → B-LP
            链条退役：有效自由度统计量 ≠ 期望最大值预测器（弥散相关
            低估选运 3.4 倍）。谱 M_eff 保留为遥测（n_eff 字段）。
-        3. 包络（σ 单位）：E[max|X|] 在 CRN 下天然单调（superset 逐点
-           max ≥ subset——定理）；包络 max(当前值, bar_sigma_at_write 章,
-           blp(n_eff_at_write) 旧章换算) 防 rebuild 重估噪声与跨版本回退。
+        3. 包络（v4 2026-09-13 计价审计：摘除）：E[max|X|] 在 CRN 下
+           天然单调（superset 逐点 max ≥ subset——定理），防灌水由该定理
+           独立保证;旧包络(章回读 max + blp 旧章换算)是单向棘轮,曾把
+           R 构造事故的高估永久锁死(3.35→4.58,详见 _build_R 事故链)。
 
         返回 stats dict：n_trials（试验计数 M，遥测）/ n_eff（谱 M_eff，
         遥测）/ bar_sigma（E[max|X|] σ 单位，**门参数**，含包络）/
@@ -1652,9 +3520,14 @@ class Bridge:
         E|Z|≈0.798（冷启动选运底价：连符号都是选出来的）；旧条目无
         horizon 字段 → 按 main_horizon 归位。
         """
-        # 1) 试验集合：(hash, horizon) 去重 + 包络收集（σ 单位）
+        # 1) 试验集合：(hash, horizon) 去重。
+        # v4（2026-09-13 计价审计）：包络摘除——章(bar_sigma_at_write /
+        # blp(n_eff_at_write) 旧章换算)回读进门是单向棘轮,把 R 构造事故
+        # (abs+逐对短重叠 → 非 PSD → 投影伪共同因子)的高估永久锁死
+        # (生产实测:诚实 3.35 → 章 4.58,超 iid 上限)。防灌水的正确
+        # 保证是 CRN 单调性定理(试验集只增,E[max] 逐点不减)——采样器
+        # 裸值即门值;章仍写盘,但只作审计轨迹,不回读。
         trials: dict[tuple, list | None] = {}
-        env_sigma = 0.0
         for e in entries:
             if not isinstance(e, dict):
                 continue  # 生产审核 R1：畸形条目（null/字符串等）跳过
@@ -1671,14 +3544,6 @@ class Bridge:
                 trials[key] = s
             elif s is not None:
                 trials[key] = s  # 重复条目：带 sketch 的覆盖（重评补 sketch）
-            v = e.get("bar_sigma_at_write")
-            if isinstance(v, (int, float)) and np.isfinite(v):
-                env_sigma = max(env_sigma, float(v))
-            # v2 旧章（谱 N_eff，无量纲）：B-LP 换算 σ 后参与包络。
-            # 单侧 < 同 N 的双侧——诚实 bar 自然支配旧章，无跨版本灌水。
-            v2 = e.get("n_eff_at_write")
-            if isinstance(v2, (int, float)) and np.isfinite(v2):
-                env_sigma = max(env_sigma, _blp_sigma(float(v2)))
         # 本因子（未入 trail 时）：pending 单例（horizon 归一到主 horizon 口径）
         if source_hash:
             ph = horizon
@@ -1691,7 +3556,7 @@ class Bridge:
         M = len(keys)
         if M == 0:
             return {"n_trials": 0, "n_eff": 0.0,
-                    "bar_sigma": float(env_sigma), "nu": None}
+                    "bar_sigma": 0.0, "nu": None}
 
         # 2) 跨 horizon 先验（同 hash 跨 horizon、实测不可测时兜底）
         def _prior(ki, kj):
@@ -1705,7 +3570,7 @@ class Bridge:
         # 3) E[max|X|]（CRN 采样器；传入实例则增量条件采样）+ 包络
         smp = sampler if sampler is not None else _LuckSampler()
         smp.sync(trials, prior_fn=_prior)
-        bar = max(smp.bar_sigma(), env_sigma)
+        bar = smp.bar_sigma()  # v4：裸值即门值（CRN 单调性=防灌水保证）
         n_spec = Bridge._spectral_m_eff(smp._R) if M > 1 else 1.0
         return {"n_trials": M, "n_eff": float(n_spec),
                 "bar_sigma": float(bar), "nu": smp.nu_telemetry()}
@@ -1840,6 +3705,243 @@ class Bridge:
                            f"（{bar.get('reason') if isinstance(bar, dict) else 'bar 缺失'}"
                            "）——有 tail 块的评估积累后自动出现")
         return out
+
+    def _deepen_telemetry(self, engine_trail: list) -> dict:
+        """IC 线近失深化遥测（2026-09-15 正修：进 loop 响应，与尾部线
+        near_misses 对称）。
+
+        背景：IC 线此前无任何近失指令（尾部线才有 near_misses），深化
+        全靠 agent 自觉——deepdig 清单自写"变体配额≥1/2"执行率 0/30
+        实证失效（散文纪律不驱动行为的第三次同型）。直驱 queue/runner
+        架构又把模型移出了逐响应反馈环（loop 指令落盘无人读）。
+
+        口径：
+        - 近失带 = **现价**重算 deflated p ∈ (0.05, 0.30]（|sr_hat|≥0.75
+          预筛省算力；p 用当前 bar 与 per-horizon pool_std 重算——墙在动，
+          旧 p 不代表现价，这正是"重定价重扫"的引擎化）；
+        - 候选 = 全局 trail（事实层，与 tail 遥测同口径）dev/batch 条目、
+          (hash, horizon) 去重取最新、未入册；
+        - 每颗带引擎计数的**已试变体数**（_entries_linked 双信号：IC
+          相关 ≥0.6 或构造血缘——同族后继试验，ts 晚于种子且 hash 不同；
+          **只计 authored/假设来源**——farm 撞相关后代不算深化投资）。
+        - 指令面：变体对墙几乎免费（相关试验在 R 里折成同一张彩票——
+          P0c 后深化的经济学），队列非空时新构造:变体配额 2:1。
+        """
+        env_id = next(iter(self.envs), None) if getattr(self, "envs", None) else None
+        if env_id is None:
+            return {"queue": [], "note": "env 未加载——IC 线近失现价不可算"}
+        main_h = self._main_horizon(env_id)
+        reg = read_registry(self.state_root)
+        admitted = {e.get("source_hash") for e in reg
+                    if isinstance(e, dict) and e.get("accepted")
+                    and e.get("source_hash")}
+        # 全局 bar（实例级 CRN 采样器，增量 sync 幂等）
+        try:
+            stats = self._n_eff_from_entries(
+                engine_trail, None, main_horizon=main_h, sampler=self._luck)
+            bar = float(stats.get("bar_sigma") or 0.0)
+        except Exception:
+            return {"queue": [], "note": "选择运气采样失败——近失现价不可算"}
+        if bar <= 0:
+            return {"queue": [], "note": "trail 空——无近失可言"}
+        # (hash, horizon) 去重取最新；|sr|≥0.75 预筛
+        cand: dict[tuple, dict] = {}
+        for e in engine_trail:
+            if not isinstance(e, dict) or e.get("stage") not in ("development", "batch"):
+                continue
+            h = e.get("source_hash")
+            d = e.get("dsr_stats") or {}
+            sr = d.get("sr_hat")
+            if (not h or h in admitted
+                    or not isinstance(sr, (int, float))
+                    or abs(float(sr)) < 0.75):
+                continue
+            k = (h, e.get("horizon"))
+            if k not in cand or (e.get("ts") or "") > (cand[k].get("ts") or ""):
+                cand[k] = e
+        # 现价 p 重算（pool_std per-horizon 本地缓存）
+        pool_cache: dict = {}
+        rows = []
+        for (h, hor), e in cand.items():
+            d = e.get("dsr_stats") or {}
+            if hor not in pool_cache:
+                try:
+                    pool_cache[hor] = self._resolve_pool_std(env_id, None, hor)[0]
+                except Exception:
+                    pool_cache[hor] = None
+            ps = pool_cache[hor]
+            if not ps:
+                continue
+            p = _dsr_p_from_stats(d.get("sr_hat"), d.get("skew"),
+                                  d.get("kurt"), d.get("n_obs"), bar, ps)
+            if isinstance(p, (int, float)) and 0.05 < p <= 0.30:
+                rows.append((float(p), e))
+        rows.sort(key=lambda r: r[0])
+        # ---- 深化战役(用户 2026-09-15 拍板:浅挖近失逐颗深挖,穷尽由引擎
+        # 机械判定——变体 ≥ 预算,模型无权宣布穷尽)----
+        # 状态文件 stateRoot/deepen_campaign.json:
+        #   {"budget": null|N, "queue": [hash...按现价升序], "history":
+        #    [{"hash","outcome","ts","variants"}]}
+        # 预算缺省(null/缺键)= DSH 插件簇试验上限 max_cluster_trials
+        # (用户拍板"预算和DSH插件里的预算保持一致";配置改,战役随动)。
+        # 推进规则(每次遥测重估,推进即落盘):入册→admitted;出带
+        # (现价>0.30/预筛外)→out_of_band;战役新鲜窗内 authored 变体
+        # ≥ 预算→exhausted_trials(引擎穷尽宣告);否则 active=当前目标。
+        campaign = {"state": "idle"}
+        resolved = set()
+        camp_path = Path(self.state_root) / "deepen_campaign.json"
+        try:
+            camp = (json.loads(camp_path.read_text(encoding="utf-8"))
+                    if camp_path.exists() else None)
+        except Exception:
+            camp = None
+        if isinstance(camp, dict) and camp.get("queue"):
+            if isinstance(camp.get("budget"), int) and camp["budget"] > 0:
+                budget = int(camp["budget"])
+            else:
+                budget = int(MINING_CONFIG.get("max_cluster_trials", 200))
+            cq = [str(h) for h in camp.get("queue") or []]
+            hist = list(camp.get("history") or [])
+            done = {h.get("hash") for h in hist if isinstance(h, dict)}
+            # 执行器回填的显式裁决(如"复合变体已入册,其腿源种子皆解决")
+            # ——复合与腿的 sketch 相关常 <0.6,自动家族胜利判不出来;
+            # 回填须带 via+note,引擎优先消费并转录进 history
+            force = [f for f in (camp.get("force_resolve") or [])
+                     if isinstance(f, dict) and f.get("hash")]
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            for f in force:
+                fh = str(f["hash"])
+                if fh in cq and fh not in done:
+                    hist.append({"hash": fh, "ts": now,
+                                 "outcome": str(f.get("outcome")
+                                                or "resolved"),
+                                 "via": str(f.get("via") or "")[:12],
+                                 "note": str(f.get("note") or "")[:160]})
+                    done.add(fh)
+                    resolved.add(fh)
+            cursor = 0
+            while cursor < len(cq):
+                tgt = cq[cursor]
+                if tgt in done:
+                    cursor += 1
+                    continue
+                row = next((e for _p, e in rows
+                            if e.get("source_hash") == tgt), None)
+                if tgt in admitted or row is None:
+                    # 入册即胜利出队;不在带内=现价出带(>0.30)或预筛外
+                    hist.append({"hash": tgt, "ts": now,
+                                 "outcome": ("admitted" if tgt in admitted
+                                             else "out_of_band")})
+                    resolved.add(tgt)
+                    cursor += 1
+                    continue
+                # 家族胜利(2026-09-15 战役实测定律):深化的正解几乎总是
+                # "目标的变体入册"而非母式本体入册(volmom_winsor_only/
+                # triple4leg_amtprice/campaign1 复合皆然)——目标的任一
+                # 更晚的同族条目已入册 → admitted_via_variant 出队
+                ts_seed = row.get("ts") or ""
+                fam_win = None
+                for ah in admitted:
+                    ae = next((x for x in engine_trail
+                               if isinstance(x, dict)
+                               and x.get("source_hash") == ah), None)
+                    if (ae is not None
+                            and (ae.get("ts") or "") > ts_seed
+                            and _entries_linked(row, ae)):
+                        fam_win = ah
+                        break
+                if fam_win is not None:
+                    hist.append({"hash": tgt, "ts": now,
+                                 "outcome": "admitted_via_variant",
+                                 "via": str(fam_win)[:12]})
+                    resolved.add(tgt)
+                    cursor += 1
+                    continue
+                ts_seed = row.get("ts") or ""
+                # 新鲜窗语义:预算只计战役启动(started)之后的 authored
+                # 变体——老种子的历史 authored 表亲(相关≥0.6 即计入)会
+                # 把存量灌到数百发,不清零则未挖先"穷尽",违背逐颗深挖
+                camp_start = str(camp.get("started") or "1970-01-01T00:00:00")
+                k = sum(
+                    1 for x in engine_trail
+                    if isinstance(x, dict)
+                    and x.get("source_hash") != tgt
+                    and (x.get("ts") or "") > max(ts_seed, camp_start)
+                    and (x.get("authored") or x.get("origin") == "hypothesis")
+                    and _entries_linked(row, x))
+                tgt_p = next(p for p, e in rows
+                             if e.get("source_hash") == tgt)
+                if k >= budget:
+                    hist.append({"hash": tgt, "ts": now,
+                                 "outcome": "exhausted_trials",
+                                 "variants": k})
+                    resolved.add(tgt)
+                    cursor += 1
+                    continue
+                campaign = {
+                    "state": "active", "target": {
+                        "hash_prefix": str(tgt)[:12], "p_now": round(tgt_p, 4),
+                        "variants": k, "budget": budget},
+                    "progress": f"{cursor + 1}/{len(cq)}",
+                    "remaining": len(cq) - cursor}
+                break
+            else:
+                campaign = {"state": "complete",
+                            "resolved": len(hist),
+                            "note": "深化战役队列已清——浅挖积压收官"}
+            if campaign.get("state") in ("complete",) or cursor != int(
+                    camp.get("cursor", -1)) or hist != camp.get("history"):
+                try:
+                    camp.update({"history": hist, "cursor": cursor})
+                    tmp = camp_path.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(camp, ensure_ascii=False,
+                                              indent=1), encoding="utf-8")
+                    os.replace(str(tmp), str(camp_path))
+                except Exception:
+                    pass  # 战役状态写失败不阻断遥测;下次重算
+        # 展示队列排除战役已决种子(入册/出带/引擎穷尽)
+        if resolved:
+            rows = [r for r in rows
+                    if r[1].get("source_hash") not in resolved]
+        queue = []
+        for p, e in rows[:3]:
+            ts_seed = e.get("ts") or ""
+            # 只计 authored/假设来源的同族后继(2026-09-15 深度审计):
+            # farm 随机撞相关后代会把计数灌到数百发,需求(变体<3)永不
+            # 触发——锤过≠深化过;审计实证带内 73/77(IC)+22/27(tail)
+            # 颗只吃过 winsor/换腿 两轴,加腿/拆杠杆几乎从未发生
+            variants = sum(
+                1 for x in engine_trail
+                if isinstance(x, dict)
+                and x.get("source_hash") != e.get("source_hash")
+                and (x.get("ts") or "") > ts_seed
+                and (x.get("authored") or x.get("origin") == "hypothesis")
+                and _entries_linked(e, x))
+            queue.append({"hash_prefix": str(e.get("source_hash"))[:12],
+                          "sr": round(float((e.get("dsr_stats") or {}).get("sr_hat")), 3),
+                          "p_now": round(p, 4),
+                          "horizon": e.get("horizon"),
+                          "variants_tried": variants,
+                          "ts": ts_seed})
+        camp_state = campaign.get("state")
+        return {
+            "queue": queue,
+            "campaign": campaign,
+            "note": (("深化战役 active:{}/{} 目标 {} k={}/{}——引擎逐颗推进,"
+                      "穷尽=authored 变体≥预算(机械判定)".format(
+                          campaign.get("progress"), campaign.get("remaining"),
+                          campaign["target"]["hash_prefix"],
+                          campaign["target"]["variants"],
+                          campaign["target"]["budget"]) if camp_state == "active"
+                      else ("深化战役 complete:浅挖积压收官" if camp_state == "complete"
+                            else "")) +
+                    ("IC 线近失（现价 p∈(0.05,0.30]，未入册）——变体对墙"
+                     "几乎免费（相关试验≈同一张彩票）；每颗值得 2-3 发变体"
+                     "（结构轴优先:winsor/换腿/加腿/拆杠杆，抖动轴失败不"
+                     "构成穷尽）；队列非空时新构造:变体配额 2:1，已试变体"
+                     "由引擎计数（仅 authored/假设来源，farm 撞相关不计）"
+                     if queue else
+                     "IC 线现价近失带为空"))}
 
     # ---- G1 权威 placebo 缓存（WS2 2026-08-25）----
     # 重 placebo 贵且确定性（seed = 指纹派生）——缓存键
@@ -2019,9 +4121,31 @@ class Bridge:
                         f"（{land_std:.3f}）——疑似同族刷屏，仅按 null 尺度计价")
         return land_std, detector
 
+    def _registered_hashes(self) -> set:
+        """registered_ledger.jsonl 的 source_hash 集合(层成员资格;损坏→空)。"""
+        out = set()
+        p = Path(self.state_root) / "registered_ledger.jsonl"
+        if not p.exists():
+            return out
+        try:
+            for ln in p.read_text(encoding="utf-8").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                    if isinstance(r, dict) and r.get("source_hash"):
+                        out.add(r["source_hash"])
+                except Exception:
+                    continue
+        except Exception:
+            return set()
+        return out
+
     def _trial_stats(self, source_hash: str | None = None,
                      horizon: int | None = None,
-                     env_id: str | None = None) -> tuple[dict, float | None]:
+                     env_id: str | None = None,
+                     stratum: str | None = None) -> tuple[dict, float | None]:
         """多重检验的引擎侧硬统计（v3 2026-08-21：E[max|X|] bar + per-horizon trail_std）。
 
         旧实现用 mining_state.round+1 计数——但 agent 走 factor_record_trail
@@ -2060,9 +4184,17 @@ class Bridge:
         if env_id is not None:
             prior = self._cross_h_prior_loaded(env_id)
             main_h = self._main_horizon(env_id)
+        _smp = self._luck
+        if stratum == "mechanism":
+            # 批次1(方案B):机制层子集 = 台账注册 hash 的试验(影子口径,
+            # 正式翻转前不进门)。子集走独立 CRN 采样器,不扰动全局状态
+            _reg = self._registered_hashes()
+            entries = [e for e in entries
+                       if isinstance(e, dict) and e.get("source_hash") in _reg]
+            _smp = self._luck_mech
         stats = self._n_eff_from_entries(entries, source_hash, horizon,
                                          cross_h_prior=prior, main_horizon=main_h,
-                                         sampler=self._luck)
+                                         sampler=_smp)
         # per-horizon trail IC_IR std（旧条目无 horizon → 归主 horizon）
         def _h_match(e) -> bool:
             if not isinstance(e, dict) or not isinstance(e.get("ic_ir"), (int, float)):
@@ -2316,29 +4448,38 @@ class Bridge:
         终态只剩 finalize（test 一次性锁）/ fail_streak（当前无喂入方）。
         候选池满 / accepted 因子不是停点；穷尽宣告一律拒收（写入拒/
         回显降级 pending_rejected）。
-        计数口径：round = arc_rounds 当前方向段轮次；rounds_total =
-        trail.json 终身叙事轮次（信息性）；n_trials = trail_engine 唯一
-        (source_hash, horizon) 终身试验数（只用于 deflation 计价不做停点）；
-        cluster_trials = family_streak 同族链长。"""
-        agent_trail = read_json_list("trail", self.state_root)
+        计数口径（2026-08-31 方案 A lane 化）：round = 本线 arc_rounds
+        方向段轮次；rounds_total = 本线 trail.json 叙事轮次（信息性）；
+        cluster_trials = 本线 family_streak 同族链长；n_trials = trail_engine
+        全局唯一 (source_hash, horizon) 试验数（**全局口径不动**——deflation
+        计价必须全量计数，其它线的试验照常抬本线的 bar）。
+        意图层（pending/frozen/族链/arc 预算）只看本线（lane 过滤）；
+        事实层（plateau 穷尽信号/n_trials/tail 遥测/explored）保持全局。"""
+        lane = current_lane()
+        agent_trail_all = read_json_list("trail", self.state_root)
         engine_trail = self._read_engine_trail()
+        agent_trail = own_entries(agent_trail_all, lane)
+        engine_own = own_entries(engine_trail, lane)
         agent_rounds = len(agent_trail)
+        n_trials_lane = len({(e.get("source_hash"), e.get("horizon"))
+                             for e in engine_own if isinstance(e, dict)
+                             and e.get("source_hash")})
         mining = read_mining_state(self.state_root)
-        arc = int(mining.get("arc_rounds", 0) or 0)
+        arc = lane_arc_rounds(mining, lane)
         n_trials = len({(e.get("source_hash"), e.get("horizon"))
                         for e in engine_trail if isinstance(e, dict)
                         and e.get("source_hash")})
-        # 簇 = 尾部同族链（_entries_linked 双信号）；streak 同时是
-        # 「当前簇试验数」，簇试验上限停点的计数基础
-        streak = self._family_streak(engine_trail)
-        effective = {**mining, "n_trials": n_trials,
+        # 簇 = 本线尾部同族链（_entries_linked 双信号）；streak 同时是
+        # 「本线当前簇试验数」，簇试验上限停点的计数基础
+        streak = self._family_streak(engine_own)
+        effective = {**mining, "arc_rounds": arc, "n_trials": n_trials,
                      "cluster_trials": streak}
         term = check_termination(effective)
         # v8（2026-08-26 规划书）：全局收敛退役，族内收敛顶上——纯
         # must_rotate 停点（用户钉死）：族收敛永远只是换向信号，不设
         # 静默终态；convergence stop_kind 消失，静默终态只剩
         # finalize/fail_streak（全局枯竭不再自动判定）
-        fam_conv = self._family_convergence(engine_trail, mining)
+        fam_conv = self._family_convergence(engine_own, mining)
         # stop_kind：None=running；direction_budget=换向可解除（注入器
         # 推进，含族收敛）；finalize/fail_streak=静默终态（注入器让位用户）
         stop_kind = None
@@ -2354,21 +4495,44 @@ class Bridge:
                  else "must_rotate" if stop_kind == "direction_budget"
                  else "may_stop")
         # 上一轮自己声明的下一步（引擎原样回显——执行或证伪，不得静默放弃）；
-        # 停笔宣言不接受回显，降级为 pending_rejected 并点名拒收
+        # 停笔宣言不接受回显，降级为 pending_rejected 并点名拒收。
+        # 灵感重置声明（2026-09-01 WS-B/D1）判定序最先：合法声明走配额
+        # 受理（受理后 pending 作废——D4 冷启动语义），超限降级
+        # pending_rejected；台账异常降级为普通 pending（声明本身没错，
+        # 不当拒收处理）
         pending = None
         pending_rejected = None
+        inspiration_reset = None
+        ir_quota = None
         if agent_trail and isinstance(agent_trail[-1], dict):
             nh = agent_trail[-1].get("next_hypothesis")
             if isinstance(nh, str) and nh.strip():
-                hit = _surrender_match(nh)
-                if hit:
-                    pending_rejected = {"text": nh.strip()[:400], "reason": hit}
+                decl = _inspiration_decl_match(nh)
+                if decl is not None:
+                    mode, reason = decl
+                    try:
+                        ir_quota = inspiration_declare(
+                            self.state_root, lane, agent_rounds, mode)
+                    except Exception:
+                        ir_quota = None
+                    if ir_quota is not None and ir_quota.get("accepted"):
+                        inspiration_reset = {"mode": mode, "reason": reason}
+                    elif ir_quota is not None:
+                        pending_rejected = {
+                            "text": nh.strip()[:400],
+                            "reason": ir_quota.get("reason") or "灵感重置声明被拒"}
+                    else:
+                        pending = nh.strip()[:400]
                 else:
-                    pending = nh.strip()[:400]
+                    hit = _surrender_match(nh)
+                    if hit:
+                        pending_rejected = {"text": nh.strip()[:400], "reason": hit}
+                    else:
+                        pending = nh.strip()[:400]
         # 家族饱和：边际收益驱动（2026-08-25 用户决策：不看链长绝对
         # 阈值，只看族内边际）——仍在改善的族不催（哪怕 100 个试验），
-        # 已平台的族催（哪怕只有 5 个）
-        fam_marg = self._family_marginal(engine_trail)
+        # 已平台的族催（哪怕只有 5 个）。族 = 本线族（lane 化）
+        fam_marg = self._family_marginal(engine_own)
         escalation = None
         # 双轨收敛分流文案（2026-08-27 D2）：IC 线收敛但尾部线仍在改善 →
         # 不触发 must_rotate，escalation 把「为什么没换向」说清楚——
@@ -2452,10 +4616,22 @@ class Bridge:
                           + "。执行策略指令换向：构造与当前族不同源的新因子"
                             "（断链后预算自动重置，回到 running）。同族参数微调"
                             "不会重置预算，禁止原地续推")
+            # 弧末蒸馏义务（构造面 v7）：换向=弧边界，正是蒸馏节拍——
+            # 引擎先自动快照旧 live 入 raw/（防洗账），终条目归档+墓志
+            try:
+                from .journal import _lane_dir, resolve_journal_lane
+                if _lane_dir(self.state_root, resolve_journal_lane()).exists():
+                    obligation += ("。换向前先 factor_journal_distill 蒸馏本弧"
+                                   "（旧 live 自动快照入 raw/，终条目自动归档）")
+            except Exception:
+                pass
         else:
             obligation = ((stop_reason or "停点触发")
                           + "。此停点换方向无法解除，注入器已静默——数据集轮换"
                             "是用户操作，向用户上报当前进展即可，不要停下来空等")
+        if inspiration_reset is not None:
+            obligation += ("。灵感重置已确认——按策略指令换源重启，上一方向的"
+                           " pending 已作废，不得回旧假设族续推")
         # 策略指令（v4 2026-08-24）：下一轮方向类型的机械选择——注入器
         # （TS drive 层）在 turn 结束后读它，以 user 角色注入 [引擎推进]。
         # v7：must_rotate 状态照常注入（direction_budget 强制 rotate/
@@ -2472,7 +4648,7 @@ class Bridge:
                     and a.get("next_hypothesis").strip()
                     and a.get("next_hypothesis") == b.get("next_hypothesis")):
                 frozen = True
-        pass_n = sum(1 for e in engine_trail if isinstance(e, dict)
+        pass_n = sum(1 for e in engine_own if isinstance(e, dict)
                      and e.get("verdict") == "pass")
         try:
             accepted_n = sum(1 for e in read_registry(self.state_root)
@@ -2480,21 +4656,46 @@ class Bridge:
         except Exception:
             accepted_n = 0
         lit_search_count = int(self._read_papers().get("searches", 0) or 0)
+        # random 配额快照读（WS-A/D3）：声明强制路径不查（受理时已查），
+        # 只供 R1 轮转决策；发射记账在策略挂出后（random_emit_count）
+        rnd_used = lane_random_used(mining, lane)
+        rnd_quota = int(mining.get("random_strategy_quota",
+                                   MINING_CONFIG["random_strategy_quota"]))
         strategy = _pick_strategy(
             stop_kind=stop_kind, streak=streak,
             pending_rejected=pending_rejected, frozen=frozen,
             plateau=plateau, pass_unadmitted=max(pass_n - accepted_n, 0),
             accepted_n=accepted_n, agent_rounds=agent_rounds,
             n_trials=n_trials, lit_search_count=lit_search_count,
-            family_marginal=fam_marg)
+            family_marginal=fam_marg,
+            inspiration_reset=inspiration_reset,
+            random_available=rnd_used < rnd_quota)
+        if strategy is not None and strategy.get("type") == "random":
+            try:
+                random_emit_count(self.state_root, lane, agent_rounds)
+                rnd_used = lane_random_used(
+                    read_mining_state(self.state_root), lane)
+            except Exception:
+                pass
+        # WS-B 回执（agent 可见配额，与 pending_rejected 同一可见性原则）：
+        # 受理回合用台账返回值（快照 mining 未含本次扣额），无声明时用快照
+        _bucket = (mining.get("lanes") or {}).get(lane) or {}
+        _i_quota = int(mining.get("inspiration_quota",
+                                  MINING_CONFIG["inspiration_quota"]))
+        if ir_quota is not None and isinstance(ir_quota.get("quota_left"), int):
+            _q_left = ir_quota["quota_left"]
+        else:
+            _q_left = max(0, _i_quota - int(_bucket.get("inspiration_used", 0) or 0))
         loop = {
             "state": state,
             "stop_kind": stop_kind,
+            "lane": lane,
             "round": arc,
             "max_rounds": int(effective.get("max_rounds",
                                             MINING_CONFIG["max_rounds"])),
             "rounds_total": agent_rounds,
             "n_trials": n_trials,
+            "n_trials_lane": n_trials_lane,
             "cluster_trials": streak,
             "max_cluster_trials": int(effective.get(
                 "max_cluster_trials", MINING_CONFIG["max_cluster_trials"])),
@@ -2502,12 +4703,39 @@ class Bridge:
             "stop_reason": stop_reason,
             "family_convergence": fam_conv[2],
             "tail": self._tail_telemetry(engine_trail),
+            "deepen": self._deepen_telemetry(engine_trail),
             "pending_hypothesis": pending,
             "pending_rejected": pending_rejected,
+            "inspiration_reset": {
+                "acknowledged": inspiration_reset is not None,
+                "mode": (inspiration_reset or {}).get("mode"),
+                "quota_left": _q_left,
+                "random_available": rnd_used < rnd_quota,
+                "syntax": ("声明 = next_hypothesis 以 [灵感重置:literature] 或 "
+                           "[灵感重置:random] 开头 + 一句理由（声明即切；每方向段 "
+                           "≤2 次，random ≤1 次；断链换向自动重置配额）"),
+            },
             "obligation": obligation,
             "escalation": escalation,
             "strategy": strategy,
         }
+        # 推理日志指针（构造面 v7）：一行遥测——存在性/活条目计数/登记率/
+        # 预算告警。全文按需 factor_journal_read（渐进披露:会话开场 level=1）
+        try:
+            from .journal import journal_pointer
+            loop["journal"] = journal_pointer(self.state_root)
+        except Exception:
+            pass
+        # 并行归属呈现（方案 A）：bar 跳变必须有出处——双线并行时 agent
+        # 无法区分「我的试验推高了 bar」还是「别的线推高了」，曾把外线
+        # 写入脑补成自己超时调用的完成。归属说清，观测不再污染归因
+        foreign = n_trials - n_trials_lane
+        if foreign > 0:
+            loop["lane_note"] = (
+                f"并行线模式：本线 {n_trials_lane} / 全局 {n_trials} 条试验"
+                f"（其它线 {foreign} 条）。n_trials 与 tail bar 按全局计价"
+                "——其它线的试验照常抬高本线门槛（多重检验全量计数）；"
+                "pending/族链/方向预算只统计本线")
         # W3（2026-08-26 规划书）：最近 30 分钟 infra 失败（-32005）≥1 → 附加
         # 纠偏引导——超时后 agent 的下一个成功调用（status/evaluate/
         # trail_summary）即收到。纯附加遥测：不影响上面任何停走判定，
@@ -2518,11 +4746,37 @@ class Bridge:
                 "recent_count": len(infra),
                 "last_method": infra[-1].get("method"),
                 "note": ("worker 超时是基础设施事件：向量化实现，勿因超时更换研究方向；"
-                         "失败的调用零写入、可立即重试"),
+                         "失败的调用零写入。重试前先 factor_status 看 workerRuns——"
+                         "evaluate 已默认异步（job_id 轮询），同参数重试会自动并入"
+                         "在途作业（去重），不会重复计算。严禁杀 bridge/python 进程"
+                         "「解卡」——bridge 单线程忙是设计内行为，busy≠stuck；"
+                         "杀掉后所有会话的 factor_* 全部挂起直至重启宿主"
+                         "（2026-08-31 实证）。等待或轮询，永远不动进程。"),
             }
         return loop
 
+    def _async_evaluate_enabled(self, params: dict) -> bool:
+        """层 0c（2026-08-31 计算利用 PLAN）：evaluate 默认异步——大面板单评
+        分钟级，同步路径占死单线程 bridge，两会话互相卡死（2026-08-31 实证）。
+        逃生阀：显式 async:false（测试与内部同步路径用）；
+        in_process 模式（受信调试）恒同步——worker 子进程语义才是异步靶子。"""
+        if self.execution_mode != "worker":
+            return False
+        return params.get("async") is not False
+
     def _factor_evaluate(self, params):
+        # 层 0c：job_id 取结果——纯取回（放在一切校验前，与 composite 同口）
+        if params.get("job_id"):
+            return self._async_result(str(params["job_id"]))
+        # 垃圾提交防线（2026-08-31 生产实证）：轮询方若丢了 job_id（如工具
+        # 层曾未转发），请求会退化成空 source 的新作业——每轮询一次制造
+        # 一个注定失败的垃圾作业。空 source 直接拒绝并教正确轮询方式。
+        if not str(params.get("source") or "").strip():
+            raise BridgeError(
+                -32602,
+                "factor.evaluate 需要 source（或传 job_id 轮询在途作业，"
+                "收到两者皆空）。轮询方法：{\"job_id\": \"job-...\"}——"
+                "evaluate/composite/batch/audit 的作业均可这样取回。")
         env_id = params.get("envId", "primary")
         # test 纪律锁前置检查（2026-08-18 独立审计 F-TP-01 澄清后的 UX 修正）：
         # 绕过链本身不成立（reset scope=all 后重配+load，evaluate_test 内部
@@ -2554,7 +4808,10 @@ class Bridge:
         env = self._require_panel_env(env_id)
         source = params.get("source", "")
         stage = params.get("stage", "development")
-        self._enforce_causality(source, env, env_id)
+        # 因果门：同步路径就地执行；异步路径（层 0c）随作业线程执行
+        # （causality_gate 元数据标记）——提交侧零 worker 调用
+        if not self._async_evaluate_enabled(params):
+            self._enforce_causality(source, env, env_id)
         source_hash = source_fingerprint(source)
         if stage != "development":
             params = {**params, "source_hash": source_hash}
@@ -2574,8 +4831,19 @@ class Bridge:
                         "通过准入再测。test 是 stateRoot 级一次性资源"
                         "（2026-08-24 教训：唯一一发烧给了从未提交的候选），"
                         "未入册的候选不得消耗它")
+            # 层 0c：selection/test 计算异步化（默认；async:false 逃生阀）——
+            # 纪律检查（锁/准入）全部在提交侧同步完成（R4），claim-then-compute
+            # 的 claim 在计算路径内（evaluate_test），语义不变
+            if self._async_evaluate_enabled(params):
+                return self._async_submit(
+                    "factor.evaluate", source, params, env, env_id,
+                    extra_meta={"stage": stage, "causality_gate": True})
             result = self._run_factor("factor.evaluate", source, params, env)
             return self._wrap_diagnosis(env_id, source, stage, result)
+
+        # S1 拒绝即信息门（2026-09-04 探索相似性防线）：仅 development
+        # 新提案路径；提交侧同步执行、零 trial；scan/profile 只判一次。
+        self._enforce_novelty_gate(source, env_id)
 
         # ---- v2（2026-08-20）horizon 申报制（仅 development）----
         # 菜单 = env calibration.horizons（未配置 = [主 horizon]，行为同旧版）。
@@ -2592,8 +4860,11 @@ class Bridge:
             else:
                 profile = {}
                 for h in menu:
+                    # scan 内层强制同步（层 0c）：profile 的每个成员必须是
+                    # 完整诊断而非 job 句柄；单次 scan 本身是罕见重操作
                     profile[str(h)] = self._evaluate_dev(
-                        env_id, env, source, source_hash, {**params, "horizon": int(h)})
+                        env_id, env, source, source_hash,
+                        {**params, "horizon": int(h), "async": False})
                 return {
                     "scan": True, "horizons": menu, "profile": profile,
                     "note": ("horizon profile：菜单内每个 horizon 独立完整诊断"
@@ -2630,31 +4901,76 @@ class Bridge:
         params = {**params, "bar_sigma": stats["bar_sigma"],
                   "n_trials": stats["n_trials"], "pool_std": pool_std,
                   "source_hash": source_hash}
+        # C1 缓存预检（修正案 A）：development 纯读——命中直接回，零子
+        # 进程/零 env.npz 序列化（个股面板每次省几十秒）；_wrap_diagnosis
+        # 照跑（池/trail/指纹语义不变）。写回由 worker 侧完成（同一键：
+        # env_fp 注入 params，两层共用 eval_key_from_parts 归一）。
+        env_fp = self._env_full_fingerprint(env_id)
+        if env_fp:
+            params = {**params, "env_fp": env_fp}
+            ck = eval_key_from_parts(source_hash, env_fp, env, horizon=h,
+                                     n_trials=stats["n_trials"],
+                                     pool_std=pool_std,
+                                     bar_sigma=stats["bar_sigma"])
+            hit = cache_read(self.state_root, ck)
+            if hit is not None:
+                return self._wrap_diagnosis(env_id, source, "development",
+                                            {**hit, "eval_cache": "hit"})
+        # 层 0c：缓存未命中 → 异步作业（默认；R2 契约分叉——缓存命中同步
+        # 直接返回 diagnosis，未命中返回 job_id 由 agent 轮询；响应自描述）
+        if self._async_evaluate_enabled(params):
+            return self._async_submit(
+                "factor.evaluate", source, params, env, env_id,
+                extra_meta={"stage": "development", "causality_gate": True})
         result = self._run_factor("factor.evaluate", source, params, env)
         return self._wrap_diagnosis(env_id, source, "development", result)
 
     def _factor_evaluate_composite(self, params):
+        # C2：job_id 取结果——纯取回，不需要 env/source（放在一切校验前）
+        if params.get("job_id"):
+            return self._async_result(str(params["job_id"]))
         env_id = params.get("envId", "primary")
         env = self._require_panel_env(env_id)
         source = params.get("source", "")
-        self._enforce_causality(source, env, env_id)
+        # 因果门（2026-08-31 计算利用 PLAN 对齐）：同步路径就地；async 分支
+        # 随作业线程（提交侧零 worker 调用，秒回）
+        if not params.get("async"):
+            self._enforce_causality(source, env, env_id)
         if params.get("ingredients") is not None:
             params = {**params, "ingredients": _as_dict(params["ingredients"], "ingredients")}
+        # C1：source_hash/env_fp 注入——worker 侧成分缓存与桥同一键空间
+        env_fp = self._env_full_fingerprint(env_id)
+        params = {**params, "source_hash": source_fingerprint(source),
+                  **({"env_fp": env_fp} if env_fp else {})}
+        if params.get("async"):
+            return self._async_submit("factor.evaluate_composite", source,
+                                      params, env, env_id,
+                                      extra_meta={"causality_gate": True})
         result = self._run_factor("factor.evaluate_composite", source, params, env)
         return self._wrap_diagnosis(env_id, source, "composite", result)
 
     def _factor_evaluate_batch(self, params):
+        # C2/R24：job_id 纯取回放在一切校验前（重启后面板未加载也能收尸；
+        # 与 evaluate/composite/audit 同口——此前放在 _require_panel_env 后）
+        if params.get("job_id"):
+            return self._async_result(str(params["job_id"]))
         env_id = params.get("envId", "primary")
         env = self._require_panel_env(env_id)
         sources = params.get("sources") or {}
         if params.get("sources") is not None:
             sources = _as_dict(params["sources"], "sources")
             params = {**params, "sources": sources}
-        # 批次内每个因子也要过因果（缓存命中时零成本）
-        for name, src in sources.items():
-            self._enforce_causality(str(src), env, env_id)
+        # S1 拒绝即信息门（2026-09-04 探索相似性防线）：批量成员逐个过门
+        # （提交侧同步、零 trial；拒绝带成员名——F5 惯例；async 路径同样
+        # 在提交侧拦截，不进作业线程。审计判例：27 分钟双胞胎经批量通道
+        # 提交、双双 pass 烧账本——stage=batch 不代表非手写，门必须覆盖）。
+        for _name, _src in sources.items():
+            self._enforce_novelty_gate(str(_src), env_id, member=str(_name))
         # v2 申报制：整批同一声明 horizon（须 ∈ 菜单；scan 不适用于 batch——
-        # 菜单×批次 = 维度爆炸，scan 走 factor.evaluate 单因子路径）
+        # 菜单×批次 = 维度爆炸，scan 走 factor.evaluate 单因子路径）。
+        # R24（2026-08-31 隔离复审）：校验与 pool_std 注入提到 async 分支
+        # 之前——此前 async 在此 return：菜单外 horizon 静默回落主口径、
+        # deflated p 全员 None（sync/async 同请求不同统计）
         menu = list(getattr(env.calibration, "horizon_menu", None)
                     or [env.calibration.horizon])
         h_req = params.get("horizon")
@@ -2682,7 +4998,23 @@ class Bridge:
         _, trail_std_pre = self._trial_stats(None, h_b, env_id)
         pool_std_pre, _det_pre = self._resolve_pool_std(env_id, trail_std_pre, h_b)
         params = {**params, "horizon": h_b, "pool_std": pool_std_pre}
+        # R24：async 分支——因果门随作业线程逐成员执行（causality_sources；
+        # 此前 async 完全绕过因果门），A1 计账/重算由轮询侧后处理完成
+        if params.get("async"):
+            return self._async_submit(
+                "factor.evaluate_batch", "", params, env, env_id,
+                extra_meta={"causality_gate": True,
+                            "causality_sources": [str(s) for s in sources.values()]})
+        # 同步路径：批次内每个因子过因果（缓存命中时零成本）；拒绝带成员名（F5）
+        for name, src in sources.items():
+            self._enforce_causality_member(str(src), env, env_id, sources)
         result = self._run_factor("factor.evaluate_batch", params.get("source", ""), params, env)
+        return self._postprocess_batch_result(env_id, h_b, sources, result)
+
+    def _postprocess_batch_result(self, env_id, h_b, sources, result):
+        """batch 结果后处理（sync 路径与异步轮询共用，R24）：
+        成员 _meta/receipt/构造指纹 + A1 逐成员 trail 入账 + deflated
+        就地重算 + 族选择成本 + loop 指令。"""
         # 批次结果逐因子附指纹/对表（轻量：只附 _meta 不重复对表）
         if isinstance(result, dict) and isinstance(result.get("factors"), dict):
             fp = self._env_full_fingerprint(env_id)
@@ -2690,17 +5022,19 @@ class Bridge:
             for name, diag in result["factors"].items():
                 if not isinstance(diag, dict) or diag.get("error"):
                     continue
+                src = str(sources.get(name, ""))
                 diag["_meta"] = {"fingerprint": fp, "engine_version": __version__,
                                  "receipt": self._make_receipt(diag)}
                 diag["_receipt"] = diag["_meta"]["receipt"]
-                # v5 血缘：批成员也带构造指纹
-                diag["_construction_fp"] = _construction_fingerprint(str(src))
+                # v5 血缘：批成员构造指纹——按成员自己的源码算（R24 复审
+                # 修正：此前误用上一迭代的陈旧 src，全批共享末成员指纹）
+                diag["_construction_fp"] = (_construction_fingerprint(src)
+                                            if src else None)
                 # A1（2026-08-19 堵 batch 绕过）：批次成员与单因子 evaluate 同等
                 # 写入 trail_engine——N_eff 计数不因走 batch 通道而漏计。此前
                 # batch 成员不写 trail → N 恒不涨 → deflated p 按 N=1 给出，
                 # 拿 batch 诊断直接 submit 即绕过 D7 门控（实验证实）。
                 # v2：entry 带 horizon（试验单元 (hash, horizon)）。
-                src = str(sources.get(name, ""))
                 if src:
                     # 源码外挂库：与单因子通道同款（error 成员不记账也不入库）
                     try:
@@ -2912,7 +5246,15 @@ class Bridge:
         return result
 
     def _factor_audit(self, params):
-        env = self._require_panel_env(params.get("envId", "primary"))
+        # C2 延伸（2026-08-29 生产事故）：audit 在个股面板上是重方法
+        # （200 次列置换 + 内嵌全量 evaluate）——job_id 取结果 / async 提交
+        if params.get("job_id"):
+            return self._async_result(str(params["job_id"]))
+        env_id = params.get("envId", "primary")
+        env = self._require_panel_env(env_id)
+        if params.get("async"):
+            return self._async_submit("factor.audit", params.get("source", ""),
+                                      params, env, env_id)
         return self._run_factor("factor.audit", params.get("source", ""), params, env)
 
     # ---- 随机种子生成器（用户决策 2026-08-17：随机校准替代固定面板）----
@@ -3004,10 +5346,34 @@ class Bridge:
                 "light_ic": diag,
                 "tree": tree,
             })
-        # 按 |ic_ir| 排序取 top_k（无 ic_ir 的沉底）
-        results.sort(key=lambda r: -(abs(r["light_ic"].get("ic_ir") or 0.0)))
+        # P0a（2026-09-13 反同质化奖励）：novelty 贪心替代纯 argmax。
+        # 生产端标定 λ=0.3（54%/40% 选种去相关，付 10%/7% IC 牺牲幅度）；
+        # 历史参照 = explore_seeds.json 近 20 条已选 IC 序列（跨 farm 周期
+        # 防吸引子）。novelty_lambda=0 可关（回到旧行为）。
+        lam = float(params.get("novelty_lambda", 0.3))
+        env_key = str(params.get("envId", "primary"))
+        seeds_path = Path(self.state_root) / "explore_seeds.json"
+        hist = []
+        try:
+            if seeds_path.exists():
+                _sd = json.loads(seeds_path.read_text(encoding="utf-8"))
+                hist = [list(x) for x in ((_sd.get(env_key) or [])[-20:])
+                        if isinstance(x, list)]
+        except Exception:
+            hist = []
+
+        def _abs_ic(r):
+            v = r["light_ic"].get("ic_ir")
+            return abs(float(v)) if isinstance(v, (int, float)) else None
+
+        def _series(r):
+            s = r["light_ic"].get("ic_series")
+            return s if isinstance(s, list) and len(s) >= 20 else None
+
+        top_sel, top_div = _novelty_greedy(
+            results, _abs_ic, _series, top_k, hist, lam)
         top = []
-        for r in results[:top_k]:
+        for r in top_sel:
             src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
             top.append({
                 "index": r["index"],
@@ -3026,8 +5392,11 @@ class Bridge:
         tail_ranked = sorted(
             (r for r in results if _sp(r) is not None),
             key=lambda r: -_sp(r))
+        tail_sel, tail_div = _novelty_greedy(
+            tail_ranked, _sp, _series, top_k,
+            hist + [s for s in (_series(r) for r in top_sel) if s], lam)             if lam > 0 else (tail_ranked[:top_k], None)
         top_tail = []
-        for r in tail_ranked[:top_k]:
+        for r in tail_sel:
             src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
             top_tail.append({
                 "index": r["index"],
@@ -3061,7 +5430,20 @@ class Bridge:
                          "换手毛利 bps，高 = 经得起贵交易）——选择不是结论，"
                          "走标准管线验证"),
             })
-        overlap_idx = sorted({r["index"] for r in results[:top_k]}
+        # 选种历史持久化(top+top_tail 的 IC 序列,界 20)+ novelty 遥测
+        try:
+            _picked = [s for s in (_series(r) for r in top_sel) if s] +                       [s for s in (_series(r) for r in tail_sel) if s]
+            if _picked:
+                _sd = {}
+                if seeds_path.exists():
+                    _sd = json.loads(seeds_path.read_text(encoding="utf-8"))
+                _sd[env_key] = (list(_sd.get(env_key) or []) + _picked)[-20:]
+                tmp = seeds_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(_sd, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(seeds_path)
+        except Exception:
+            pass
+        overlap_idx = sorted({r["index"] for r in top_sel}
                              & {r["index"] for r in top_tail})
         dist = [abs(r["light_ic"].get("ic_ir") or 0.0) for r in results]
         sp_dist = [_sp(r) for r in results if _sp(r) is not None]
@@ -3071,6 +5453,12 @@ class Bridge:
             "top_tail": top_tail,
             "top_net": top_net,
             "overlap_indexes": overlap_idx,
+            "novelty": {
+                "lambda": lam,
+                "top_inner_abs_corr": top_div,
+                "tail_inner_abs_corr": tail_div,
+                "note": "P0a 反同质化选种:组内平均两两|ρ|(λ=0.3 生产标定);历史参照 explore_seeds.json 近20条",
+            },
             "abs_ic_ir_distribution": {
                 "median": float(np.median(dist)) if dist else None,
                 "p95": float(np.percentile(dist, 95)) if dist else None,
@@ -3091,6 +5479,16 @@ class Bridge:
             "break_even_cost（每单位换手毛利 bps）排序——统计平局间偏好"
             "低换手（成本定价，无奖励系数）；三列表都是选择不是结论，走"
             "标准管线验证")
+        # WS-C（2026-09-01）：三列表幸存者哈希入本线台账——这些原文直进
+        # 管线时引擎 trail 标 origin=random（agent 改造后哈希不同，如实
+        # 回落 hypothesis）。并集追加（多批 explore 都算），台账侧截尾
+        try:
+            lane_explore_hashes_extend(
+                self.state_root, current_lane(),
+                sorted({source_fingerprint(x["source"])
+                        for lst in (top, top_tail, top_net) for x in lst}))
+        except Exception:
+            pass
         return out
 
     def _factor_operators(self, params):
@@ -3166,6 +5564,11 @@ class Bridge:
     def _paths_append(self, params):
         layer = params.get("layer")
         entry = _as_dict(params.get("entry") or {}, "entry")
+        # lane 打标（方案 A 2026-08-31）：会话身份来自 dispatch contextvar，
+        # 覆盖 entry 里模型自填的同名字段——归属是基础设施事实，不是
+        # 模型可声明的元数据。三层都打（explored/search_paths 读端仍
+        # 全局共享，标签只作溯源）
+        entry["lane"] = current_lane()
         required = self._RECORD_SCHEMAS.get(layer)
         if required:
             missing = [f for f in required if not str(entry.get(f, "") or "").strip()]
@@ -3231,18 +5634,25 @@ class Bridge:
         if layer == "search_paths":
             return append_search_path(entry, self.state_root)
         if layer == "trail":
+            # S2 宣言分型校验（2026-09-04 探索相似性防线）：「新」宣称与
+            # 结构/L1 对账，不符则拒收重写（fail-open：校验故障不阻断写入）
+            self._declaration_gate(entry)
             # 穷尽宣告拒收（2026-08-24）：停笔宣言混进 next_hypothesis 会被
             # 引擎回显背书成状态（session.jsonl 实测 12/12 假穷尽）——写入口
-            # 直接拒绝，让停点定义权留在引擎机械判据手里
+            # 直接拒绝，让停点定义权留在引擎机械判据手里。
+            # 灵感重置声明（2026-09-01 WS-B）先于停笔判定：换源宣言不是
+            # 停笔宣言，理由里带「无新假设」等措辞不连坐（配额由
+            # _loop_directive 侧受理与限频，写入口只放行形态合法者）
             nh = str(entry.get("next_hypothesis", "") or "")
-            hit = _surrender_match(nh)
-            if hit:
-                raise BridgeError(
-                    -32602,
-                    f"next_hypothesis 被拒收（「{nh[:80]}」）：{hit}。"
-                    "停点仅由引擎机械判据触发（轮次/试验上限、IC_IR 改善收敛、"
-                    "finalize）。把 next_hypothesis 改写为可执行的新假设"
-                    "（构造什么、测什么），然后重写本条 trail")
+            if _inspiration_decl_match(nh) is None:
+                hit = _surrender_match(nh)
+                if hit:
+                    raise BridgeError(
+                        -32602,
+                        f"next_hypothesis 被拒收（「{nh[:80]}」）：{hit}。"
+                        "停点仅由引擎机械判据触发（轮次/试验上限、IC_IR 改善收敛、"
+                        "finalize）。把 next_hypothesis 改写为可执行的新假设"
+                        "（构造什么、测什么），然后重写本条 trail")
             # F4 引用溯源：文献驱动的假设必须携带 papers（paper→hypothesis
             # 链条可验证——「直接迁移自论文X」的宣称不再不可审计）
             papers = entry.get("papers")
@@ -3269,11 +5679,12 @@ class Bridge:
                         e["cited_rounds"].append(rnd)
                 self._write_papers(d)
             res = append_trail(entry, self.state_root)
-            # 方向段轮次计数（2026-08-25 arc 化）：一条叙事 trail = 当前
-            # 方向段一轮。上限按 arc 计不按终身计——机械换向（家族链断）
-            # 自动归零。计数失败不阻断叙事写入（少计只会更保守）。
+            # 方向段轮次计数（2026-08-25 arc 化；2026-08-31 lane 化）：
+            # 一条叙事 trail = 本线当前方向段一轮。上限按 arc 计不按
+            # 终身计——机械换向（本线家族链断）自动归零。计数失败不阻断
+            # 叙事写入（少计只会更保守）。
             try:
-                arc_rounds_bump(self.state_root)
+                arc_rounds_bump(self.state_root, lane=current_lane())
             except Exception:
                 pass
             return res
@@ -3290,16 +5701,21 @@ class Bridge:
             except Exception:
                 engine_trail = []
         agent_trail = read_json_list("trail", self.state_root)
+        agent_own = own_entries(agent_trail, current_lane())
         explored = read_json_list("explored", self.state_root)
         mining = read_mining_state(self.state_root)
         # 与 _loop_directive 同口径注入读时计算的计数（2026-08-25 修正：
         # 此前直接传 mining，cluster_trials 从不在盘上 → termination 恒显
-        # 示「簇试验 0/200」，与 loop 指令口径不一致）
-        streak = self._family_streak(engine_trail)
+        # 示「簇试验 0/200」，与 loop 指令口径不一致）。2026-08-31 lane
+        # 化：streak/arc 本线，n_trials 全局（计价口径与 loop 一致）
+        engine_own = own_entries(engine_trail, current_lane())
+        streak = self._family_streak(engine_own)
         n_trials = len({(e.get("source_hash"), e.get("horizon"))
                         for e in engine_trail if isinstance(e, dict)
                         and e.get("source_hash")})
-        effective = {**mining, "n_trials": n_trials, "cluster_trials": streak}
+        effective = {**mining, "arc_rounds": lane_arc_rounds(mining,
+                                                             current_lane()),
+                     "n_trials": n_trials, "cluster_trials": streak}
         verdicts = {}
         red_flagged = []
         for e in engine_trail:
@@ -3324,6 +5740,7 @@ class Bridge:
                 "source_hash": str(e.get("source_hash") or "")[:12],
                 "horizon": e.get("horizon"),
                 "stage": e.get("stage"),
+                "origin": e.get("origin"),
                 "ic_ir": e.get("ic_ir"),
                 "verdict": e.get("verdict"),
                 "red_flags": list(e.get("red_flags") or [])[:2],
@@ -3338,20 +5755,23 @@ class Bridge:
             # 自主性停走指令（2026-08-21）：恢复会话/定方向前先看这里——
             # loop.state=running 必须继续内循环，不得停下来问用户
             "loop": self._loop_directive(),
-            "last_engine_trail": [_trail_entry_compact(e) for e in engine_trail[-5:]],
+            "last_engine_trail": [_trail_entry_compact(e) for e in engine_own[-5:]],
             "evaluations": {"total": len(engine_trail),
+                            "lane": len(engine_own),
+                            "foreign": len(engine_trail) - len(engine_own),
                             "unique_sources": len({e.get("source_hash") for e in engine_trail}),
                             "verdict_counts": verdicts},
             # 源码外挂库（2026-08-29）：source_hash 即键，按
             # sources/<hash[:2]>/<hash>.py 取全文
             "source_store": factor_source_stats(self.state_root),
-            "agent_rounds": len(agent_trail),
+            "agent_rounds": len(agent_own),
             "explored_count": len(explored),
             "red_flagged": red_flagged[-10:],
             "pool": self._pool().stats(),
             "note": ("引擎层 trail 为 evaluate 自动记录（硬事实，不可瞒报）；"
-                     "last_engine_trail 为紧凑投影（每条 ≈150B，防呈现层截断），"
-                     "完整条目人读 stateRoot/trail_engine.json；"
+                     "last_engine_trail 为紧凑投影（每条 ≈150B，防呈现层截断）"
+                     "且只列本线最近 5 条（evaluations.lane/foreign 为分线计数，"
+                     "verdict_counts 仍全局）；完整条目人读 stateRoot/trail_engine.json；"
                      "agent 层叙事见 factor_query_paths(layer='trail' 不支持时读文件)"),
         }
 
@@ -3372,7 +5792,10 @@ class Bridge:
         # papers.json 是文献台账（F1，2026-08-24），同属挖掘记忆
         "mining": ["trail.json", "trail_engine.json", "explored_paths.json",
                    "search_paths.json", "mining_state.json", "pool",
-                   "papers.json", "sources"],
+                   "papers.json", "sources", "explore_seeds.json"],
+        # 不在任何 scope:registered_ledger.jsonl(分层计价台账,同 ledger.json
+        # 待遇——机制层 M 的依据,不可由任何 reset 抹除)与 journal/(模型自有
+        # 解释层,独立生命周期,走 journal 工具自管)
         "landscape": ["null_landscape.json", "operator_set.json"],
         "registry": ["registry.json"],
         "config": ["data-config.json"],
@@ -3554,6 +5977,20 @@ class Bridge:
             best = st  # trail 时间正序，最后一个即最新
         return best
 
+    def _run_gates_parallel(self, gates: dict):
+        """submit 门并发（方案 C，2026-08-29 用户拍板）。
+
+        提交全部门 → **等全部完成** → 返回 {name: Future}。调用方按
+        原判定序 .result() 合并，异常语义由各门原有的 try/except 包装
+        逐字保留——本方法只负责并发，不触碰判定与事务语义。各门是独立
+        worker 子进程（单线程 BLAS），线程只阻塞在 communicate 上等
+        待，无共享可变状态。等全部完成而非首个失败即返回：worker 无法
+        安全中断，失败路径的成本 = 最慢门的墙，可接受（语义优先）。"""
+        import concurrent.futures as _cf
+
+        with _cf.ThreadPoolExecutor(max_workers=max(2, len(gates))) as pool:
+            return {name: pool.submit(fn) for name, fn in gates.items()}
+
     def _registry_submit(self, params):
         """提交候选到 registry。收 factor_evaluate 的完整诊断对象做结构校验
         与充分统计量重算，随后引擎自主执行四个过拟合门（噪声世界 / day-perm /
@@ -3574,6 +6011,12 @@ class Bridge:
         diagnosis = params.get("diagnosis") or params.get("result")
         if not isinstance(diagnosis, dict) or "ic_ir_train" not in diagnosis:
             raise BridgeError(-32602, "registry_submit 需要 diagnosis（factor_evaluate 的完整诊断对象，含 ic_ir_train）")
+        # 坑10 加固（2026-09-06）：提交入口即加载面板。此前的 A3 提交期
+        # 重算在面板未加载的进程内会把环境指纹退回 spec 声明口径，与 null
+        # 地形绑定的加载后口径必然 mismatch → pool_std=None → "不可算"
+        # 拒绝（2026-09-04/05 五连实证；同进程 data.load 后即恢复）。前置
+        # _require_panel_env 一次性修复整条重算链。
+        _entry_env = self._require_panel_env(params.get("envId", "primary"))
         verified = self._verify_receipt(diagnosis)
         if verified is False:
             # receipt 在场但不匹配 = 关键数字（IC/充分统计量）被改动——
@@ -3727,10 +6170,37 @@ class Bridge:
                                            "nu": stats.get("nu"),
                                            "stats_from_trail": auth is not None,
                                            "recomputed_at_submit": True}
+        # 通道⑤ 豁免(批次4,2026-09-13):孵化幸存者豁免 dev deflated p——
+        # 复活证据=新鲜窗口 OOS t>z(cohort 校正),选择影子不跨样本,dev 的
+        # 选择运气价不再重复征收。仅豁免多重检验红旗这一项;噪声/正交/
+        # 同构/其他 red flag 照旧。验证口=incubation/survivors.jsonl(引擎写)
+        incubated_marker = None
+        if params.get("incubated_cohort"):
+            from .incubate import is_survivor
+            sv = is_survivor(self.state_root, src_hash_dp or "")
+            if sv is not None:
+                incubated_marker = {"cohort_id": sv.get("cohort_id"),
+                                    "t": sv.get("t")}
+                _rf = [f for f in (diagnosis.get("red_flags") or [])
+                       if not ("deflated p" in str(f) or "池分布基线" in str(f))]
+                if len(_rf) != len(diagnosis.get("red_flags") or []):
+                    diagnosis["red_flags"] = _rf
+                    if not _rf:
+                        diagnosis["verdict"] = "pass"
+                # passes_acceptance 同样门控 p(evaluate.py 单检验函数)——
+                # 豁免口径:原 p 存档审计,判定走复活证据
+                _dp2 = diagnosis.get("deflated_train")
+                if isinstance(_dp2, dict) and _dp2.get("p") is not None:
+                    _dp2["p_dev_original"] = _dp2.get("p")
+                    _dp2["p"] = 0.001
+                    _dp2["p_incubation_waived"] = True
         accepted, reason = _passes_acceptance(diagnosis)
         if diagnosis.get("red_flags"):
             accepted = False
             reason = f"red_flags 未清：{diagnosis['red_flags'][:2]}"
+        if incubated_marker is not None and accepted:
+            reason = (f"{reason} | incubated: dev deflated p 已豁免"
+                      "(OOS 复活证据在 incubation/survivors.jsonl)")
         # 噪声硬门（2026-08-24 用户设计决策）：因子在随机噪声世界上的
         # 直接表现。真 alpha 按构造不可预测噪声；噪声上仍显著 = 因子
         # 公式在拟合评价 artifact（管道偏差/重叠窗口构造），无条件拒收。
@@ -3738,13 +6208,99 @@ class Bridge:
         # worker 崩溃）= **事务中止（raise，不落盘）**——旧版写成
         # accepted=false 条目导致铁律烧名，重试被「不得重复入册」挡死。
         # 只有实质性判定（artifact 确认）才落拒绝条目。
+        # ===== 五门并行（2026-08-29 方案 C）=====
+        # IC 噪声 / day-perm / 平坦性 / spread 噪声 / G1 placebo 互不依赖
+        # （同一 source+env 的独立诊断，结果只汇入最终判定，无交叉喂入
+        # ——day-perm report-only、噪声/spread/placebo 只产 verdict）。
+        # 个股面板上顺序总和（~240+20+90+78+180s）必超客户端 360s 期限
+        # ——并行后墙钟 = max(门)。各门仍各享独立 worker 墙与预算自适应；
+        # _run_gates_parallel 等全部完成后按**原判定序**合并，事务语义
+        # 与顺序版逐字一致（任一门基础设施失败 = 中止不落盘可重试）。
+        _ms = read_mining_state(self.state_root)
+        _sub_env_id = params.get("envId", "primary")
+        _sub_env = self._require_panel_env(_sub_env_id)
+        import hashlib as _hl
+        _fp_ns = self._env_full_fingerprint(_sub_env_id) or "nofp"
+        _seed_ns = int(_hl.sha256(
+            str(_fp_ns).encode("utf-8")).hexdigest()[:8], 16)
+        # 换手率定价（2026-08-28 规划书 WS-T2 v1 双报）：判定基开关——
+        # false（默认）= G2/G3 判毛口径，net 三件套只陪跑；true = 三门
+        # 全 net 口径（G1 本就 net）。可被 mining_state.tail_net_basis 覆盖
+        _net_basis = bool(_ms.get("tail_net_basis",
+                                  MINING_CONFIG["tail_net_basis"]))
+        # 尾块按 (source_hash, horizon) 匹配用的口径 + placebo 门同源
+        hor_tb = diagnosis.get("horizon")
+        if not isinstance(hor_tb, (int, float)) or int(hor_tb) <= 0:
+            hor_tb = None
+        admit_basis = str(params.get("admit_basis") or "ic")
+        if admit_basis not in ("ic", "tail"):
+            raise BridgeError(-32602,
+                              f"admit_basis 必须是 ic | tail（收到 {admit_basis!r}）")
+        fp_decl = params.get("flatness_params")
+        if fp_decl is not None:
+            # 申报校验前置：失败快拒，不起 worker
+            self._flatness_decl_check(source, fp_decl)
+
+        def _gate_noise_ic():
+            return self._factor_noise_test({
+                "envId": _sub_env_id, "source": source,
+                "m": int(_ms.get("noise_gate_m", 50) or 50)})
+
+        def _gate_dayperm():
+            return self._factor_day_perm_test({
+                "envId": _sub_env_id, "source": source,
+                "m": int(_ms.get("day_perm_m", 200) or 200)})
+
+        _gates = {"noise": _gate_noise_ic, "dayperm": _gate_dayperm}
+        if fp_decl is not None:
+            def _gate_flatness():
+                return self._run_factor(
+                    "factor.flatness_test", str(source),
+                    {"flatness": fp_decl}, _sub_env)
+            _gates["flatness"] = _gate_flatness
+
+        def _gate_spread_noise():
+            # 2026-08-31 修正：G2 恒用毛统计量。z 判据的 null=「统计量围绕
+            # 0」只在毛口径成立——net 口径下随机世界均值 = −2·cost·E[turn]
+            # 的确定性成本拖累，z 全员爆负（实测 13/13 |z|≥7.5）≠ artifact。
+            # artifact 检测与成本无关（确定性偏移只稀释判别力）；net 定价
+            # 由 G1（real net vs 付成本随机选股 null）与 G3（net vs 付成本
+            # 地形）承载，两边同付成本、判据公平。
+            return self._run_factor(
+                "factor.noise_test", str(source),
+                {"m": int(_ms.get("tail_noise_m", 12) or 12),
+                 "base_seed": _seed_ns, "statistic": "spread"},
+                _sub_env)
+
+        _gates["spread"] = _gate_spread_noise
+        # G1 placebo：缓存读前置（命中零成本），未命中才进池
+        _placebo_gate_z: float | None = None
+        _placebo_gate_m: int | None = None
+        _tpm = int(_ms.get("tail_placebo_m", 120) or 0)
+        if _tpm > 0 and source and source_hash:
+            _KF = _sub_env.calibration.tail_k  # 2026-08-30 可配化：随环境口径
+            _tp_budget = float(_ms.get("tail_placebo_budget_secs", 180) or 180)
+            _tp_draws = max(60, _tpm)
+            _tp_h = int(hor_tb) if hor_tb is not None else None
+            _cached = self._placebo_cache_read(
+                _sub_env_id, source_hash, _tp_h, _KF, _seed_ns, _tp_draws)
+            if _cached is not None:
+                _placebo_gate_z = _cached.get("z")
+                _placebo_gate_m = _cached.get("draws")
+            else:
+                def _gate_placebo():
+                    return self._run_factor(
+                        "factor.tail_placebo", str(source),
+                        {"draws": _tp_draws, "seed": _seed_ns,
+                         "horizon": _tp_h, "budget_secs": _tp_budget},
+                        _sub_env)
+                _gates["placebo"] = _gate_placebo
+
+        _futs = self._run_gates_parallel(_gates)
+
         noise_report = None
         try:
-            noise_report = self._factor_noise_test({
-                "envId": params.get("envId", "primary"),
-                "source": source,
-                "m": int(read_mining_state(self.state_root).get(
-                    "noise_gate_m", 50) or 50)})
+            noise_report = _futs["noise"].result()
         except Exception as e:
             raise BridgeError(
                 -32003,
@@ -3774,11 +6330,7 @@ class Bridge:
         # Phase 6 校准（registry × 证伪 preset 混淆矩阵）后启用。
         dayperm_report = None
         try:
-            dayperm_report = self._factor_day_perm_test({
-                "envId": params.get("envId", "primary"),
-                "source": source,
-                "m": int(read_mining_state(self.state_root).get(
-                    "day_perm_m", 200) or 200)})
+            dayperm_report = _futs["dayperm"].result()
         except Exception as e:
             raise BridgeError(
                 -32003,
@@ -3790,14 +6342,9 @@ class Bridge:
         # 假阳性后已启用，见下方 cliff 分支）；申报不实（value 不在
         # source）= 事务中止拒收。
         flatness_report = None
-        fp_decl = params.get("flatness_params")
         if fp_decl is not None:
-            self._flatness_decl_check(source, fp_decl)
             try:
-                flatness_report = self._run_factor(
-                    "factor.flatness_test", str(source),
-                    {"flatness": fp_decl},
-                    self._require_panel_env(params.get("envId", "primary")))
+                flatness_report = _futs["flatness"].result()
             except BridgeError:
                 raise
             except Exception as e:
@@ -3830,10 +6377,6 @@ class Bridge:
         # submit 时**两轨都判**——admit_basis 决定哪轨管 acceptance，
         # tracks + dual_pass 是完整标注（audit 实证双过仅 ~4/19，
         # 是有区分度的信号质量维度）。
-        admit_basis = str(params.get("admit_basis") or "ic")
-        if admit_basis not in ("ic", "tail"):
-            raise BridgeError(-32602,
-                              f"admit_basis 必须是 ic | tail（收到 {admit_basis!r}）")
         # IC 轨判定快照（此刻 accepted/reason 已含 deflation/red_flags/
         # 噪声门/平坦性硬门全部 ic 链门）
         ic_verdict = {"accepted": bool(accepted),
@@ -3846,9 +6389,6 @@ class Bridge:
         # 账本键本身含 horizon，判定块与账本键口径必须一致）+
         # stage 排除（WS3 防线 b：test 区 spread_ir 绝不可用于 G3 准入
         # ——泄漏）
-        hor_tb = diagnosis.get("horizon")
-        if not isinstance(hor_tb, (int, float)) or int(hor_tb) <= 0:
-            hor_tb = None
         tail_block = None
         for e in reversed(engine_trail):
             if (isinstance(e, dict)
@@ -3860,26 +6400,8 @@ class Bridge:
                 if hor_tb is None or eh is None or int(eh) == int(hor_tb):
                     tail_block = e["tail"]
                     break
-        import hashlib as _hl
-        _fp_ns = self._env_full_fingerprint(
-            params.get("envId", "primary")) or "nofp"
-        _seed_ns = int(_hl.sha256(
-            str(_fp_ns).encode("utf-8")).hexdigest()[:8], 16)
-        # 换手率定价（2026-08-28 规划书 WS-T2 v1 双报）：判定基开关——
-        # false（默认）= G2/G3 判毛口径，net 三件套只陪跑；true = 三门
-        # 全 net 口径（G1 本就 net）。可被 mining_state.tail_net_basis 覆盖
-        _net_basis = bool(read_mining_state(self.state_root).get(
-            "tail_net_basis", MINING_CONFIG["tail_net_basis"]))
-        _tail_env = self._require_panel_env(params.get("envId", "primary"))
         try:
-            spread_noise = self._run_factor(
-                "factor.noise_test", str(source),
-                {"m": int(read_mining_state(self.state_root).get(
-                    "tail_noise_m", 12) or 12),
-                 "base_seed": _seed_ns, "statistic": "spread",
-                 "net_cost": (float(_tail_env.calibration.cost)
-                              if _net_basis else None)},
-                _tail_env)
+            spread_noise = _futs["spread"].result()
         except Exception as e:
             raise BridgeError(
                 -32003,
@@ -3916,58 +6438,38 @@ class Bridge:
         # 轻量值（degraded 标注）。基础设施失败（编译/超时）：tail 轨 =
         # 事务中止（对齐 G2 spread 门 b670a65）；ic 轨 = 降级轻量值
         # （标注只作 tracks.tail，不拦主判定）。
-        _tpm = int(read_mining_state(self.state_root).get(
-            "tail_placebo_m", 120) or 0)
-        _placebo_gate_z: float | None = None
-        _placebo_gate_m: int | None = None
-        if _tpm > 0 and source and source_hash:
-            from .factor.tail import K_FRAC as _KF
-            _tp_budget = float(read_mining_state(self.state_root).get(
-                "tail_placebo_budget_secs", 180) or 180)
-            _tp_draws = max(60, _tpm)
-            _tp_h = int(hor_tb) if hor_tb is not None else None
-            _cached = self._placebo_cache_read(
-                params.get("envId", "primary"), source_hash, _tp_h,
-                _KF, _seed_ns, _tp_draws)
-            if _cached is not None:
-                _placebo_gate_z = _cached.get("z")
-                _placebo_gate_m = _cached.get("draws")
-            else:
+        _placebo_ran = "placebo" in _futs
+        if _placebo_ran:
+            try:
+                _rep = _futs["placebo"].result()
+            except Exception as e:
+                if admit_basis == "tail":
+                    raise BridgeError(
+                        -32003,
+                        f"G1 权威 placebo 执行失败（事务中止，可直接"
+                        f"重试）：{type(e).__name__}: {e}。可先 "
+                        "factor_noise_test 自测因子耗时，或设置 "
+                        "mining_state.tail_placebo_m=0 走轻量逃生门")
+                _rep = None
                 try:
-                    _rep = self._run_factor(
-                        "factor.tail_placebo", str(source),
-                        {"draws": _tp_draws, "seed": _seed_ns,
-                         "horizon": _tp_h, "budget_secs": _tp_budget},
-                        self._require_panel_env(
-                            params.get("envId", "primary")))
-                except Exception as e:
-                    if admit_basis == "tail":
-                        raise BridgeError(
-                            -32003,
-                            f"G1 权威 placebo 执行失败（事务中止，可直接"
-                            f"重试）：{type(e).__name__}: {e}。可先 "
-                            "factor_noise_test 自测因子耗时，或设置 "
-                            "mining_state.tail_placebo_m=0 走轻量逃生门")
-                    _rep = None
-                    try:
-                        import sys as _sys
-                        _sys.stderr.write(
-                            f"[tail_placebo] ic 轨降级轻量值（执行失败）: "
-                            f"{type(e).__name__}: {e}\n")
-                    except Exception:
-                        pass
-                if isinstance(_rep, dict):
-                    _gz = _rep.get("z")
-                    if isinstance(_gz, (int, float)) and math.isfinite(_gz):
-                        _placebo_gate_z = float(_gz)
-                        _placebo_gate_m = _rep.get("draws")
-                        self._placebo_cache_write(
-                            params.get("envId", "primary"), source_hash,
-                            _tp_h, _KF, _seed_ns,
-                            int(_rep.get("draws") or 0),
-                            {k: _rep.get(k) for k in
-                             ("z", "draws", "null_mean", "null_std",
-                              "periods", "truncated")})
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[tail_placebo] ic 轨降级轻量值（执行失败）: "
+                        f"{type(e).__name__}: {e}\n")
+                except Exception:
+                    pass
+            if isinstance(_rep, dict):
+                _gz = _rep.get("z")
+                if isinstance(_gz, (int, float)) and math.isfinite(_gz):
+                    _placebo_gate_z = float(_gz)
+                    _placebo_gate_m = _rep.get("draws")
+                    self._placebo_cache_write(
+                        params.get("envId", "primary"), source_hash,
+                        _tp_h, _KF, _seed_ns,
+                        int(_rep.get("draws") or 0),
+                        {k: _rep.get(k) for k in
+                         ("z", "draws", "null_mean", "null_std",
+                          "periods", "truncated")})
         from .factor.tailgate import tail_admission, tail_ledger
         tail_decision = tail_admission(
             tail_block, tail_ledger(engine_trail), _z_spread, s0_emp=_s0_emp,
@@ -4053,6 +6555,59 @@ class Bridge:
                     _entry_cpu_rel = round(float(_entry_cpu_s) / _ref, 2)
             except Exception:
                 _entry_cpu_rel = None
+        # 正交门（2026-09-06，设计见 state.py MINING_CONFIG 注释与
+        # book_ranks.py）：显著性门回答"它自己是否真实"，本门回答"账本
+        # 是否已知"。仅对将通过验收的候选执行（未过验收者不入册，无冗余
+        # 可言）；基础设施失败 → 跳过不拒绝不烧名（book.backfill 重建）。
+        ortho_report = None
+        cand_u16 = None
+        cand_dates = None
+        if accepted and source_hash and MINING_CONFIG.get("orthogonality_gate", True):
+            try:
+                from .book_ranks import dev_rank_u16, load_book_cache, check_candidate
+                _ortho_env = self._require_panel_env(params.get("envId", "primary"))
+                ns = {"env": _ortho_env}
+                exec(source, ns)
+                F_cand = np.asarray(ns["factor"](_ortho_env), dtype=np.float64)
+                cand_u16, cand_dates = dev_rank_u16(
+                    _ortho_env, F_cand, _ortho_env.calibration.dev_end)
+                cache = load_book_cache(self.state_root)
+                if not cache or not cache.get("names"):
+                    ortho_report = {"status": "skipped",
+                                    "why": "book cache empty——先运行 book.backfill 建立在册秩基线"}
+                else:
+                    ortho_report = check_candidate(
+                        cache, cand_u16,
+                        reject_th=float(MINING_CONFIG.get("ortho_reject_th", 0.80)),
+                        annotate_th=float(MINING_CONFIG.get("ortho_annotate_th", 0.60)))
+                    # 正交门降级为提示（2026-09-10 用户决策）：冗余度不再否决
+                    # 入册——深挖式重组（绑已知强腿过 deflation 墙）与正交硬拒
+                    # 结构性冲突，前者恰是新域唯一现实入口。缺省 soft；置
+                    # ortho_hard_gate=True 可恢复旧硬拒行为。
+                    # 2026-09-15 两树收敛注记：此块 09-10 只落主树，worktree
+                    # 昨夜以硬门运行并烧名一次——用户复裁恢复软门后自主树
+                    # 移植归位。
+                    if (ortho_report.get("action") == "reject"
+                            and not MINING_CONFIG.get("ortho_hard_gate", False)):
+                        ortho_report["action"] = "annotate"
+                        ortho_report["hint"] = (
+                            "冗余度超 reject_th——按 2026-09-10 决策降级为提示，"
+                            "提交照常入册；test 区为最终仲裁")
+                    if ortho_report.get("action") == "reject":
+                        accepted = False
+                        _rk = "substantive"
+                        reason = (f"正交门拒收：与在册「{ortho_report['worst_name']}」"
+                                  f"|ρ̄|={ortho_report['max_corr']:.2f} 同源"
+                                  "（冗余非无效——账本变更后可依程序重议）")
+                        next_moves = [
+                            {"move": "structural_new_hypothesis",
+                             "detail": (f"与在册 {ortho_report['worst_name']} 同源——"
+                                        "构造正交新方向；确系同源变体时在 signal 中显式声明关系")},
+                        ]
+            except Exception as e:
+                ortho_report = {"status": "skipped",
+                                "why": ("ortho check infra failure（不拒绝不烧名）："
+                                        f"{type(e).__name__}: {e}")[:220]}
         entry = {
             "name": name,
             # ts（2026-08-27 WS-A）：紧凑投影的时间字段——旧条目无此键，
@@ -4077,6 +6632,11 @@ class Bridge:
             "dual_pass": dual_pass,
             "source": source,
             "source_hash": source_hash,
+            # WS-C 灵感源标注（2026-09-01）：与引擎 trail 同一判定口径
+            "origin": self._inspiration_origin(source_hash, current_lane()),
+            # 通道⑤ 豁免标注(批次4):OOS 复活证据可审计
+            **({"incubated_admitted": incubated_marker}
+               if incubated_marker is not None and accepted else {}),
             "fingerprint": (diagnosis.get("_meta") or {}).get("fingerprint")
                            or self._env_full_fingerprint(params.get("envId", "primary")),
             "engine_version": __version__,
@@ -4087,6 +6647,8 @@ class Bridge:
             "cpu_s": _entry_cpu_s,
             "cpu_rel": _entry_cpu_rel,
         }
+        if ortho_report is not None:
+            entry["orthogonality"] = ortho_report
         # 终点写（并行 P0）：提交前的长计算（噪声门等）不持锁；落盘时刻
         # 锁内重读 registry——预检查用的是几分钟前的快照，并发会话可能
         # 已写入同名/同源码条目。锁内重跑硬不变量（同源码/同名非程序性
@@ -4110,6 +6672,23 @@ class Bridge:
                     "换名提交或用 factor_registry_update 修正已有条目。")
             registry.append(entry)
             write_registry(registry, self.state_root)
+            # 正交门秩缓存追加（2026-09-06）：入册即入账本基线，此后后续
+            # 提交的候选会与它做值相关检查。失败不阻断——book.backfill 可
+            # 全量重建。
+            try:
+                if accepted and cand_u16 is not None:
+                    from .book_ranks import append_to_cache as _ortho_append
+                    if not _ortho_append(self.state_root, name, cand_dates,
+                                         cand_u16,
+                                         str(entry.get("fingerprint"))):
+                        import sys as _sx
+                        _sx.stderr.write(
+                            "[orthogonality] 秩缓存追加跳过（缺失/日期/指纹"
+                            "不符）——运行 book.backfill 重建基线\n")
+            except Exception as _exc_o:
+                import sys as _sx2
+                _sx2.stderr.write(f"[orthogonality] 秩缓存追加失败（不阻断）: "
+                                  f"{_exc_o!r}\n")
         # 永久审计账本（v4 2026-08-22）：ledger.json 记录每一次 submit——
         # name/结果/门参数/p，**不随任何 state.reset scope 清除**（只随
         # scope=registry 连带清空）。不做门的输入（层 2 已评审撤回：
@@ -4176,6 +6755,207 @@ class Bridge:
         if next_moves is not None:
             result["next_moves"] = next_moves
         return result
+
+    def _book_backfill(self, params):
+        """重建在册账本秩缓存（正交门基线，2026-09-06）。
+
+        对 registry 全部 accepted 条目逐只重算 dev 区秩（每只秒级）并落
+        book_ranks.npz。缓存过期（新入册未追加/指纹变更）时由提交路径
+        提示运行本方法。→ {status, n_factors, n_dates, failed}"""
+        env_id = params.get("envId", "primary")
+        env = self._require_panel_env(env_id)
+        from .book_ranks import rebuild_book_cache
+        registry = read_registry(self.state_root)
+        entries = [e for e in registry
+                   if e.get("accepted") and (e.get("source") or "").strip()]
+        fp = self._env_full_fingerprint(self._resolve_env_id(env_id))
+        report = rebuild_book_cache(self.state_root, env, entries,
+                                    fingerprint=fp)
+        if isinstance(report, dict) and report.get("status") == "ok":
+            say = getattr(self, "_on_progress", None)
+            if say:
+                say({"label": "book.backfill",
+                     "done": report.get("n_factors"),
+                     "total": report.get("n_factors")})
+        return report
+
+    # ---- 推理日志（构造面 v7 2026-09-12：双层记忆的解释层，引擎只当机械仓库管理员）----
+    def _journal_read(self, params):
+        """渐进披露读：level 0=INDEX(L0)/1=live 全文(L1)/2=按 id 拉单条(L2)。"""
+        from . import journal as _j
+        try:
+            lvl = int(params.get("level", 0))
+        except (TypeError, ValueError):
+            raise BridgeError(-32602, "level 必须是 0|1|2") from None
+        try:
+            return _j.read_journal(self.state_root, lvl,
+                                   params.get("entry_id"))
+        except _j.JournalError as e:
+            raise BridgeError(-32602, str(e)) from None
+
+    def _journal_append(self, params):
+        """追加条目块到 live（首行约定校验：`## <id> <status> <标题>`；
+        registered 传 source=因子源码——引擎算 hash 作 ref，评估后镜像
+        按它关联；或显式写 `ref:<source_hash>` 行）。"""
+        from . import journal as _j
+        content = params.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise BridgeError(-32602,
+                              "content 必填（markdown 条目块，首行 `## <id> "
+                              "<status> <标题>`）")
+        source = params.get("source")
+        if source is not None and not isinstance(source, str):
+            raise BridgeError(-32602, "source 须是因子源码字符串（引擎按它计算 ref）")
+        try:
+            return _j.append_entry(self.state_root, content, source)
+        except _j.JournalError as e:
+            raise BridgeError(-32602, str(e)) from None
+
+    def _journal_update(self, params):
+        """状态迁移/补 note（open→registered→adjudicated→resolved|stale，
+        active→retired；同状态调用=补 note 合法）。"""
+        from . import journal as _j
+        eid = params.get("id")
+        if not eid:
+            raise BridgeError(-32602, "id 必填（live 区条目 ID，INDEX 里查）")
+        try:
+            return _j.update_entry(self.state_root, str(eid),
+                                   str(params.get("status") or ""),
+                                   params.get("note"))
+        except _j.JournalError as e:
+            raise BridgeError(-32602, str(e)) from None
+
+    def _journal_distill(self, params):
+        """弧末蒸馏：旧 live 快照入 raw/（防洗账）→ 终条目归档+墓志 →
+        新 live 落盘 → INDEX 重建。遗漏的活条目自动保留并警示。"""
+        from . import journal as _j
+        new_live = params.get("new_live")
+        if not isinstance(new_live, str):
+            raise BridgeError(-32602,
+                              "new_live 必填（蒸馏后的 live 全文——保留 preamble "
+                              "与活条目，终条目会被引擎自动归档）")
+        try:
+            return _j.distill(self.state_root, new_live)
+        except _j.JournalError as e:
+            raise BridgeError(-32602, str(e)) from None
+
+    def _standby_view(self, params):
+        """候补线视图(批次0,2026-09-13):dev 优异未过线存量的派生只读视图。
+
+        复活通道①③⑤的取材面;agent 无申诉权(复活由机械触发)。
+        → {rows[], count_raw, count_family_dedup, meta}"""
+        from .standby import standby_view
+        try:
+            return standby_view(
+                self.state_root,
+                min_abs_sr=float(params.get("min_abs_sr", 0.75)),
+                top_n=int(params.get("top_n", 30)),
+                family_dedup=bool(params.get("family_dedup", True)))
+        except (TypeError, ValueError):
+            raise BridgeError(-32602,
+                              "min_abs_sr/top_n 须为数值;family_dedup 布尔") from None
+
+    def _standby_combine(self, params):
+        """通道③(批次3):规则化组合——候补池两两|ρ|<0.3 按分数取前 k 等权
+        符号对齐;规则作为 dof=1 注册假设登记(journal+台账),组合走标准
+        evaluate_composite(异步 job,凭 job_id 轮询)。agent 只触发不选成员。"""
+        from .standby import combine as _combine
+        rep = _combine(self.state_root,
+                       k=int(params.get("k", 4) or 4),
+                       ortho_th=float(params.get("ortho_th", 0.3) or 0.3),
+                       min_abs_sr=float(params.get("min_abs_sr", 0.75) or 0.75))
+        if not rep.get("ok"):
+            return rep
+        comp_src, comp_hash = rep["composite_source"], rep["composite_hash"]
+        # 规则注册:journal registered(dof=1 机制层假设)+台账直接落盘
+        # (composite 评估不走 _wrap_diagnosis 镜像,此处是层成员资格的写入点)
+        jid = f"C-{comp_hash[:8]}"
+        try:
+            from . import journal as _j
+            _j.append_entry(self.state_root,
+                            f"## {jid} registered 规则化组合(通道③)\n"
+                            f"预期:组合联合 alpha(成员各自近门,√K 增益过线)",
+                            source=comp_src)
+        except Exception as _e:
+            try:
+                sys.stderr.write(f"[standby.combine] journal 注册失败(继续): {_e}\n")
+            except Exception:
+                pass
+        try:
+            import ast as _ast
+            _tree = _ast.parse(comp_src)
+            _ops = sum(1 for _n in _ast.walk(_tree) if isinstance(_n, _ast.Call))
+            with state_write_lock(self.state_root):
+                with open(Path(self.state_root) / "registered_ledger.jsonl",
+                          "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps({
+                        "ts_registered": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "ts_eval": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "source_hash": comp_hash, "journal_id": jid,
+                        "ops": _ops, "depth": 3,
+                        "via": "standby.combine",
+                        "members": [m["hash"][:12] for m in rep["members"]],
+                    }, ensure_ascii=False) + "\n")
+        except Exception as _e:
+            try:
+                sys.stderr.write(f"[standby.combine] 台账落盘失败(继续): {_e}\n")
+            except Exception:
+                pass
+        # 成分源码(按成员 hash 从 sources 库取)
+        from .standby import standby_view
+        ing = {}
+        for m in rep["members"]:
+            f = Path(self.state_root) / "sources" / m["hash"][:2] / f"{m['hash']}.py"
+            ing[m["hash"][:12]] = f.read_text(encoding="utf-8")
+        rep.pop("composite_source", None)   # 全文走返回的评估参数,不双份
+        out = self._factor_evaluate_composite({
+            "envId": params.get("envId", "primary"),
+            "source": comp_src, "ingredients": ing,
+            "async": params.get("async", True)})
+        if isinstance(out, dict):
+            out["standby_combine"] = rep
+        return out
+
+    def _incubate_enqueue(self, params):
+        """通道⑤ 入队:hashes(cohort 成员,agent 自由选择——dev 选择不污染
+        新数据,统计免费;容量 ≤50),window_days 缺省 120。源码冻结。"""
+        from . import incubate as _inc
+        return _inc.enqueue(self.state_root,
+                            params.get("hashes") or [],
+                            window_days=int(params.get("window_days", 120) or 120),
+                            start_date=params.get("start_date"))
+
+    def _incubate_status(self, params):
+        from . import incubate as _inc
+        return _inc.status(self.state_root)
+
+    def _incubate_judge(self, params):
+        """通道⑤ 判决:需 env 已加载且数据含 start 后 window_days 个新交易
+        日。幸存者落 survivors.jsonl;submit 凭 incubated_cohort 豁免 dev
+        deflated p(其余门照旧)。窗口未满=not_ready,不消耗判决。"""
+        from . import incubate as _inc
+        cid = str(params.get("cohort_id") or "")
+        if not cid:
+            raise BridgeError(-32002, "cohort_id 必填(incubate.status 查)")
+        env = self._require_panel_env(params.get("envId", "primary"))
+        return _inc.judge(self.state_root, env, cid,
+                          compile_fn=self._compile_factor)
+
+    def _journal_stats(self, params):
+        """遥测：live 条目计数/登记率(evaluates 中带 registered 预期的比例)/
+        蒸馏次数/pull 计数。行为对照（journal 开/关）的数据源。"""
+        from . import journal as _j
+        d = _j._lane_dir(self.state_root, _j._current_lane())
+        if not d.exists():
+            return {"exists": False, "hint": "本线日志未开立"}
+        counts = _j.rebuild_index(d)["counts"]
+        st = _j._read_stats(d)
+        return {"exists": True, "counts": counts, "stats": st,
+                "registration_rate": (round(st["mirrored"] / st["evals"], 3)
+                                      if st.get("evals") else None),
+                "live_chars": (_j._live_path(d).stat().st_size
+                               if _j._live_path(d).exists() else 0),
+                "live_char_cap": _j.LIVE_CHAR_CAP}
 
     def _registry_update(self, params):
         """修正已入册条目的描述性字段（2026-08-18 换名重登事故的产品化通道）。
@@ -4502,11 +7282,19 @@ def main(argv=None):
     parser.add_argument("--probe", action="store_true", help="print version and exit")
     parser.add_argument("--state-root", dest="state_root", default=None)
     parser.add_argument("--data-config", dest="data_config", default=None)
+    # 进程级默认 lane（2026-08-31 方案 A）：直连 CLI/ZCode 并行会话各起
+    # 一个 bridge 进程时用；请求级 lane（dsh web 共享 bridge）优先于此
+    parser.add_argument("--lane", dest="lane", default=None,
+                        help="process-default parallel-lane id "
+                             "(request-level lane takes precedence)")
     args = parser.parse_args(argv)
 
     if args.probe:
         print(json.dumps({"ok": True, "version": __version__, "schemaVersion": PROTOCOL_SCHEMA_VERSION}))
         return 0
+
+    if args.lane:
+        os.environ.setdefault("DSH_FACTOR_MINING_LANE", args.lane)
 
     bridge = Bridge(state_root=args.state_root, data_config_path=args.data_config)
     _register_bridge_instance(bridge.state_root)
