@@ -655,6 +655,18 @@ def _novelty_greedy(cands, score_of, series_of, top_k, hist, lam=0.3):
     return chosen, (float(_np.mean(inner)) if inner else None)
 
 
+def _self_locked(attr: str):
+    """按实例属性名串行化方法(2026-09-18 双通道并发):
+    status 走读快道后,loop 组装(含深化遥测重估/战役推进写盘)会被
+    并发调用——重估段串行化防 history 双推进。"""
+    def deco(fn):
+        def wrapper(self, *a, **k):
+            with getattr(self, attr):
+                return fn(self, *a, **k)
+        return wrapper
+    return deco
+
+
 class Bridge:
     # C2（修正案 A 2026-08-28）：重方法 = 成本乘数/并行池所在——run 目录
     # 保留 out.json；异步作业并发上限（防单线程桥自淹没）
@@ -735,6 +747,7 @@ class Bridge:
         # 等待先来者结果，不重复 spawn）；烟测/验证子进程并发信号量（burst
         # 下瞬时 smoke worker 数有界，防权重核算外的进程超订）
         self._smoke_inflight: dict[tuple, threading.Event] = {}
+        self._telemetry_lock = threading.Lock()
         self._smoke_spawn_sem = threading.Semaphore(2)
         self._rewrite_inflight: set[str] = set()    # source_fp -> 重写作业在途
         self._optimizer_lock = threading.Lock()
@@ -3706,6 +3719,7 @@ class Bridge:
                            "）——有 tail 块的评估积累后自动出现")
         return out
 
+    @_self_locked('_telemetry_lock')
     def _deepen_telemetry(self, engine_trail: list) -> dict:
         """IC 线近失深化遥测（2026-09-15 正修：进 loop 响应，与尾部线
         near_misses 对称）。
@@ -7298,11 +7312,66 @@ def main(argv=None):
 
     bridge = Bridge(state_root=args.state_root, data_config_path=args.data_config)
     _register_bridge_instance(bridge.state_root)
-    bridge._on_progress = lambda p: print(
-        json.dumps({"jsonrpc": "2.0", "method": "progress", "params": p}, ensure_ascii=False),
-        flush=True)
-    print(json.dumps({"jsonrpc": "2.0", "method": "ready", "params": bridge._status({})}, ensure_ascii=False),
-          flush=True)
+
+    # 2026-09-18 读写分离双通道(机制层提效):原主循环纯串行——一个同步
+    # evaluate_batch(实测中位 ~17min)占住进程,后续轻请求(status/journal/
+    # paths/drive 注入查询)全部排队(实测 factor_status 最长 91min,本地
+    # read/grep 亦被同批长尾拖到 105min)。TS 客户端按 id 配对响应
+    # (#pending Map),乱序返回安全。通道划分:
+    #   读快道(_FAST_RO,线程池并发): 无副作用的查询方法;
+    #   串行道(FIFO 单线程): 一切写方法/重计算/未知方法——保序+零竞态
+    # (引擎内存态未做全面线程安全审计;_deepen_telemetry 已加实例锁,
+    # status 的 loop 组装并发安全)。progress/ready 共享写出锁。
+    _FAST_RO = {
+        "status", "paths.query", "journal.read", "journal.stats",
+        "registry.get", "state.trail_summary", "library.query",
+        "standby.view", "incubate.status", "report.export",
+    }
+
+    out_lock = threading.Lock()
+
+    def emit(obj):
+        with out_lock:
+            print(json.dumps(obj, ensure_ascii=False, default=_json_default), flush=True)
+
+    bridge._on_progress = lambda p: emit(
+        {"jsonrpc": "2.0", "method": "progress", "params": p})
+    emit({"jsonrpc": "2.0", "method": "ready", "params": bridge._status({})})
+
+    def handle_one(msg):
+        req_id = msg.get("id")
+        if msg.get("method") is None or msg.get("method") == "cancel":
+            # Cancellation is best-effort in the synchronous prototype.
+            return
+        try:
+            result = bridge.dispatch(msg["method"], msg.get("params") or {})
+            emit({"jsonrpc": "2.0", "id": req_id, "result": _json_safe(result)})
+        except BridgeError as e:
+            emit(_rpc_error(req_id, e.code, e.message, e.data))
+        except DataError as e:
+            # 用户数据/配置错误 → 域错误码（非内部错误），信息可直接呈现给用户
+            emit(_rpc_error(req_id, -32002, str(e)))
+        except Exception as e:
+            emit(_rpc_error(req_id, -32603, f"Internal error: {e}",
+                            {"traceback": traceback.format_exc(limit=3)}))
+
+    import queue as _queue
+    from concurrent.futures import ThreadPoolExecutor
+
+    fast_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="rpc-fast")
+    write_q: "_queue.Queue" = _queue.Queue()
+
+    def write_worker():
+        while True:
+            msg = write_q.get()
+            if msg is None:
+                return
+            try:
+                handle_one(msg)
+            except Exception:
+                pass  # handle_one 已自带兜底,此处防御线程边界
+
+    threading.Thread(target=write_worker, name="rpc-write", daemon=True).start()
 
     for line in sys.stdin:
         line = line.strip()
@@ -7311,26 +7380,12 @@ def main(argv=None):
         try:
             msg = json.loads(line)
         except Exception:
-            print(_rpc_error(None, -32700, "Parse error"), flush=True)
+            emit(_rpc_error(None, -32700, "Parse error"))
             continue
-        req_id = msg.get("id")
-        if msg.get("method") == "cancel":
-            # Cancellation is best-effort in the synchronous prototype.
-            continue
-        if msg.get("method") is None:
-            continue
-        try:
-            result = bridge.dispatch(msg["method"], msg.get("params") or {})
-            print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": _json_safe(result)}, ensure_ascii=False,
-                             default=_json_default), flush=True)
-        except BridgeError as e:
-            print(_rpc_error(req_id, e.code, e.message, e.data), flush=True)
-        except DataError as e:
-            # 用户数据/配置错误 → 域错误码（非内部错误），信息可直接呈现给用户
-            print(_rpc_error(req_id, -32002, str(e)), flush=True)
-        except Exception as e:
-            print(_rpc_error(req_id, -32603, f"Internal error: {e}",
-                             {"traceback": traceback.format_exc(limit=3)}), flush=True)
+        if msg.get("method") in _FAST_RO:
+            fast_pool.submit(handle_one, msg)
+        else:
+            write_q.put(msg)
     return 0
 
 
