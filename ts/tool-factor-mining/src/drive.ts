@@ -259,16 +259,22 @@ export function applyDrive(
           const strategy: Strategy | undefined = loop.strategy
           if (strategy === undefined || typeof strategy.directive !== 'string') return
           const isSimple = SIMPLE_TYPES.has(strategy.type)
+          // 2026-09-18 死锁兜底:query(里程碑审计)同 key 也允许限次重推——
+          // 引擎侧 query key 曾只含 accepted 数,审计完成后 accepted 不变 →
+          // key 冻结 → sameKey 去重永久拦截(实测 stock 账本 36 只恰为 3 的
+          // 倍数,双线夜挖 stock 会话停摆)。引擎已正修(key 并入 agent_rounds),
+          // 此处为旧引擎/AI 不写 trail 的残余场景兜底,与 simple 共用上限。
+          const repeatable = isSimple || strategy.type === 'query'
           const sameKey = strategy.key !== undefined && strategy.key === state.lastKey
-          // 同 key 去重只约束复杂类型（防无状态变化的无限循环）；简单类型
-          // （continue）允许原地重推——用户 31 次 push 中的高频模式——
+          // 同 key 去重只约束复杂类型（防无状态变化的无限循环）；可重推型
+          // （continue/query）允许原地重推——用户 31 次 push 中的高频模式——
           // 但受连续上限约束（用户决策 2：简单 push ≤5 连续）。
-          if (sameKey && !isSimple) return
-          if (isSimple && state.consecutiveSimple >= maxSimple) {
+          if (sameKey && !repeatable) return
+          if (repeatable && state.consecutiveSimple >= maxSimple) {
             // 方案 B (2026-09-17): an armed deadline REPLACES the simple cap
             // as the stop condition — without one the original fuse holds.
             if (deadlineMs === undefined) {
-              ctx.logger.info(`factor-mining drive: 连续简单注入达上限 ${maxSimple}，`
+              ctx.logger.info(`factor-mining drive: 连续可重推注入达上限 ${maxSimple}，`
                 + '暂停自动推进，等待真人指示')
               return
             }
@@ -299,7 +305,7 @@ export function applyDrive(
           }
           agent.followup(message)
           state.lastKey = strategy.key
-          state.consecutiveSimple = isSimple ? state.consecutiveSimple + 1 : 0
+          state.consecutiveSimple = repeatable ? state.consecutiveSimple + 1 : 0
           ctx.logger.info(`factor-mining drive: 注入 ${strategy.type}`
             + ` (${strategy.key ?? 'no-key'}, 连续简单 ${state.consecutiveSimple}/${maxSimple})`
             + ` msg.id=${message.id}`)
