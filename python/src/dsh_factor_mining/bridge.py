@@ -417,7 +417,9 @@ _STRATEGY_DIRECTIVES = {
     "refine": ("深挖当前最优因子：分析它的特性与构成（各窗口/算子/信息源"
                "各自承担了什么），构思补正与强化方法，逐一验证。"),
     "rotate": ("换一个方向：先用 factor_query_paths 查已试路径避免重复，"
-               "再从一个未覆盖的维度构造新假设并验证。"),
+               "再从一个未覆盖的维度构造新假设并验证；一时没有新方向，就用 "
+               "factor_random_generate(mode='explore') 生成随机因子找灵感，"
+               "幸存者逐个走标准管线（causality→evaluate→evaluate_batch）。"),
     "literature": ("从文献找灵感：用 factor_arxiv_search 检索方法论论文"
                    "（数学结构/微观结构/时间序列建模），提取一个可迁移的"
                    "构造思路，自己改进后验证。"),
@@ -518,10 +520,12 @@ def _timeout_rotate_strategy(n: int, lane_trials: int,
         "why": (f"距上次试验落账已超 {mins} 分钟且无在途评估——"
                 f"超时换向重置灵感（第 {n} 次，无上限）"),
         "directive": (
-            f"引擎超时换向：距上次试验落账已超过 {mins} 分钟。若评估或构造"
-            "正在进行，回报进度并继续、不必换向；否则立即换向重置灵感：先用 "
+            f"距上次试验落账已超过 {mins} 分钟。若评估或构造正在进行，"
+            "回报进度并继续即可；否则立即换一个方向：先用 "
             "factor_query_paths 查已试路径避免重复，再从一个未覆盖的维度"
-            "构造新假设并验证。"),
+            "构造新假设并验证；一时没有新方向，就用 "
+            "factor_random_generate(mode='explore') 生成随机因子找灵感，"
+            "幸存者逐个走标准管线（causality→evaluate→evaluate_batch）。"),
     }
 
 

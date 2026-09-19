@@ -89,11 +89,30 @@ function jsonRecord(value: unknown, field: string): Record<string, unknown> {
 export function apply(ctx: Context, config: Config): void {
   const service = ctx.factorMining as FactorMiningService
   // Dual-line routing (2026-09-17): one session, one ledger. A session that
-  // called factor_root_use sticks to that root's bridge; unbound sessions
-  // (and providers without forRoot) use the default root.
+  // called factor_root_use sticks to that root's bridge.
+  // 首调门（2026-09-19 用户拍板，0.1.16）：有会话身份但未声明账本的调用
+  // 不再静默路由默认 root——返回一次性声明提示，错线路径在机械上不存在
+  // （此前新会话首调会被隐式绑到默认个股账本：ETF 会话污染个股试验计数
+  // + 收到个股引擎指令 + 错误绑定落盘）。无会话身份（工具/回放上下文）
+  // 维持旧回退（单线用法正确）。factor_root_use 自身先 bind 后 svcFor，
+  // 天然过门。
+  const GATE_MSG = ('[账本未声明] 本会话尚未绑定因子账本，本次调用未执行。'
+    + '个股线：factor_root_use {root:"default"}；ETF 线：factor_root_use '
+    + '{root:"etf"}。声明后重试本调用（一次性声明，重启持久）。')
+  const gatedService = (): FactorMiningService =>
+    new Proxy({} as FactorMiningService, {
+      get: () => () => Promise.reject(new Error(GATE_MSG)),
+    })
   const svcFor = (exec: unknown): FactorMiningService => {
     const key = rootOfExec(exec)
-    if (key === undefined || service.forRoot === undefined) return service
+    if (key === undefined) {
+      const id = (exec as { agent?: { id?: unknown } } | undefined)?.agent?.id
+      if (typeof id === 'string' && id.length > 0 && service.forRoot !== undefined) {
+        return gatedService()
+      }
+      return service
+    }
+    if (service.forRoot === undefined) return service
     try {
       return service.forRoot!(key)
     } catch {

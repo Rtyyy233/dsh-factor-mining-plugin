@@ -191,7 +191,8 @@ def test_timeout_rotate_strategy_shape():
     assert s["key"] == "rotate-timeout:2:7"
     assert "factor_query_paths" in s["directive"]
     assert "回报进度" in s["directive"]  # 误报无害化
-    assert "换向" in s["directive"]
+    assert "换一个方向" in s["directive"]
+    assert "factor_random_generate" in s["directive"]  # 随机因子兜底（用户五点之二）
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import type { FactorMiningService } from '@deepseek-ai/dsh-factor-mining'
-import { laneOfSession, rootOfSession } from './lane.ts'
+import { boundSessionIds, laneOfSession, rootOfSession } from './lane.ts'
 
 /** Injector configuration; every field has a deployment-visible default. */
 export interface DriveConfig {
@@ -54,7 +54,10 @@ export interface DriveConfig {
   deadline?: string
   /** Fallback sweep interval (ms). Periodically re-runs the injection check
    *  for tracked sessions so a stalled one (no turn/end events reaching us)
-   *  still gets re-ignited. 0 disables the sweep (default). */
+   *  still gets re-ignited. **Default ON (5 min) since 2026-09-19**（用户
+   *  指令：挖掘不停止）——治理间隔窗的静默会话唯一复活通道是本扫描，
+   *  原默认 0（关）的前提"无死线=有人值守"被治理静默窗打破；0 仍可
+   *  显式关闭。 */
   wakeIntervalMs?: number
 }
 
@@ -118,7 +121,7 @@ export function applyDrive(
     return parsed
   })()
   let deadlineLabel: string | undefined = config.deadline
-  let wakeMs = config.wakeIntervalMs ?? 0
+  let wakeMs = config.wakeIntervalMs ?? 300_000
   /** Sessions that called a factor_* tool in this host run (mining sessions). */
   const factorSessions = new Set<unknown>()
   const states = new Map<unknown, DriveState>()
@@ -196,7 +199,10 @@ export function applyDrive(
               try {
                 await scoped.sessions?.flush?.(agent.session)
               } catch { /* checkpoint failure is non-fatal for the injection */ }
-              const text = '[引擎推进][deadline] 挖掘死线已到（'
+              // 2026-09-19 用户决策：注入去引擎标识、用户口吻——模型对
+              // "引擎消息"打折（吸收不执行），对用户指令不打折。溯源保
+              // 留在宿主日志（ctx.logger），不进模型上下文。
+              const text = '挖掘死线已到（'
                 + `${deadlineLabel}）。请立即收官，不要再发起新试验：`
                 + '汇总本会话的试验数/入册/near-miss 与账本状态，'
                 + '写一份收官战报后结束。'
@@ -207,7 +213,7 @@ export function applyDrive(
                         ?? `drive-${Date.now()}-${Math.random().toString(36).slice(2)}`),
                   role: 'user',
                   content: [{ type: 'text', text }],
-                  source: { kind: 'plugin', plugin: 'dsh-tool-factor-mining/drive' },
+                  source: { kind: 'user' },
                 }
               } catch (e) {
                 ctx.logger.warn(`factor-mining drive: 收官消息构造失败: ${renderThrown(e)}`)
@@ -227,8 +233,16 @@ export function applyDrive(
             // 必须是该会话自己的 pending/族链/预算，不是别的并行线的
             // 2026-09-17 双线：会话绑定过账本(factor_root_use)则查该
             // 账本的 loop——stock 会话与 etf 会话各推各的引擎指令
+            // 2026-09-19 挖掘不停止：未绑定会话**不注入**——重启后绑定
+            // 丢失期曾把个股（默认 root）指令注进 ETF 对话；绑定落盘后
+            // 已知会话必有记录，无记录=真未知，宁可沉默也不串线
             const rootKey = rootOfSession(sessionId)
-            const svc = rootKey !== undefined && service.forRoot !== undefined
+            if (rootKey === undefined) {
+              ctx.logger.info('factor-mining drive: 会话无账本绑定（无落盘记录且未 '
+                + 'factor_root_use）——不注入，避免错线')
+              return
+            }
+            const svc = service.forRoot !== undefined
               ? (() => {
                   try {
                     return service.forRoot!(rootKey)
@@ -283,9 +297,12 @@ export function applyDrive(
           try {
             await scoped.sessions?.flush?.(agent.session)
           } catch { /* checkpoint failure is non-fatal for the injection */ }
-          const text = `[引擎推进][${strategy.type}] ${strategy.directive}\n`
-            + `（依据：${strategy.why}。本消息由因子挖掘引擎自动注入；`
-            + '停点仅由引擎机械判据触发，请继续内循环，不要停下来等待指示。）'
+          // 2026-09-19 用户决策：注入正文 = 指令本身——无 [引擎推进] 前缀、
+          // 无依据尾注、source 标 user（不标注不是用户消息）。理由：模型
+          // 已实测把带引擎标识的消息当可吸收的机器通知（等待环吸收
+          // rotate 指令），用户口吻不打折。why/键等遥测保留在 loop 响应
+          // 与宿主日志，不进注入正文。
+          const text = strategy.directive
           // 2026-08-25 崩溃修复（review 修订）：不用 createUserMessage
           // （版本不匹配风险）也不 Object.freeze——DSH followup 内部可能
           // 需要往消息上附加字段（序列号/时间戳），freeze 在 ES module
@@ -297,7 +314,7 @@ export function applyDrive(
                     ?? `drive-${Date.now()}-${Math.random().toString(36).slice(2)}`),
               role: 'user',
               content: [{ type: 'text', text }],
-              source: { kind: 'plugin', plugin: 'dsh-tool-factor-mining/drive' },
+              source: { kind: 'user' },
             }
           } catch (e) {
             ctx.logger.warn(`factor-mining drive: 消息构造失败: ${renderThrown(e)}`)
@@ -322,12 +339,17 @@ export function applyDrive(
 
       // Host session events; payload shape mirrors dsh-session's
       // SessionEventMap. Errors here must never propagate either.
+      // 2026-09-19 挖掘不停止：注册名单从落盘绑定种子恢复（重启后无需
+      // 手动唤醒，静默会话也进扫描视野）。未绑定会话不做隐式 default
+      // 绑定（0.1.16 首调门接管：未声明=工具报提示+注入器不注入，
+      // 直到 factor_root_use 显式选边并落盘）。
+      for (const id of boundSessionIds()) factorSessions.add(id)
       scoped.on('session/event',
         (session: { id: unknown }, event: { type: string; data: any }) => {
           try {
             const data = event.data ?? {}
             if (event.type === 'tool/call'
-              && typeof data.name === 'string' && data.name.startsWith('factor_')) {
+                && typeof data.name === 'string' && data.name.startsWith('factor_')) {
               factorSessions.add(session.id)
               trimSessions()
               return
@@ -370,8 +392,11 @@ export function applyDrive(
         try {
           const sweep = (ctx as unknown as Record<string, any>).interval(() => {
             for (const id of factorSessions) {
-              const s = states.get(id)
-              if (s === undefined || s.timer !== undefined) continue
+              // stateFor（非 states.get）：种子/重启恢复的会话没有 state 条目，
+              // 旧写法会把它们整个跳过——扫描视野等于白撒（09-19 实证：换向
+              // 第 3 注因无人查状态而永缺）
+              const s = stateFor(id)
+              if (s.timer !== undefined) continue
               void driveNow(id)
             }
           }, wakeMs)
