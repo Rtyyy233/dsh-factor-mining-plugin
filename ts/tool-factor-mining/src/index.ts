@@ -443,7 +443,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_operators',
-    description: 'View or configure the effective operator set for the random seed generator. action=get returns the active set; action=set writes a user override {disable?: string[], windows?: number[], delays?: number[]} to the user state root.',
+    description: 'View or configure the effective operator set for the random seed generator. action=get returns the active set; action=set writes a user override {disable?: string[], windows?: number[], delays?: number[], humps?: number[], disable_templates?: string[], template_share?: number} to the user state root.',
     parameters: {
       action: { type: 'string', description: 'get (default) or set.', enum: ['get', 'set'] },
       override: { type: 'json', description: 'set only: {disable?, windows?, delays?} override object.' },

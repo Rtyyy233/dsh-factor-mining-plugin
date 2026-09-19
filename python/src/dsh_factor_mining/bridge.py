@@ -92,6 +92,8 @@ from .state import (
     inspiration_declare,
     lane_arc_rounds,
     lane_decl_seen_update,
+    lane_drive_bk,
+    lane_drive_bk_update,
     lane_explore_hashes_extend,
     lane_random_used,
     random_emit_count,
@@ -429,7 +431,98 @@ _STRATEGY_DIRECTIVES = {
                 "正交组合（目标截面相关 < 0.7），用 factor_evaluate_composite 验证。"),
     "query": ("正交性审计：计算最近入册因子与既有入册因子的截面相关性，"
               "确认是否带来增量信息；发现高相关就记录 explored 并构造去重组合。"),
+    "drain": ("机械库存已清空（无未消化假设、无近失待深化、无组合库存）——"
+              "从随机因子找灵感：factor_random_generate(mode='explore') 生成"
+              "一批（省略 seed 走运行时派生），三列表（top/top_tail/top_net）"
+              "幸存者逐个走标准管线（causality→evaluate→evaluate_batch "
+              "deflation）；随机通道不可用或连续失败时改从文献找灵感"
+              "（factor_arxiv_search，种子查询见 literature 指令）。供数型"
+              "探索：幸存者是选择不是结论，未过门如实入账。"),
 }
+
+
+def _govern_decide(bk: dict, *, now: float, growth: bool, async_running: bool,
+                   chosen_type: str | None, lane_trials: int,
+                   cfg: dict | None = None) -> dict:
+    """推进治理（2026-09-19 终稿：超时换向制，纯函数，可单测）。
+
+    演进：初版"有界补推+收摊终态"被用户否决——drained/stalled 收摊会让
+    预定任务在死线前静默，违反"死线=最低期限非收摊点"纪律（且收摊判据
+    "三发无响应"远弱于真终态的枯竭证据）。终稿（用户方案）：
+      - **一段时间无本线试验落账 → 引擎注入 rotate 重置灵感**——无上限、
+        无终态；死线收官与 finalize 是仅有的结束方式。换向直接作废自我
+        续命的等待环声明（复述式催促等于请它继续等）。
+      - drain（库存清空的供数指令，随机优先论文次之）保留：间隔窗内
+        原键续供（注入器同键去重静默）；预算（3 发）耗尽后落入超时换向
+        循环，不发终态。
+      - 增长 = **本线引擎试验数前进**（叙事回合不算——等待环的一句话
+        每轮写一条 trail，旧定义被它喂成"永远在增长"）。键只编
+        lane_trials（零增长期稳定）与序号（每次超时换新键恰好推送一注）。
+      - 误报无害化：评估在途（异步作业守卫）不判超时。
+
+    返回 action ∈ {pass, drain_hold, drain_emit, rotate_hold,
+    rotate_emit}，附 key/count/reason。
+    """
+    cfg = cfg or MINING_CONFIG
+    dmax = int(cfg.get("drain_max_emissions", 3))
+    dspace = float(cfg.get("drain_repush_spacing_s", 900))
+    stuck_after = float(cfg.get("stuck_after_s", 1800))
+    last_key = str(bk.get("last_key") or "")
+    last_ts = float(bk.get("last_ts") or 0.0)
+    reset = bool(growth)
+    # growth_ts 显式判型取值（`or` 幂等陷阱：0.0 是合法时戳却被当缺失）
+    _gts = bk.get("growth_ts")
+    stuck = ((now - (float(_gts) if isinstance(_gts, (int, float)) else now))
+             > stuck_after and not growth)
+    if chosen_type == "drain":
+        within_space = last_key.startswith("drain:") and now - last_ts < dspace
+        d_next = int(bk.get("drain", 0) or 0) + 1
+        if within_space:
+            return {"action": "drain_hold", "key": last_key,
+                    "reason": f"drain 间隔窗内（<{int(dspace // 60)}min）——原键续供，注入器去重静默"}
+        if d_next <= dmax:
+            return {"action": "drain_emit", "count": d_next,
+                    "key": f"drain:{d_next}:{lane_trials}",
+                    "reason": f"drain 发射 {d_next}/{dmax}"}
+        if not stuck and last_key.startswith("drain:"):
+            # 预算耗尽但未到超时窗：原键续供静默，超时换向接管
+            return {"action": "drain_hold", "key": last_key,
+                    "reason": "drain 预算耗尽——原键续供静默，超时换向接管"}
+        # 预算耗尽且超时 → 落入下方换向分支
+    if stuck and not async_running:
+        n = int(bk.get("timeout", 0) or 0)
+        if (last_key.startswith("rotate-timeout:")
+                and now - last_ts <= stuck_after):
+            return {"action": "rotate_hold", "key": last_key, "count": n,
+                    "reason": "超时换向间隔窗内——原键续供静默"}
+        return {"action": "rotate_emit", "count": n + 1,
+                "key": f"rotate-timeout:{n + 1}:{lane_trials}",
+                "reason": (f"距上次落账超 {int(stuck_after // 60)}min 零增长——"
+                           f"超时换向重置灵感（第 {n + 1} 次，无上限）")}
+    return {"action": "pass",
+            "reset": reset,
+            "reason": ("零增长但窗内/评估在途" if stuck else "正常推进")}
+
+
+def _timeout_rotate_strategy(n: int, lane_trials: int,
+                             stuck_after_s: int) -> dict:
+    """超时换向指令（2026-09-19 用户方案）：无试验落账超窗 → 注入
+    rotate 重置灵感。type 复用 rotate（注入器非可重推→同键去重静默），
+    键编超时序号+lane_trials：序号保证每次超时换新键恰好推送一注，
+    试验数在零增长期稳定使去重咬得住。误报无害化：评估或构造在途时
+    模型回报进度并继续、不必换向。"""
+    mins = max(1, int(stuck_after_s // 60))
+    return {
+        "type": "rotate",
+        "key": f"rotate-timeout:{n}:{lane_trials}",
+        "why": (f"距上次试验落账已超 {mins} 分钟且无在途评估——"
+                f"超时换向重置灵感（第 {n} 次，无上限）"),
+        "directive": (
+            f"引擎超时换向：距上次试验落账已超过 {mins} 分钟。若评估或构造"
+            "正在进行，回报进度并继续、不必换向；否则立即换向重置灵感：先用 "
+            "factor_query_paths 查已试路径避免重复，再从一个未覆盖的维度"
+            "构造新假设并验证。"),
+    }
 
 
 def _pick_strategy(*, stop_kind: str | None = None, streak: int,
@@ -438,7 +531,9 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
                    n_trials: int, lit_search_count: int = 0,
                    family_marginal: dict | None = None,
                    inspiration_reset: dict | None = None,
-                   random_available: bool = True) -> dict | None:
+                   random_available: bool = True,
+                   drained: bool = False,
+                   milestone_fired: int | None = None) -> dict | None:
     """下一轮方向类型选择（纯函数，供注入器与 loop 指令共用）。
 
     停点分流（2026-08-25 arc 化 + 2026-08-26 v8 族收敛）：
@@ -466,7 +561,12 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
        → 深挖载体特性补正强化）
     R4 pending 被拒收（停笔宣言）→ rotate
     R5 frozen pending（同一句冻结 ≥2 轮）→ rotate
-    R6 accepted≥3 且为 3 的倍数 → query（里程碑审计）
+    R6 accepted≥3 且为 3 的倍数且**未消费**（drive_bk.milestone）→ query
+       （里程碑审计；2026-09-19 边沿触发一次即消费——旧电平触发在入册数
+       停在倍数上时永远重推同一 query，是 09-19 空转实录的引擎侧根源）
+    R6.5 drained（机械库存清空：无 pending/无近失队列/无组合库存）→ drain
+       （2026-09-19：供数型换向——随机因子优先、论文次之；限发+零增长
+       检测由 _govern_decide 总闸管理，注入器零改动）
     R7 pass 未入册 ≥3 → compose
     R8 兜底 → continue
     尾部线无数据（tail_marginal.enough_data=False）→ 回到 IC 单轨判定。
@@ -547,9 +647,19 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
     elif frozen:
         t = "rotate"
         why = "同一句 next_hypothesis 已冻结 ≥2 轮——停摆模式，强制换方向"
-    elif accepted_n >= 3 and accepted_n % 3 == 0:
+    elif (accepted_n >= 3 and accepted_n % 3 == 0
+          and accepted_n != milestone_fired):
+        # 2026-09-19 边沿触发：入册数**跨入** 3 倍数时发一次即消费
+        # （消费记录 drive_bk.milestone）。旧电平触发在入册数停在倍数上
+        # 时永远推荐同一 query——审计答没答引擎看不见（09-19 03:00-10:00
+        # 空转实录）。答卷不检测：正交性硬保证在入册时的机器门上。
         t = "query"
-        why = f"已入册 {accepted_n} 个因子——里程碑正交性审计"
+        why = f"已入册 {accepted_n} 个因子——里程碑正交性审计（一次即消费）"
+    elif drained:
+        # 2026-09-19 机械库存清空：不等待、供数型换向（随机优先论文次之）
+        t = "drain"
+        why = ("机械库存清空（无未消化假设、无近失待深化、无组合库存）——"
+               "从随机因子或论文找灵感重启供数")
     elif pass_unadmitted >= 3:
         t = "compose"
         why = f"{pass_unadmitted} 个已验证未入册的单因子——组合机会库存充足"
@@ -794,14 +904,32 @@ class Bridge:
         except Exception:
             return None
 
+    def _landscape_env_fingerprint(self, env_id: str) -> str | None:
+        """null 地形专用指纹（2026-09-18 缝1正修）：环境三元组 + 生效算子集。
+
+        算子集指纹（含算子实现源码哈希、窗口/延迟/阈值、模板配置）进地形
+        绑定——扩算子/改实现/改模板占比后旧地形判 mismatch，pool_std 失效
+        直至重校准（此前指纹不含算子集，变更静默漂移墙口径）。只绑地形：
+        receipt/缓存/trail 用的环境指纹不含算子集（手写因子不依赖随机
+        生成器的采样配置）。
+        """
+        fp = self._env_full_fingerprint(env_id)
+        if fp is None:
+            return None
+        from .factor import random_gen
+        return (fp + "+op:"
+                + random_gen.opset_fingerprint(
+                    random_gen.effective_operator_set(self.state_root)))
+
     def _landscape_fingerprint_status(self, landscape, env_id: str) -> str:
         """null 地形指纹比对：'match' | 'mismatch' | 'legacy_no_field'。
 
         指纹硬门（2026-08-19）的统一判据：地形写盘时绑定的 env_fingerprint
-        必须等于当前环境指纹（数据文件+口径+引擎版本三元组，纯复用
-        _env_full_fingerprint——trail_engine 条目一直在用）。旧版地形无
-        字段 → legacy_no_field，与 mismatch 同判无效（宁可保守：重跑一次
-        null 校准，几分钟，换永久绑定；否则换数据集的洞一直开着）。
+        必须等于当前环境指纹（数据文件+口径+引擎版本三元组 **+ 生效算子集**，
+        2026-09-18 起；纯复用 _landscape_env_fingerprint——与 null 校准写入
+        同一合成）。旧版地形无字段 → legacy_no_field，与 mismatch 同判无效
+        （宁可保守：重跑一次 null 校准，几分钟，换永久绑定；否则换数据集
+        的洞一直开着）。
         """
         if not isinstance(landscape, dict):
             return "mismatch"
@@ -809,9 +937,9 @@ class Bridge:
         if fp is None:
             return "legacy_no_field"
         try:
-            cur = self._env_full_fingerprint(self._resolve_env_id(env_id))
+            cur = self._landscape_env_fingerprint(self._resolve_env_id(env_id))
         except Exception:
-            cur = self._env_full_fingerprint(env_id)
+            cur = self._landscape_env_fingerprint(env_id)
         return "match" if fp == cur else "mismatch"
 
     def _progress(self, label: str, done: int, total: int):
@@ -1919,6 +2047,15 @@ class Bridge:
             # 进程，绝不继承 DSH 工作区 cwd（node_modules 循环符号链接事故）
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                # stdin=DEVNULL（2026-09-18 事故根因二）：worker 绝不读
+                # stdin，但继承桥的 stdin（JSON-RPC 管道）会让 CPython
+                # 3.14 解释器初始化（Py_Initialize 的 stdio 探测，
+                # fflush/lseek→ZwQueryInformationFile）在该句柄上永久
+                # 阻塞——实测 15ms CPU 后零增量冻结，烟测门 60s 误判
+                # 「死循环」拒绝一切评估（含全向量化平凡因子；py-spy
+                # 栈实证）。DEVNULL 同时消除 worker 偷读 RPC 通道字节
+                # 的潜在协议风险。
+                stdin=subprocess.DEVNULL,
                 text=True, env=env_os, cwd=str(run_root),
                 # R31（2026-08-31 生产双实证）：worker 绝不继承宿主控制台——
                 # 控制台上的 Ctrl+C/控制事件（宿主重启、宿主侧 pwsh 等待被
@@ -4675,6 +4812,31 @@ class Bridge:
         rnd_used = lane_random_used(mining, lane)
         rnd_quota = int(mining.get("random_strategy_quota",
                                    MINING_CONFIG["random_strategy_quota"]))
+        # ---- 推进治理总闸（2026-09-19）：drain 判据 + 增长检测 ----
+        # deepen 遥测提前算（drain 判据读队列；loop 响应复用同值）
+        deepen_tel = self._deepen_telemetry(engine_trail)
+        _dnote = str(deepen_tel.get("note") or "")
+        drained = (pending is None and pending_rejected is None
+                   and inspiration_reset is None
+                   and not (deepen_tel.get("queue") or [])
+                   and "不可算" not in _dnote
+                   and max(pass_n - accepted_n, 0) < 3)
+        bk = lane_drive_bk(mining, lane)
+        _now = time.time()
+        # 增长 = 本线引擎试验数前进（09-19 生产复犯修正：叙事回合不算
+        # 增长——等待环的一句话每轮写一条 trail，旧定义 (回合数,全局试验数)
+        # 被它喂成"永远在增长"，drain/nudge 从未触发）
+        _growth = n_trials_lane != bk.get("growth_trials")
+        if _growth:
+            # 本线真试验落账 → 超时换向/drain 计数全重置
+            try:
+                bk = lane_drive_bk_update(
+                    self.state_root, lane,
+                    growth_trials=n_trials_lane, growth_ts=_now,
+                    timeout=0, drain=0)
+            except Exception:
+                bk = dict(bk, growth_trials=n_trials_lane,
+                          growth_ts=_now, timeout=0, drain=0)
         strategy = _pick_strategy(
             stop_kind=stop_kind, streak=streak,
             pending_rejected=pending_rejected, frozen=frozen,
@@ -4683,7 +4845,17 @@ class Bridge:
             n_trials=n_trials, lit_search_count=lit_search_count,
             family_marginal=fam_marg,
             inspiration_reset=inspiration_reset,
-            random_available=rnd_used < rnd_quota)
+            random_available=rnd_used < rnd_quota,
+            drained=drained, milestone_fired=bk.get("milestone"))
+        # 里程碑消费（边沿触发）：query 挂出即记账（幂等；崩溃最坏丢一条
+        # 里程碑不重发——不会回到电平触发）
+        if strategy is not None and strategy.get("type") == "query":
+            try:
+                lane_drive_bk_update(self.state_root, lane,
+                                     milestone=accepted_n)
+                bk["milestone"] = accepted_n
+            except Exception:
+                pass
         if strategy is not None and strategy.get("type") == "random":
             try:
                 random_emit_count(self.state_root, lane, agent_rounds)
@@ -4691,6 +4863,42 @@ class Bridge:
                     read_mining_state(self.state_root), lane)
             except Exception:
                 pass
+        # ---- 推进治理（_govern_decide 纯函数，2026-09-19 终稿：超时换向
+        #      制，无终态）：drain 限发 / 超时换向重置灵感——死线前永不
+        #      静默，死线收官与 finalize 是仅有的结束方式 ----
+        g = {"action": "none"}
+        if strategy is not None:
+            g = _govern_decide(
+                bk, now=_now, growth=_growth,
+                async_running=bool(getattr(self, "_async_jobs", None)),
+                chosen_type=strategy.get("type"),
+                lane_trials=n_trials_lane)
+            act = g.get("action")
+            if act == "drain_hold":
+                strategy["key"] = str(g.get("key"))
+            elif act == "drain_emit":
+                strategy["key"] = str(g.get("key"))
+                try:
+                    bk = lane_drive_bk_update(
+                        self.state_root, lane,
+                        drain=int(g.get("count") or 0),
+                        last_key=strategy["key"], last_ts=_now)
+                except Exception:
+                    pass
+            elif act in ("rotate_hold", "rotate_emit"):
+                strategy = _timeout_rotate_strategy(
+                    int(g.get("count") or 1), n_trials_lane,
+                    int(MINING_CONFIG.get("stuck_after_s", 1800)))
+                strategy["key"] = str(g.get("key") or strategy["key"])
+                if act == "rotate_emit":
+                    try:
+                        bk = lane_drive_bk_update(
+                            self.state_root, lane,
+                            timeout=int(g.get("count") or 0),
+                            timeout_ts=_now, last_key=strategy["key"],
+                            last_ts=_now)
+                    except Exception:
+                        pass
         # WS-B 回执（agent 可见配额，与 pending_rejected 同一可见性原则）：
         # 受理回合用台账返回值（快照 mining 未含本次扣额），无声明时用快照
         _bucket = (mining.get("lanes") or {}).get(lane) or {}
@@ -4717,7 +4925,25 @@ class Bridge:
             "stop_reason": stop_reason,
             "family_convergence": fam_conv[2],
             "tail": self._tail_telemetry(engine_trail),
-            "deepen": self._deepen_telemetry(engine_trail),
+            "deepen": deepen_tel,
+            "governor": {
+                "drained": drained,
+                "since_growth_s": int(_now - (float(bk["growth_ts"])
+                                              if isinstance(bk.get("growth_ts"),
+                                                            (int, float))
+                                              else _now)),
+                "drain_emitted": int(bk.get("drain", 0) or 0),
+                "timeout_rotates": int(bk.get("timeout", 0) or 0),
+                "milestone_consumed": bk.get("milestone"),
+                "last_action": g.get("action"),
+                "note": g.get("reason"),
+                "thresholds": {
+                    "stuck_after_s": int(MINING_CONFIG.get("stuck_after_s", 1800)),
+                    "drain_max": int(MINING_CONFIG.get("drain_max_emissions", 3)),
+                },
+                "policy": ("超时换向制：无落账超窗 → 注入 rotate 重置灵感"
+                           "（无上限无终态，死线前永不静默）"),
+            },
             "pending_hypothesis": pending,
             "pending_rejected": pending_rejected,
             "inspiration_reset": {
@@ -5302,7 +5528,8 @@ class Bridge:
                         or [env.calibration.horizon])
             return random_gen.run_null_calibration(
                 env, self.state_root, n=n, seed=seed, opset=opset,
-                env_fingerprint=self._env_full_fingerprint(fp_env),
+                # 2026-09-18 缝1正修：地形绑定含算子集指纹（写入/校验同合成）
+                env_fingerprint=self._landscape_env_fingerprint(fp_env),
                 horizons=menu,
                 # 换手定价（2026-08-28）：成本口径戳进 landscape（v1 毛段，
                 # net 重校时换版本串 + spread_cost）
@@ -5345,11 +5572,21 @@ class Bridge:
                 spread_ref = landscape["spread"].get(
                     str(int(env.calibration.horizon)))
         results = []
+        # 2026-09-18 缝2/结构扩充：叶子按 env 可用性过滤（与 null 校准同款，
+        # 无 amount 的 env 不再生成含 amount 的整棵 error 树）+ 模板通道 +
+        # 健康门（inf/爆炸/退化树标 error 不进选种）
+        leaves = random_gen.env_leaves(env)
         for i in range(n):
-            tree = random_gen.generate_tree(rng, opset)
+            tree, tpl = random_gen.generate_one(rng, opset, leaves=leaves)
             try:
                 F = random_gen._eval_tree(tree, env)
-                diag = random_gen.light_ic_scan(F, env, spread_ref=spread_ref)
+                ph = random_gen.matrix_health(F)
+                if ph is not None:
+                    diag = {"ic_mean": None, "ic_ir": None, "n": 0,
+                            "spread_ir": None, "spread_pct": None,
+                            "error": f"random-pathology:{ph.get('pathology')}"}
+                else:
+                    diag = random_gen.light_ic_scan(F, env, spread_ref=spread_ref)
             except Exception as e:
                 diag = {"ic_mean": None, "ic_ir": None, "n": 0,
                         "spread_ir": None, "spread_pct": None,
@@ -5357,6 +5594,7 @@ class Bridge:
             results.append({
                 "index": i,
                 "expression": tree.to_expression(),
+                "template": tpl,
                 "light_ic": diag,
                 "tree": tree,
             })
@@ -5388,10 +5626,12 @@ class Bridge:
             results, _abs_ic, _series, top_k, hist, lam)
         top = []
         for r in top_sel:
-            src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
+            src, _imports = random_gen.render_factor_source(
+                r["tree"], f"random_factor_{r['index']}", template=r.get("template"))
             top.append({
                 "index": r["index"],
                 "expression": r["expression"],
+                "template": r.get("template"),
                 "light_ic": r["light_ic"],
                 "source": src,
                 "note": "随机幸存=选择非结论：拿 source 走标准管线 causality→evaluate→evaluate_batch(deflate)",
@@ -5411,10 +5651,12 @@ class Bridge:
             hist + [s for s in (_series(r) for r in top_sel) if s], lam)             if lam > 0 else (tail_ranked[:top_k], None)
         top_tail = []
         for r in tail_sel:
-            src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
+            src, _imports = random_gen.render_factor_source(
+                r["tree"], f"random_factor_{r['index']}", template=r.get("template"))
             top_tail.append({
                 "index": r["index"],
                 "expression": r["expression"],
+                "template": r.get("template"),
                 "light_ic": r["light_ic"],
                 "source": src,
                 "note": ("尾部线幸存（spread_ir 排序，IC 可能平庸）——top-K "
@@ -5434,10 +5676,12 @@ class Bridge:
             key=lambda r: -_cs(r))
         top_net = []
         for r in cost_ranked[:top_k]:
-            src, _imports = random_gen.render_factor_source(r["tree"], f"random_factor_{r['index']}")
+            src, _imports = random_gen.render_factor_source(
+                r["tree"], f"random_factor_{r['index']}", template=r.get("template"))
             top_net.append({
                 "index": r["index"],
                 "expression": r["expression"],
+                "template": r.get("template"),
                 "light_ic": r["light_ic"],
                 "source": src,
                 "note": ("成本平局裁决幸存（break_even_cost 排序——每单位"
@@ -7334,6 +7578,14 @@ def main(argv=None):
         with out_lock:
             print(json.dumps(obj, ensure_ascii=False, default=_json_default), flush=True)
 
+    def emit_error(req_id, code, message, data=None):
+        # _rpc_error 返回已序列化字符串，emit 只接受 dict——2026-09-18
+        # 事故：错误分支直接 emit(_rpc_error(...)) 被二次 json.dumps 成
+        # JSON 字符串字面量，TS 端按 id 配对不到 pending，一切错误响应
+        # 变成客户端 900s 超时（成功响应走 dict 分支不受影响——轻请求
+        # 秒回、报错请求全挂的分裂症状即源于此）
+        emit(json.loads(_rpc_error(req_id, code, message, data)))
+
     bridge._on_progress = lambda p: emit(
         {"jsonrpc": "2.0", "method": "progress", "params": p})
     emit({"jsonrpc": "2.0", "method": "ready", "params": bridge._status({})})
@@ -7347,13 +7599,13 @@ def main(argv=None):
             result = bridge.dispatch(msg["method"], msg.get("params") or {})
             emit({"jsonrpc": "2.0", "id": req_id, "result": _json_safe(result)})
         except BridgeError as e:
-            emit(_rpc_error(req_id, e.code, e.message, e.data))
+            emit_error(req_id, e.code, e.message, e.data)
         except DataError as e:
             # 用户数据/配置错误 → 域错误码（非内部错误），信息可直接呈现给用户
-            emit(_rpc_error(req_id, -32002, str(e)))
+            emit_error(req_id, -32002, str(e))
         except Exception as e:
-            emit(_rpc_error(req_id, -32603, f"Internal error: {e}",
-                            {"traceback": traceback.format_exc(limit=3)}))
+            emit_error(req_id, -32603, f"Internal error: {e}",
+                            {"traceback": traceback.format_exc(limit=3)})
 
     import queue as _queue
     from concurrent.futures import ThreadPoolExecutor
@@ -7380,7 +7632,7 @@ def main(argv=None):
         try:
             msg = json.loads(line)
         except Exception:
-            emit(_rpc_error(None, -32700, "Parse error"))
+            emit_error(None, -32700, "Parse error")
             continue
         if msg.get("method") in _FAST_RO:
             fast_pool.submit(handle_one, msg)
