@@ -28,7 +28,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .ops import (DEFAULT_DELAYS, DEFAULT_WINDOWS, LEAVES, OPERATOR_REGISTRY, TWO_INPUT_TS)
+from .ops import (DEFAULT_DELAYS, DEFAULT_HUMPS, DEFAULT_WINDOWS, LEAVES,
+                  OPERATOR_REGISTRY, SAME_SPACE_BINARY, THREE_INPUT_TS,
+                  TWO_INPUT_TS)
 
 
 # ---------------------------------------------------------------------------
@@ -56,12 +58,18 @@ def effective_operator_set(state_root=None):
     覆盖文件结构（全部可选）：
       {"disable": ["ts_kurt", "sigmoid"],          # 禁用算子名
        "windows": [5, 10, 20, 60],                  # 覆盖窗口采样集
-       "delays": [1, 5]}                            # 覆盖延迟采样集
+       "delays": [1, 5],                            # 覆盖延迟采样集
+       "humps": [0.01, 0.05],                       # 换手族阈值采样集（2026-09-18）
+       "disable_templates": ["cond_gate"],          # 禁用结构模板（2026-09-18）
+       "template_share": 0.3}                       # 模板采样占比（0=纯随机）
     """
     ov = read_operator_override(state_root) if state_root else {}
     disable = set(ov.get("disable", []))
     windows = ov.get("windows", DEFAULT_WINDOWS)
     delays = ov.get("delays", DEFAULT_DELAYS)
+    humps = ov.get("humps", DEFAULT_HUMPS)
+    disable_tpls = set(ov.get("disable_templates", []))
+    template_share = float(ov.get("template_share", DEFAULT_TEMPLATE_SHARE))
 
     ops = {}
     for cat, entries in OPERATOR_REGISTRY.items():
@@ -69,7 +77,76 @@ def effective_operator_set(state_root=None):
         if kept:
             ops[cat] = kept
     return {"ops": ops, "windows": list(windows), "delays": list(delays),
-            "disabled": sorted(disable)}
+            "humps": list(humps), "disabled": sorted(disable),
+            "templates_enabled": [t for t in TEMPLATES if t not in disable_tpls],
+            "template_share": template_share}
+
+
+def opset_fingerprint(opset) -> str:
+    """生效算子集指纹（2026-09-18 缝1正修）：null 地形绑定专用。
+
+    覆盖：算子名单+参数类别+算子实现源码哈希（改实现=改 null 分布）、
+    窗口/延迟/阈值采样集、模板集与占比。landscape 写入与校验共用此函数
+    ——扩算子/改实现/改占比后旧地形判 mismatch，强制重校准（此前指纹只含
+    数据+口径+引擎版本，算子集变更静默漂移 pool_std 口径）。
+    """
+    import hashlib
+    import inspect
+    from . import ops as _ops
+    parts = {}
+    for cat, entries in opset["ops"].items():
+        for name, (fn, kind) in entries.items():
+            try:
+                src = inspect.getsource(fn)
+            except Exception:
+                src = ""
+            parts[f"{cat}/{name}"] = [kind,
+                                      hashlib.sha256(src.encode("utf-8")).hexdigest()[:12]]
+    payload = {
+        "ops": parts,
+        "windows": sorted(opset.get("windows", [])),
+        "delays": sorted(opset.get("delays", [])),
+        "humps": sorted(opset.get("humps", [])),
+        "templates_enabled": sorted(opset.get("templates_enabled") or []),
+        "template_share": float(opset.get("template_share", DEFAULT_TEMPLATE_SHARE)),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True,
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def env_leaves(env):
+    """按 env 实际可用字段过滤叶子（amount 缺失时剔除）。
+
+    2026-09-18 缝2c：explore 补齐同款过滤（此前只有 null 校准过滤——
+    无 amount 的 env 上 explore 含 amount 的树整棵 error）。
+    """
+    return ["o", "h", "l", "c", "v"] + (
+        ["amount"] if getattr(env, "amount", None) is not None else [])
+
+
+def matrix_health(F) -> dict | None:
+    """生成树输出健康门（2026-09-18 缝2b）：None=健康，dict=病态描述。
+
+    两道门对已知病态（construction_ledger Day4 除法 inf 事故 / cp_z 1e15
+    尺度事故 / 09-14 噪声世界退化树）：
+      - finite 门：后半面板 isfinite 占比 < 0.5（前半允许滚动暖机 NaN）
+      - 尺度门：|p99| > 1e12 或零方差（退化常量树）
+    """
+    arr = np.asarray(F, dtype=np.float64)
+    if arr.size == 0:
+        return {"pathology": "empty"}
+    half = arr[arr.shape[0] // 2:]
+    fin = np.isfinite(half)
+    if float(fin.mean()) < 0.5:
+        return {"pathology": "low_finite_frac",
+                "finite_frac": round(float(fin.mean()), 4)}
+    vals = half[fin]
+    if vals.size == 0 or float(np.std(vals)) == 0.0:
+        return {"pathology": "degenerate_zero_variance"}
+    p99 = float(np.percentile(np.abs(vals), 99))
+    if not np.isfinite(p99) or p99 > 1e12:
+        return {"pathology": "scale_explosion", "abs_p99": p99}
+    return None
 
 
 def write_operator_override(override, state_root):
@@ -105,137 +182,324 @@ class Node:
         args = [c.to_code(leaf_exprs) for c in self.children]
         if self.param is None:
             return f"{self.op}({', '.join(args)})"
-        return f"{self.op}({args[0]}, {self.param})" if len(args) == 1 else \
-            f"{self.op}({args[0]}, {args[1]}, {self.param})"
+        return f"{self.op}({', '.join(args)}, {self.param})"
 
 
-def _sample_param(kind, rng, windows, delays):
+def _sample_param(kind, rng, windows, delays, humps=None):
     if kind == "w":
         return int(rng.choice(windows))
     if kind == "d":
         return int(rng.choice(delays))
+    if kind == "h":
+        return float(rng.choice(humps if humps else DEFAULT_HUMPS))
     return None
 
 
-def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None):
-    """生成一棵满足结构约束的组合树。
+def _space(n: Node) -> str:
+    """子树输出空间（2026-09-18 结构扩充的最小类型系统）：raw | norm | bool。
+
+    规则（防已知废树类，只约束组合合法性、不改数学）：
+      R1 cs_* 的输入必须是 raw —— cs_rank(cs_zscore(x)) 按日仿射不变性
+         恰等于 cs_rank(x)，双重截面归一是纯冗余（FARM_REVIEW 实测废树类）
+      R2 add/sub/minv/maxv/signed_diff 与 gt/lt 两子树同空间（单位匹配，
+         add(价格, 排名) 类混尺度废树）；where 两分支同空间。mul/div 自由
+         ——乘除=加权/比值语义，mul(价格腿, 排名腿) 正是战役兑现的量腿加权
+    空间：leaf=raw；ts=raw（时序聚合不改截面归一性）；cs=norm；unary 传递；
+    mul/div 双 norm 才 norm；gt/lt=bool；where=分支空间。
+    """
+    if n.category in ("leaf", "ts"):
+        return "raw"
+    if n.category == "cs":
+        return "norm"
+    if n.category == "unary":
+        return _space(n.children[0])
+    if n.category == "cmp":
+        return "bool"
+    if n.category == "cond":
+        return _space(n.children[1])
+    if n.op in SAME_SPACE_BINARY:
+        return _space(n.children[0])
+    return "norm" if (_space(n.children[0]) == "norm"
+                      and _space(n.children[1]) == "norm") else "raw"
+
+
+def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=None):
+    """生成一棵满足结构约束的组合树（2026-09-18 结构扩充：空间类型+模板通道）。
 
     约束由生成保证（后不需单独校验）：
-      - 至少 1 ts + 1 cs 算子
-      - 二元算子的子树不全是叶子
-      - 深度 3..max_depth（根=1）。边界说明（2026-08-18 独立审计 F-D11 对齐）：
-        `depth >= max_depth` 且 force_ts/force_cs 未满足时，收尾节点会把叶子挂到
-        max_depth+1 层（含 TWO_INPUT_TS 的第二叶）——这是有界边界行为而非违约，
-        实测深度分布为 3..6（约 19% 的树达 6，均为收尾叶子层）。
+      - 至少 1 个时序算子（ts_*）+ 至少 1 个截面算子（cs_*）
+      - 二元算子的两个子树不能都是叶子（禁 c1/c2 纯数据运算）
+      - 空间类型规则见 _space docstring
+    - 深度 3..max_depth（根=1）。边界说明（2026-08-18 独立审计 F-D11 对齐）：
+      深度耗尽且 force/空间未满足时收尾节点可把叶子挂到 max_depth+1 层
+      （空间 wrap 如 ts(cs(leaf)) 可到 +2）——有界边界行为而非违约。
+    - template（结构模板名）：走带槽骨架（出身=结构先验，非零先验），
+      槽内组合仍均匀随机。
     """
+    if template is not None:
+        return _from_template(rng, opset, leaves or LEAVES, template)
     ops, windows, delays = opset["ops"], opset["windows"], opset["delays"]
-    # 叶子集按 env 实际可用字段过滤（amount 缺失时含 amount 的树必然整棵丢弃，
-    # 会把 null 分布系统性偏离 volume/amount 类因子）
+    humps = opset.get("humps") or DEFAULT_HUMPS
     leaves = leaves or LEAVES
     ts_names = list(ops.get("ts", {}).keys())
     cs_names = list(ops.get("cs", {}).keys())
     bin_names = list(ops.get("binary", {}).keys())
     una_names = list(ops.get("unary", {}).keys())
+    cmp_names = list(ops.get("cmp", {}).keys())
+    cond_names = list(ops.get("cond", {}).keys()) if cmp_names else []
     if not ts_names or not cs_names:
         raise ValueError("算子集必须至少含 1 个 ts_* 与 1 个 cs_* 算子")
+    ts_single = [n for n in ts_names
+                 if n not in TWO_INPUT_TS and n not in THREE_INPUT_TS]
 
-    def _grow(depth: int, force_ts: bool, force_cs: bool) -> Node:
-        # 到达最大深度 → 只能是单输入算子或叶子
+    def _leaf() -> Node:
+        return Node(rng.choice(leaves), "leaf")
+
+    def _param(name):
+        return _sample_param(OPERATOR_REGISTRY["ts"][name][1], rng, windows, delays, humps)
+
+    def _ts_leaf(name, child=None):
+        return Node(name, "ts", _param(name), [child or _leaf()])
+
+    def _grow(depth: int, force_ts: bool, force_cs: bool, need: str = "any") -> Node:
+        # ---- 边界：深度耗尽 ----
         if depth >= max_depth:
+            if need == "bool":
+                return Node(rng.choice(cmp_names), "cmp", None, [_leaf(), _leaf()])
+            if force_ts and need == "norm":
+                # norm 且必须含 ts：cs(ts(leaf)) —— cs 产 norm，ts 藏其内
+                return Node(rng.choice(cs_names), "cs", None,
+                            [_ts_leaf(rng.choice(ts_single))])
             if force_ts:
                 name = rng.choice(ts_names)
-                # 深度耗尽时双输入 ts 用叶子对叶子（子树约束只限 binary）
-                kind = OPERATOR_REGISTRY["ts"][name][1]
-                p = _sample_param(kind, rng, windows, delays)
-                kids = [Node(rng.choice(leaves), "leaf")]
+                kids = [_leaf()]
+                if name in THREE_INPUT_TS:
+                    kids.append(_leaf())
                 if name in TWO_INPUT_TS:
-                    kids.append(Node(rng.choice(leaves), "leaf"))
-                return Node(name, "ts", p, kids)
-            if force_cs:
-                name = rng.choice(cs_names)
-                return Node(name, "cs", None, [_leaf()])
+                    kids.append(_leaf())
+                return Node(name, "ts", _param(name), kids)
+            if force_cs and need == "raw":
+                # raw 且必须含 cs：ts(cs(leaf)) —— ts 产 raw，cs 藏其内
+                return _ts_leaf(rng.choice(ts_single),
+                                Node(rng.choice(cs_names), "cs", None, [_leaf()]))
+            if force_cs or need == "norm":
+                return Node(rng.choice(cs_names), "cs", None, [_leaf()])
             return _leaf()
-        # 顶部结构：保证 ts 与 cs 至少各一次 —— 根附近先 ts，尾端收 cs
+
+        # ---- 根部结构：保证 ts 与 cs 至少各一次（根=ts，cs 沿传播链）----
         if force_ts and force_cs and depth == 1:
-            # 根 = ts 算子，其子树里必含一个 cs
             name = rng.choice(ts_names)
-            kind = OPERATOR_REGISTRY["ts"][name][1]
-            p = _sample_param(kind, rng, windows, delays)
-            kids = [_grow(depth + 1, force_ts=False, force_cs=True)]
+            kids = [_grow(depth + 1, False, True, "any")]
+            if name in THREE_INPUT_TS:
+                kids.append(_grow(depth + 1, False, False, "any"))
             if name in TWO_INPUT_TS:
-                kids.append(_grow(depth + 1, force_ts=False, force_cs=False))
-            return Node(name, "ts", p, kids)
-        # 中间节点：ts / cs / binary / unary / leaf 按权重采
-        # binary 有限制（子树不能全叶），且深度余量 >=2 才能保孙非叶
+                kids.append(_grow(depth + 1, False, False, "any"))
+            return Node(name, "ts", _param(name), kids)
+
+        # ---- 中间节点：类别采样 + 空间约束过滤 ----
         choices = ["ts", "cs", "unary", "leaf"]
         if depth + 2 <= max_depth:
             choices += ["binary", "binary"]   # 鼓励结构组合
+        if cmp_names and depth + 2 <= max_depth:
+            choices += ["cmp"]
+        if cond_names and depth + 3 <= max_depth:
+            choices += ["cond"]
         if force_ts:
             choices += ["ts"]
         if force_cs:
             choices += ["cs"]
         pick = rng.choice(choices)
+        # 空间约束：need 决定本节点可产出的类别（bool 槽只收 cmp，norm 槽
+        # 不收 ts/leaf/cmp，raw 槽不收 cs——重定向保 force 语义优先）
+        allowed = {
+            "any": {"ts", "cs", "unary", "binary", "cmp", "cond", "leaf"},
+            "raw": {"ts", "unary", "binary", "cond", "leaf"},
+            "norm": {"cs", "unary", "binary"},
+            "bool": {"cmp"},
+        }[need]
+        if pick not in allowed:
+            if force_ts and "ts" in allowed:
+                pick = "ts"
+            elif force_cs and "cs" in allowed:
+                pick = "cs"
+            elif need == "norm":
+                pick = "cs"
+            elif need == "raw":
+                pick = "ts"
+            else:
+                pick = "cmp" if need == "bool" else "ts"
         if pick == "leaf" and (force_ts or force_cs):
-            pick = "ts" if force_ts else "cs"
+            pick = "ts" if force_ts else ("cs" if need != "raw" else "ts")
+
         if pick == "ts":
             name = rng.choice(ts_names)
-            kind = OPERATOR_REGISTRY["ts"][name][1]
-            p = _sample_param(kind, rng, windows, delays)
-            kids = [_grow(depth + 1, force_ts=False, force_cs=force_cs)]
+            kids = [_grow(depth + 1, False, force_cs, "any")]
+            if name in THREE_INPUT_TS:
+                kids.append(_grow(depth + 1, False, False, "any"))
             if name in TWO_INPUT_TS:
-                kids.append(_grow(depth + 1, force_ts=False, force_cs=False))
-            return Node(name, "ts", p, kids)
+                kids.append(_grow(depth + 1, False, False, "any"))
+            return Node(name, "ts", _param(name), kids)
         if pick == "cs":
-            name = rng.choice(cs_names)
-            return Node(name, "cs", None,
-                        [_grow(depth + 1, force_ts=force_ts, force_cs=False)])
+            return Node(rng.choice(cs_names), "cs", None,
+                        [_grow(depth + 1, force_ts, False, "raw")])
+        if pick == "unary":
+            return Node(rng.choice(una_names), "unary", None,
+                        [_grow(depth + 1, force_ts, force_cs, need)])
+        if pick == "cmp":
+            # 两子树同空间：先生成 a，b 按 a 的空间生成。叶子对（gt(c,o)
+            # 类日内方向门）语义合法，不限全叶——与 binary 的算术约束不同
+            a = _grow(depth + 1, False, False, "any")
+            b = _grow(depth + 1, force_ts, force_cs, _space(a))
+            return Node(rng.choice(cmp_names), "cmp", None, [a, b])
+        if pick == "cond":
+            c = _grow(depth + 1, False, False, "bool")
+            a = _grow(depth + 1, force_ts, False,
+                      "raw" if need == "raw" else ("norm" if need == "norm" else "any"))
+            b = _grow(depth + 1, False, force_cs, _space(a))
+            if a.category == "leaf" and b.category == "leaf":
+                b = _unary_or_ts(rng, ops, windows, delays, False)
+            return Node(rng.choice(cond_names), "cond", None, [c, a, b])
         if pick == "binary":
             name = rng.choice(bin_names)
-            # 约束：两子树不全是叶子 → 至少一侧强制非叶（给 unary/ts）
-            side = rng.random() < 0.5
-            a = _grow(depth + 1, force_ts=False, force_cs=False)
+            if name in SAME_SPACE_BINARY:
+                need_a = need if need in ("raw", "norm") else "any"
+            else:
+                # mul/div：norm 槽需双 norm 子树
+                need_a = "norm" if need == "norm" else "any"
+            a = _grow(depth + 1, False, False, need_a)
             if a.category == "leaf":
-                a = _grow(depth + 1, force_ts=False, force_cs=False)
-                # 仍可能为叶（深度允许 unary），换一个必非叶节点
+                a = _grow(depth + 1, False, False, need_a)
                 if a.category == "leaf":
-                    a = _unary_or_ts(rng, ops, windows, delays, force_cs)
-            b = _grow(depth + 1, force_ts=force_ts, force_cs=force_cs)
+                    a = _unary_or_ts(rng, ops, windows, delays, False)
+            if name in SAME_SPACE_BINARY:
+                need_b = _space(a)
+            elif need == "norm":
+                need_b = "norm"
+            elif need == "raw" and _space(a) == "norm":
+                need_b = "raw"      # 保至少一侧 raw → mul/div 输出 raw
+            else:
+                need_b = "any"
+            b = _grow(depth + 1, force_ts, force_cs, need_b)
             if b.category == "leaf" and a.category == "leaf":
                 b = _unary_or_ts(rng, ops, windows, delays, force_cs)
             return Node(name, "binary", None, [a, b])
-        if pick == "unary":
-            name = rng.choice(una_names)
-            return Node(name, "unary", None,
-                        [_grow(depth + 1, force_ts=force_ts, force_cs=force_cs)])
         return _leaf()
-
-    def _leaf() -> Node:
-        return Node(rng.choice(leaves), "leaf")
 
     def _unary_or_ts(rng, ops, windows, delays, force_cs) -> Node:
         una = ops.get("unary", {})
         if una and rng.random() < 0.6:
             return Node(rng.choice(list(una.keys())), "unary", None, [_leaf()])
-        ts = ops.get("ts", {})
-        name = rng.choice(list(ts.keys()))
-        kind = OPERATOR_REGISTRY["ts"][name][1]
-        p = _sample_param(kind, rng, windows, delays)
+        name = rng.choice(ts_single)
         kids = [_leaf()]
         if name in TWO_INPUT_TS:
             kids.append(_leaf())
-        return Node(name, "ts", p, kids)
+        return Node(name, "ts", _param(name), kids)
 
     root = _grow(1, force_ts=True, force_cs=True)
     return root
 
 
-def render_factor_source(tree: Node, name: str) -> tuple[str, list[str]]:
+# ---------------------------------------------------------------------------
+# 结构模板（2026-09-18 结构扩充）：已兑现结构的带槽骨架，出身=结构先验。
+# 战役证据：收官六入册全部来自加腿/拆杠杆/条件门——均匀树长不出这些形状。
+# 渲染源码首行注释带 template 标记 + explore 返回携带 template 字段；
+# null 校准同通道采样（墙必须覆盖实际搜索空间，模板与占比进 opset 指纹）。
+# ---------------------------------------------------------------------------
+DEFAULT_TEMPLATE_SHARE = 0.3
+TEMPLATES = ("leg_weight", "hedge_resid", "window_spread", "cond_gate")
+
+
+def _tpl_ts_leg(rng, opset, leaves, exclude=None):
+    """模板腿：单输入 ts 算子套随机叶子（exclude=(op,param,field) 避同款重掷）。"""
+    ts_single = [n for n in opset["ops"].get("ts", {})
+                 if n not in TWO_INPUT_TS and n not in THREE_INPUT_TS]
+    humps = opset.get("humps") or DEFAULT_HUMPS
+    name = rng.choice(ts_single)
+    p = _sample_param(OPERATOR_REGISTRY["ts"][name][1], rng,
+                      opset["windows"], opset["delays"], humps)
+    leaf = rng.choice(leaves)
+    if exclude is not None:
+        for _ in range(5):
+            if (name, p, leaf) != exclude:
+                break
+            name = rng.choice(ts_single)
+            p = _sample_param(OPERATOR_REGISTRY["ts"][name][1], rng,
+                              opset["windows"], opset["delays"], humps)
+            leaf = rng.choice(leaves)
+    return Node(name, "ts", p, [Node(leaf, "leaf")])
+
+
+def _from_template(rng, opset, leaves, template):
+    cs_names = list(opset["ops"].get("cs", {}).keys())
+    if not cs_names:
+        raise ValueError("模板要求至少 1 个 cs_* 算子")
+    if template == "leg_weight":
+        # 量腿加权（战役三度兑现）：mul(ts腿A, 截面权重腿B)
+        A = _tpl_ts_leg(rng, opset, leaves)
+        B = Node(rng.choice(cs_names), "cs", None, [Node(rng.choice(leaves), "leaf")])
+        return Node("mul", "binary", None, [A, B])
+    if template == "hedge_resid":
+        # 残差对冲腿（七元腿战役的机械化内核）：y 对 x 滚动残差 + 截面收口
+        if "ts_resid" not in opset["ops"].get("ts", {}):
+            return _from_template(rng, opset, leaves, "leg_weight")
+        f1 = rng.choice(leaves)
+        rest = [l for l in leaves if l != f1] or leaves
+        w = int(rng.choice(opset["windows"]))
+        R = Node("ts_resid", "ts", w, [Node(f1, "leaf"), Node(rng.choice(rest), "leaf")])
+        return Node(rng.choice(cs_names), "cs", None, [R])
+    if template == "window_spread":
+        # 窗口价差（triplewin 族的机械化内核）：同字段同算子异窗差 + 截面收口
+        A = _tpl_ts_leg(rng, opset, leaves)
+        pool = (opset["windows"]
+                if OPERATOR_REGISTRY["ts"][A.op][1] == "w" else opset["delays"])
+        w2 = A.param
+        for _ in range(6):
+            cand = int(rng.choice(pool))
+            if cand != A.param:
+                w2 = cand
+                break
+        B = Node(A.op, "ts", w2, [A.children[0]])
+        return Node(rng.choice(cs_names), "cs", None,
+                    [Node("sub", "binary", None, [A, B])])
+    if template == "cond_gate":
+        # 条件门（战役"门+腿"形态）：gt/lt 时序腿门控 + 双腿分支 + 截面收口
+        cmp_names = list(opset["ops"].get("cmp", {}).keys())
+        if not cmp_names:
+            return _from_template(rng, opset, leaves, "window_spread")
+        A = _tpl_ts_leg(rng, opset, leaves)
+        B = _tpl_ts_leg(rng, opset, leaves,
+                        exclude=(A.op, A.param, A.children[0].op))
+        gate = Node(rng.choice(cmp_names), "cmp", None, [A, B])
+        t = _tpl_ts_leg(rng, opset, leaves)
+        f = _tpl_ts_leg(rng, opset, leaves)
+        return Node(rng.choice(cs_names), "cs", None,
+                    [Node("where", "cond", None, [gate, t, f])])
+    raise ValueError(f"未知模板: {template}")
+
+
+def generate_one(rng, opset, leaves=None):
+    """一次生成（explore/null 共用入口）：按 template_share 掷模板或均匀树。
+
+    返回 (tree, template_name|None)。null 校准与 explore 走同一通道——
+    墙必须覆盖实际采样空间（模板与占比进 opset 指纹，改配置=须重校准）。
+    """
+    tpls = opset.get("templates_enabled") or []
+    share = float(opset.get("template_share", DEFAULT_TEMPLATE_SHARE))
+    if tpls and share > 0 and rng.random() < share:
+        t = str(rng.choice(tpls))
+        return generate_tree(rng, opset, leaves=leaves, template=t), t
+    return generate_tree(rng, opset, leaves=leaves), None
+
+
+def render_factor_source(tree: Node, name: str, template: str | None = None) -> tuple[str, list[str]]:
     """把组合树渲染成自包含的 factor(env) 源码。
 
     返回 (source, imports)。源码引用包内 ops 算子库（算子真值源，可配置）。
     函数名固定 factor（2026-08-18 生产审计修正）：下游 causality/evaluate/batch
     的契约都要求 def factor(env)——此前渲染 def random_factor_N(env)，agent 每
     轮冷启动必踩 5 次「缺少 factor(env)」ERR。tree id 移入注释保留可读性。
+    template（2026-09-18）：模板出身的树在首行注释带 template 标记——出身
+    诚实（结构先验非零先验），台账/审阅按此区分纯随机与模板产物。
     """
     leaf_exprs = {
         "o": "pd.DataFrame(env.o)", "h": "pd.DataFrame(env.h)",
@@ -254,8 +518,11 @@ def render_factor_source(tree: Node, name: str) -> tuple[str, list[str]]:
 
     body = tree.to_code(leaf_exprs)
     imports = ", ".join(sorted(set(used)))
+    head = f"# tree: {name}"
+    if template:
+        head += f" | template: {template}"
     src = (
-        f"# tree: {name} | expression: {tree.to_expression()}\n"
+        f"{head} | expression: {tree.to_expression()}\n"
         f"def factor(env):\n"
         f"    import pandas as pd\n"
         f"    from dsh_factor_mining.factor.ops import {imports}\n"
@@ -337,6 +604,7 @@ def light_ic_scan(F, env, spread_ref: dict | None = None):
     # net——explore 的成本平局裁决列表（top_net 按 c* 排序）用 c*
     try:
         sts = spread_turn_stats(F, fwd, pit, env.calibration.sample_step,
+                                k_frac=env.calibration.tail_k,
                                 t_end=_train_end_of(env),
                                 cost=float(env.calibration.cost or 0.0))
     except Exception:
@@ -346,6 +614,12 @@ def light_ic_scan(F, env, spread_ref: dict | None = None):
     for _k in ("turn_tail", "break_even_cost", "net_spread_ir"):
         if sts.get(_k) is not None:
             out[_k] = sts.get(_k)
+    # P0a(2026-09-13 反同质化奖励):explore 选种的 novelty 项需要候选的
+    # 逐采样日 IC 向量(组内相关用)。只在序列可用时携带,轻量(round 4)
+    try:
+        out["ic_series"] = [round(float(x), 4) + 0.0 for x in ic.tolist()]
+    except Exception:
+        pass
     return out
 
 
@@ -434,19 +708,22 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
     from .tail import spread_ir_statistic
     opset = opset or effective_operator_set(state_root)
     menu = [int(h) for h in horizons] if horizons else [env.calibration.horizon]
-    leaves = ["o", "h", "l", "c", "v"] + (["amount"] if getattr(env, "amount", None) is not None else [])
+    leaves = env_leaves(env)
     rng = np.random.default_rng(seed)
     views = {h: _env_horizon_view(env, h) for h in menu}
     irs_by_h = {h: [] for h in menu}
     series_by_h = {h: [] for h in menu}
     spread_by_h = {h: [] for h in menu}
+    n_pathological = 0
     for _i in range(n):
         if on_progress is not None:
             try:
                 on_progress(_i, n)
             except Exception:
                 pass
-        tree = generate_tree(rng, opset, leaves=leaves)
+        # 模板同通道采样（2026-09-18）：null 必须覆盖实际采样空间——
+        # explore 走 generate_one（含模板占比），null 校准同款
+        tree, _tpl = generate_one(rng, opset, leaves=leaves)
         # 内联执行：直接调 ops 算子（不经源码编译，同数学）。
         # asarray 必须有：_eval_tree 返回 DataFrame（symbol 索引），裸传
         # _cross_sectional_ic 会在 pit[t] & isfinite(F[t]) 的 Series/ndarray
@@ -454,6 +731,12 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
         try:
             F = np.asarray(_eval_tree(tree, env), dtype=np.float64)
         except Exception:
+            continue
+        # 健康门（2026-09-18 缝2b）：inf/爆炸/退化树不进 null 样本——
+        # 此前被 IC mask 静默吃掉（样本悄悄变少），现在显式计数
+        ph = matrix_health(F)
+        if ph is not None:
+            n_pathological += 1
             continue
         for h in menu:
             try:
@@ -471,6 +754,7 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
                 # spread_cost 给定时 = net 段（随机树同样付成本）
                 sp_ir = spread_ir_statistic(F, fwd, pit,
                                             v.calibration.sample_step,
+                                            k_frac=v.calibration.tail_k,
                                             t_end=_train_end_of(v),
                                             cost=spread_cost)
                 if sp_ir is not None and np.isfinite(sp_ir):
@@ -542,6 +826,7 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
 
     result = {
         "n_generated": n, "n_valid": int(len(irs_by_h[menu[0]])), "seed": seed,
+        "n_pathological": int(n_pathological),
         "env_fingerprint": env_fingerprint,
         "horizons": menu,
         "ic_ir": ic_ir_out,
@@ -590,7 +875,7 @@ def _eval_tree(node: Node, env):
     if node.category == "leaf":
         return pd.DataFrame(getattr(env, node.op))
     fn = None
-    for cat in ("ts", "cs", "binary", "unary"):
+    for cat in ("ts", "cs", "binary", "unary", "cmp", "cond"):
         if node.op in OPERATOR_REGISTRY.get(cat, {}):
             fn = OPERATOR_REGISTRY[cat][node.op][0]
             break
