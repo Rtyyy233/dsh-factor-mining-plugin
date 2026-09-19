@@ -12,8 +12,12 @@
  *
  * Identity comes from infrastructure only — a lane field the model writes
  * inside an entry is overridden, never trusted.
+ *
  * @module dsh-tool-factor-mining/lane
  */
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 /** Shape of the second `execute` argument (ToolRunContext extends
  * ToolExecution which carries the calling agent); host vocabulary, hence
@@ -71,12 +75,60 @@ export function journalLaneOfConfig(config: unknown): string | undefined {
 const MAX_BOUND_SESSIONS = 500
 const sessionRootBindings = new Map<unknown, string>()
 
+// ---------------------------------------------------------------------------
+// 绑定持久化（2026-09-19 用户指令：挖掘不停止——重启后路由必须恢复）。
+// 落盘 ~/.dsh/factor-session-bindings.json（host 级文件，会话→root 键值表，
+// 工具包自持——不经 bridge RPC，省 seam/provider 两包改动）。失败容忍：
+// 读失败=空表起步（行为退回旧版）；写失败=仅内存生效。
+// ---------------------------------------------------------------------------
+const BINDINGS_FILE = path.join(os.homedir(), '.dsh', 'factor-session-bindings.json')
+
+function loadPersistedBindings(): Map<string, string> {
+  const out = new Map<string, string>()
+  try {
+    const parsed = JSON.parse(fs.readFileSync(BINDINGS_FILE, 'utf-8'))
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof k === 'string' && typeof v === 'string') out.set(k, v)
+      }
+    }
+  } catch { /* 缺失/损坏 = 空表起步 */ }
+  return out
+}
+
+try {
+  for (const [k, v] of loadPersistedBindings()) sessionRootBindings.set(k, v)
+} catch { /* 种子失败 = 空表起步 */ }
+
+function persistBindings(): void {
+  try {
+    fs.mkdirSync(path.dirname(BINDINGS_FILE), { recursive: true })
+    const obj: Record<string, string> = {}
+    for (const [k, v] of sessionRootBindings) {
+      if (typeof k === 'string') obj[k] = v
+    }
+    const tmp = `${BINDINGS_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(obj), 'utf-8')
+    fs.renameSync(tmp, BINDINGS_FILE)
+  } catch { /* 写失败 = 仅内存生效 */ }
+}
+
+/** 已知挖掘会话名单（落盘绑定的键集）——drive 用它重启后恢复扫描视野。 */
+export function boundSessionIds(): string[] {
+  const out: string[] = []
+  for (const k of sessionRootBindings.keys()) {
+    if (typeof k === 'string') out.push(k)
+  }
+  return out
+}
+
 export function bindSessionRoot(sessionId: unknown, rootKey: string): void {
   if (sessionRootBindings.size >= MAX_BOUND_SESSIONS && !sessionRootBindings.has(sessionId)) {
     const oldest = sessionRootBindings.keys().next().value
     if (oldest !== undefined) sessionRootBindings.delete(oldest)
   }
   sessionRootBindings.set(sessionId, rootKey)
+  persistBindings()
 }
 
 export function rootOfSession(sessionId: unknown): string | undefined {
