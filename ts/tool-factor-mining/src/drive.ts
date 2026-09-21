@@ -14,7 +14,11 @@
  *   complex pushes are uncapped — the engine's mechanical stops bound them.
  * - a real user message cancels any pending injection and resets the
  *   simple-push counter; a busy agent (new turn already running or inbox
- *   non-empty) is never injected into.
+ *   non-empty) is never injected into — **except past the wedge threshold**
+ *   (2026-09-19 ETF incident): zero session events for `wedgeAfterMs` while
+ *   `running` means the stream died mid-turn; the drive then cancels the
+ *   dead turn (keepInbox) and re-drives on convergence, and a stale parked
+ *   inbox no longer blocks injection (idle wake always opens a turn).
  * - same strategy key is never injected twice in a row (engine keys embed
  *   the monotonically growing trial count; `query` keys on accepted count).
  *
@@ -59,6 +63,15 @@ export interface DriveConfig {
    *  原默认 0（关）的前提"无死线=有人值守"被治理静默窗打破；0 仍可
    *  显式关闭。 */
   wakeIntervalMs?: number
+  /** Wedged-turn recovery threshold (ms, default 30 min; 0 disables). A turn
+   *  whose stream died mid-generation leaves the agent `running` forever —
+   *  both injection paths skip it (event path needs turn/end, sweep respects
+   *  busy agents), so the session starves silently (ETF incident 2026-09-19
+   *  22:52: 零事件 37min，扫描每 5min 到场却永久跳过). Past this many ms
+   *  with zero session events while running, the drive cancels the dead turn
+   *  (keepInbox) and re-drives on convergence; a stale parked inbox no longer
+   *  blocks injection either (idle wake always opens a turn boundary). */
+  wedgeAfterMs?: number
 }
 
 /** Runtime control surface for the deadline (2026-09-17 方案 B 追加):
@@ -93,6 +106,11 @@ interface DriveState {
   consecutiveSimple: number
   /** Deadline wrap-up already injected — stay disarmed for this session. */
   finished: boolean
+  /** Last session/event of any type for this session (ms). Zero events while
+   *  `running` is the wedge signature — a live turn emits tool/call, steering
+   *  or chunk events continuously. Undefined until the first observation
+   *  (restart-safe: no cancel storms on fresh state). */
+  lastEventTs: number | undefined
 }
 
 function renderThrown(value: unknown): string {
@@ -106,6 +124,9 @@ export function applyDrive(
 ): DriveHandle {
   const delayMs = config.delayMs ?? 60_000
   const maxSimple = config.maxConsecutiveSimple ?? 5
+  // 2026-09-19 楔死恢复（ETF 事故）：30min 无事件默认值远高于合法静默
+  // （单次工具调用上限 900s；连续 decode 30min ≈ 85k token 不可能）。
+  const wedgeMs = config.wedgeAfterMs ?? 1_800_000
   // 方案 B (2026-09-17): optional wall-clock deadline. Mutable at runtime via
   // the DriveHandle (factor_drive_deadline tool) — the static config value
   // is only the initial arm; malformed initial values log once and disarm.
@@ -150,7 +171,8 @@ export function applyDrive(
   const stateFor = (id: unknown): DriveState => {
     let s = states.get(id)
     if (s === undefined) {
-      s = { timer: undefined, lastKey: undefined, consecutiveSimple: 0, finished: false }
+      s = { timer: undefined, lastKey: undefined, consecutiveSimple: 0,
+            finished: false, lastEventTs: undefined }
       states.set(id, s)
     }
     return s
@@ -182,9 +204,39 @@ export function applyDrive(
         try {
           const agent = scoped.agents?.get?.(sessionId)
           if (agent === undefined) return
-          if (agent.status !== 'idle') return
+          // 2026-09-19 楔死恢复（ETF 事故诊断）：流死于生成中途时 agent 永远
+          // `running`（AgentStatus 仅 idle|running，无流级超时），事件路径等
+          // 不到 turn/end、扫描路径尊重忙碌 agent——两会话双哑。楔死签名 =
+          // running 且零事件超阈。处置：cancel 中止死回合（keepInbox 保住
+          // 未启动的排队工作），whenIdle 收敛后重走本函数走标准注入复活。
+          if (wedgeMs > 0 && state.lastEventTs === undefined
+              && agent.status === 'running') {
+            state.lastEventTs = Date.now() // 首次观察到 running：起钟（重启安全）
+          }
+          const stale = wedgeMs > 0 && state.lastEventTs !== undefined
+            && Date.now() - state.lastEventTs > wedgeMs
+          if (agent.status === 'running') {
+            if (!stale) return
+            const quietMin = Math.round((Date.now() - (state.lastEventTs ?? Date.now())) / 60_000)
+            ctx.logger.warn(`factor-mining drive: 会话楔死 ${quietMin}min 零事件仍 running`
+              + '——cancel 中止死回合（keepInbox），收敛后重推复活')
+            try {
+              agent.cancel({ kind: 'hook', reason: 'factor-mining wedge recovery: dead stream' },
+                { keepInbox: true })
+            } catch (e) {
+              ctx.logger.warn(`factor-mining drive: 楔死 cancel 失败: ${renderThrown(e)}`)
+            }
+            state.lastEventTs = Date.now() // 防风暴：每 wedgeMs 至多 cancel 一次
+            const sid = sessionId
+            try {
+              void agent.whenIdle?.().then(() => driveNow(sid)).catch(() => {})
+            } catch { /* whenIdle 不可用则等下一轮扫描（≤5min）兜底 */ }
+            return
+          }
           const inbox = agent.inbox
-          if (inbox !== undefined
+          // 陈旧 parked inbox 不再永久拦截：idle 上的新唤醒必开回合边界
+          // （cancel-convergence wake latch 语义），穿透注入可复活会话。
+          if (!stale && inbox !== undefined
               && ((Array.isArray(inbox.nextTurn) && inbox.nextTurn.length > 0)
               || (Array.isArray(inbox.nextStep) && inbox.nextStep.length > 0))) {
             return
@@ -348,6 +400,11 @@ export function applyDrive(
         (session: { id: unknown }, event: { type: string; data: any }) => {
           try {
             const data = event.data ?? {}
+            // 活性时钟（楔死恢复）：任何类型的会话事件都证明宿主↔会话链路
+            // 活着。只记已有 state 的会话（=在册挖掘会话），不给全宿主
+            // 会话白建 state 条目。
+            const s = states.get(session.id)
+            if (s !== undefined) s.lastEventTs = Date.now()
             if (event.type === 'tool/call'
                 && typeof data.name === 'string' && data.name.startsWith('factor_')) {
               factorSessions.add(session.id)
@@ -434,19 +491,26 @@ export function applyDrive(
       for (const s of states.values()) s.finished = false
       ctx.logger.info('factor-mining drive: 死线已由会话清除——恢复常规自动推进（连续简单上限重新生效）')
     },
-    status(): Record<string, unknown> {
-      const wrapped = [...states.values()].filter((s) => s.finished).length
-      return {
-        deadline: deadlineLabel,
-        deadlineEpochMs: deadlineMs,
-        wrapUpInjectedSessions: wrapped,
-        wakeIntervalMs: wakeMs > 0 ? wakeMs : null,
-        trackedSessions: factorSessions.size,
-        note: deadlineMs === undefined
-          ? '未设死线：常规自动推进（连续简单注入上限生效）'
-          : `死线 ${deadlineLabel}：连续简单上限让位，到点注入一次收官后自动解除；一次性，重启即失`,
-      }
-    },
+      status(): Record<string, unknown> {
+        const wrapped = [...states.values()].filter((s) => s.finished).length
+        const now = Date.now()
+        const wedged = [...states.entries()]
+          .filter(([, s]) => s.lastEventTs !== undefined
+            && wedgeMs > 0 && now - s.lastEventTs > wedgeMs)
+          .map(([id]) => (typeof id === 'string' ? id.slice(-12) : String(id)))
+        return {
+          deadline: deadlineLabel,
+          deadlineEpochMs: deadlineMs,
+          wrapUpInjectedSessions: wrapped,
+          wakeIntervalMs: wakeMs > 0 ? wakeMs : null,
+          wedgeAfterMs: wedgeMs > 0 ? wedgeMs : null,
+          wedgedSessions: wedged,
+          trackedSessions: factorSessions.size,
+          note: deadlineMs === undefined
+            ? '未设死线：常规自动推进（连续简单注入上限生效）'
+            : `死线 ${deadlineLabel}：连续简单上限让位，到点注入一次收官后自动解除；一次性，重启即失`,
+        }
+      },
   }
   return handle
 

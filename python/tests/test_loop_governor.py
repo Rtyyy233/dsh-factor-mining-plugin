@@ -26,7 +26,8 @@ from dsh_factor_mining.bridge import (  # noqa: E402
     Bridge, _govern_decide, _pick_strategy, _timeout_rotate_strategy,
 )
 from dsh_factor_mining.state import (  # noqa: E402
-    MINING_CONFIG, lane_drive_bk, lane_drive_bk_update,
+    MINING_CONFIG, lane_activity, lane_activity_tick, lane_drive_bk,
+    lane_drive_bk_update,
 )
 
 BASELINE_SOURCE = """
@@ -300,6 +301,102 @@ def test_waiting_loop_narrative_does_not_disarm_governor(tmp_path):
     assert loop3["governor"]["timeout_rotates"] == 1
 
 
+def test_evaluation_activity_disarms_timeout(tmp_path):
+    """生产复犯回归（09-19/20 个股线实录）：合法打磨期（评估在跑、试验
+    零入账——重税墙下入账稀缺，5h 一笔）被注 rotate 六连发全吸收。
+    增长轴扩宽后：cache-miss 评估派发/随机生成计入活动轴 → 判窗刷新，
+    rotate 不再在打磨期开火；era 键（试验数:活动数）跨世代唯一——活动
+    增长不撞键，sameKey 去重不误吞换向；叙事仍碰不到活动轴。"""
+    import json as _json
+    b = _make_bridge(tmp_path)
+    loop = b._loop_directive()
+    lane = loop.get("lane") or "glm"
+    # 挂 pending：策略走 continue（隔离 drain 预算分支，直测超时路径）
+    p = Path(b.state_root) / "trail.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_json.dumps(
+        [{"ts": "2026-09-20T00:29:00", "lane": lane,
+          "next_hypothesis": "测试假设：X 与 Y"}], ensure_ascii=False),
+        encoding="utf-8")
+    _ = b._loop_directive()
+    # 卡住（判窗与上次发射都拨古）→ rotate 开火，era=0:0
+    stale = time.time() - 2400
+    lane_drive_bk_update(b.state_root, lane, growth_ts=stale, last_ts=stale,
+                         last_key="rotate-timeout:1:0:0")
+    loop = b._loop_directive()
+    assert loop["strategy"]["type"] == "rotate"
+    assert loop["strategy"]["key"] == "rotate-timeout:1:0:0"
+    # 模型照做中：评估派发（活动轴 +1，试验轴不动）→ 判窗刷新、计数清零
+    lane_activity_tick(b.state_root, lane)
+    loop = b._loop_directive()
+    assert loop["strategy"]["type"] != "rotate"
+    assert loop["governor"]["timeout_rotates"] == 0
+    assert loop["governor"]["activity_n"] == 1
+    assert loop["governor"]["since_growth_s"] < 60
+    # 再卡住 → 新 era 0:1 ≠ 旧 0:0：活动增长的世代不撞键
+    stale = time.time() - 2400
+    lane_drive_bk_update(b.state_root, lane, growth_ts=stale, last_ts=stale,
+                         last_key="rotate-timeout:1:0:0")
+    loop = b._loop_directive()
+    assert loop["strategy"]["type"] == "rotate"
+    assert loop["strategy"]["key"] == "rotate-timeout:1:0:1"
+    # 叙事（换措辞续命）不喂活动轴：act_n 不变，判窗照走 → 同 era 第 2 注
+    entries = _json.loads(p.read_text(encoding="utf-8"))
+    entries.append({"ts": "2026-09-20T00:31:00", "lane": lane,
+                    "next_hypothesis": "换措辞续命"})
+    p.write_text(_json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+    stale = time.time() - 2400
+    lane_drive_bk_update(b.state_root, lane, growth_ts=stale, last_ts=stale)
+    loop = b._loop_directive()
+    assert loop["strategy"]["type"] == "rotate"
+    assert loop["governor"]["activity_n"] == 1
+    assert loop["governor"]["timeout_rotates"] == 2
+
+
+def test_lane_activity_tick_isolation():
+    """活动计数按线隔离；未触碰的线读 0。"""
+    from dsh_factor_mining.state import read_mining_state
+    with tempfile.TemporaryDirectory() as d:
+        lane_activity_tick(d, "glm")
+        lane_activity_tick(d, "glm")
+        lane_activity_tick(d, "etf")
+        st = read_mining_state(d)
+        assert lane_activity(st, "glm") == 2
+        assert lane_activity(st, "etf") == 1
+        assert lane_activity(st, "untouched") == 0
+
+
+def test_evaluate_ticks_request_lane_activity(tmp_path):
+    """生产 bug 回归（09-20 晨实录）：活动计数没传 current_lane()——四
+    处 tick 全部误记 default 线，会话线 act_n=None、双轴增长对真正的挖
+    掘线无效（个股线 05:48 rotate 照旧在打磨期开火）。评估派发必须记
+    到发起请求的线。"""
+    from dsh_factor_mining.state import read_mining_state
+    b = _make_bridge(tmp_path)
+    b.dispatch("factor.evaluate",
+               {"lane": "session-reg", "source": BASELINE_SOURCE,
+                "stage": "development"})
+    st = read_mining_state(b.state_root)
+    assert lane_activity(st, "session-reg") == 1
+    assert lane_activity(st, "default") == 0
+
+
+def test_compose_edge_trigger():
+    """R7 边沿触发（09-20 个股线一夜 13 连注实录）：旧电平触发在组合
+    库存常驻时（入册稀缺、组合消化不动库存）每回合推荐 compose，键编
+    agent_rounds 每回合新鲜 → sameKey 去重永不咬合。修正后：同一库存
+    只发一次；库存量变化再发；消化到 <3 停。"""
+    assert _pick_strategy(**_base_kwargs(pass_unadmitted=3))["type"] == "compose"
+    assert _pick_strategy(**_base_kwargs(
+        pass_unadmitted=3, compose_fired=3))["type"] == "continue"
+    assert _pick_strategy(**_base_kwargs(
+        pass_unadmitted=4, compose_fired=3))["type"] == "compose"
+    assert _pick_strategy(**_base_kwargs(
+        pass_unadmitted=4, compose_fired=4))["type"] == "continue"
+    assert _pick_strategy(**_base_kwargs(
+        pass_unadmitted=2, compose_fired=4))["type"] == "continue"
+
+
 if __name__ == "__main__":
     fns = [test_pick_strategy_drain_branch,
            test_pick_strategy_milestone_edge_trigger,
@@ -309,7 +406,11 @@ if __name__ == "__main__":
            test_drive_bk_roundtrip,
            test_loop_drain_and_milestone_integration,
            test_loop_recovery_on_growth,
-           test_waiting_loop_narrative_does_not_disarm_governor]
+           test_waiting_loop_narrative_does_not_disarm_governor,
+           test_evaluation_activity_disarms_timeout,
+           test_lane_activity_tick_isolation,
+           test_evaluate_ticks_request_lane_activity,
+           test_compose_edge_trigger]
     failures = []
     for fn in fns:
         try:

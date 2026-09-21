@@ -92,6 +92,8 @@ from .state import (
     inspiration_declare,
     lane_arc_rounds,
     lane_decl_seen_update,
+    lane_activity,
+    lane_activity_tick,
     lane_drive_bk,
     lane_drive_bk_update,
     lane_explore_hashes_extend,
@@ -444,7 +446,7 @@ _STRATEGY_DIRECTIVES = {
 
 
 def _govern_decide(bk: dict, *, now: float, growth: bool, async_running: bool,
-                   chosen_type: str | None, lane_trials: int,
+                   chosen_type: str | None, lane_trials: "int | str",
                    cfg: dict | None = None) -> dict:
     """推进治理（2026-09-19 终稿：超时换向制，纯函数，可单测）。
 
@@ -457,9 +459,12 @@ def _govern_decide(bk: dict, *, now: float, growth: bool, async_running: bool,
       - drain（库存清空的供数指令，随机优先论文次之）保留：间隔窗内
         原键续供（注入器同键去重静默）；预算（3 发）耗尽后落入超时换向
         循环，不发终态。
-      - 增长 = **本线引擎试验数前进**（叙事回合不算——等待环的一句话
-        每轮写一条 trail，旧定义被它喂成"永远在增长"）。键只编
-        lane_trials（零增长期稳定）与序号（每次超时换新键恰好推送一注）。
+      - 增长 = **本线引擎试验数前进 或 引擎可见活动前进**（09-20 复轴：
+        只认试验入账在重税墙下过度开火——入账稀缺，合法打磨期被注
+        rotate 全吸收；活动 = cache-miss 评估派发/随机生成，叙事碰不到，
+        反叙事性质保持——等待环的一句话每轮写一条 trail 喂不进活动轴）。
+        键编 era 令牌（试验数:活动数，跨世代唯一）与序号（每次超时换新
+        键恰好推送一注）。
       - 误报无害化：评估在途（异步作业守卫）不判超时。
 
     返回 action ∈ {pass, drain_hold, drain_emit, rotate_hold,
@@ -506,22 +511,23 @@ def _govern_decide(bk: dict, *, now: float, growth: bool, async_running: bool,
             "reason": ("零增长但窗内/评估在途" if stuck else "正常推进")}
 
 
-def _timeout_rotate_strategy(n: int, lane_trials: int,
+def _timeout_rotate_strategy(n: int, lane_trials: "int | str",
                              stuck_after_s: int) -> dict:
-    """超时换向指令（2026-09-19 用户方案）：无试验落账超窗 → 注入
-    rotate 重置灵感。type 复用 rotate（注入器非可重推→同键去重静默），
-    键编超时序号+lane_trials：序号保证每次超时换新键恰好推送一注，
-    试验数在零增长期稳定使去重咬得住。误报无害化：评估或构造在途时
-    模型回报进度并继续、不必换向。"""
+    """超时换向指令（2026-09-19 用户方案；09-20 轴扩宽）：无引擎活动
+    （试验落账/评估派发/随机生成任一）超窗 → 注入 rotate 重置灵感。
+    type 复用 rotate（注入器非可重推→同键去重静默），键编超时序号+era
+    令牌（试验数:活动数——era 保证跨世代键唯一，sameKey 去重不误吞）。
+    误报无害化：评估或构造在途时模型回报进度并继续、不必换向。"""
     mins = max(1, int(stuck_after_s // 60))
     return {
         "type": "rotate",
         "key": f"rotate-timeout:{n}:{lane_trials}",
-        "why": (f"距上次试验落账已超 {mins} 分钟且无在途评估——"
+        "why": (f"距上次引擎活动已超 {mins} 分钟且无在途评估——"
                 f"超时换向重置灵感（第 {n} 次，无上限）"),
         "directive": (
-            f"距上次试验落账已超过 {mins} 分钟。若评估或构造正在进行，"
-            "回报进度并继续即可；否则立即换一个方向：先用 "
+            f"距上次挖掘活动已超过 {mins} 分钟（期间无评估、无试验落账、"
+            "无随机生成）。若评估或构造正在进行，回报进度并继续即可；"
+            "否则立即换一个方向：先用 "
             "factor_query_paths 查已试路径避免重复，再从一个未覆盖的维度"
             "构造新假设并验证；一时没有新方向，就用 "
             "factor_random_generate(mode='explore') 生成随机因子找灵感，"
@@ -537,7 +543,8 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
                    inspiration_reset: dict | None = None,
                    random_available: bool = True,
                    drained: bool = False,
-                   milestone_fired: int | None = None) -> dict | None:
+                   milestone_fired: int | None = None,
+                   compose_fired: int | None = None) -> dict | None:
     """下一轮方向类型选择（纯函数，供注入器与 loop 指令共用）。
 
     停点分流（2026-08-25 arc 化 + 2026-08-26 v8 族收敛）：
@@ -571,7 +578,11 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
     R6.5 drained（机械库存清空：无 pending/无近失队列/无组合库存）→ drain
        （2026-09-19：供数型换向——随机因子优先、论文次之；限发+零增长
        检测由 _govern_decide 总闸管理，注入器零改动）
-    R7 pass 未入册 ≥3 → compose
+    R7 pass 未入册 ≥3 **且库存量 ≠ 已消费量**（drive_bk.compose_fired）→
+       compose（2026-09-20 边沿触发：旧电平触发在库存常驻时——入册稀缺、
+       组合消化不动库存——每回合都推荐 compose，且键编 agent_rounds 每回
+       合新鲜 → 注入器 sameKey 去重永不咬合 → 个股线一夜 13 连注实录；
+       同一库存只提示一次，库存量变化（新 pass 到库/入册消化）再提示）
     R8 兜底 → continue
     尾部线无数据（tail_marginal.enough_data=False）→ 回到 IC 单轨判定。
     key：常规类型含 round/n_trials（单调保证新鲜）；query 用 accepted。"""
@@ -664,7 +675,11 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
         t = "drain"
         why = ("机械库存清空（无未消化假设、无近失待深化、无组合库存）——"
                "从随机因子或论文找灵感重启供数")
-    elif pass_unadmitted >= 3:
+    elif (pass_unadmitted >= 3
+          and pass_unadmitted != (compose_fired if compose_fired is not None
+                                  else -1)):
+        # 2026-09-20 边沿触发：库存量 ≠ 已消费量才发（挂出即由
+        # _loop_directive 记账消费——同一库存只提示一次；库存变化再提示）
         t = "compose"
         why = f"{pass_unadmitted} 个已验证未入册的单因子——组合机会库存充足"
     else:
@@ -4827,20 +4842,26 @@ class Bridge:
                    and max(pass_n - accepted_n, 0) < 3)
         bk = lane_drive_bk(mining, lane)
         _now = time.time()
-        # 增长 = 本线引擎试验数前进（09-19 生产复犯修正：叙事回合不算
-        # 增长——等待环的一句话每轮写一条 trail，旧定义 (回合数,全局试验数)
-        # 被它喂成"永远在增长"，drain/nudge 从未触发）
-        _growth = n_trials_lane != bk.get("growth_trials")
+        # 增长 = 本线引擎试验数前进 或 引擎可见活动前进（09-20 复轴）。
+        # 09-19 复犯修正杀叙事喂钟用的轴是"只认试验入账"——但入账在
+        # 重税墙下稀缺（个股线 5h 一笔），合法打磨期每 10min 被注 rotate
+        # 且全被吸收（规格本义"没有触发挖掘"：评估派发就是挖掘在触发）。
+        # 活动轴只收引擎可见的机械事件（cache-miss 评估派发/随机生成），
+        # 叙事碰不到——反叙事性质不变。
+        _act_n = lane_activity(mining, lane)
+        _growth = (n_trials_lane != bk.get("growth_trials")
+                   or _act_n != bk.get("growth_act"))
         if _growth:
-            # 本线真试验落账 → 超时换向/drain 计数全重置
+            # 本线真试验/活动前进 → 超时换向/drain 计数全重置
             try:
                 bk = lane_drive_bk_update(
                     self.state_root, lane,
-                    growth_trials=n_trials_lane, growth_ts=_now,
-                    timeout=0, drain=0)
+                    growth_trials=n_trials_lane, growth_act=_act_n,
+                    growth_ts=_now, timeout=0, drain=0)
             except Exception:
                 bk = dict(bk, growth_trials=n_trials_lane,
-                          growth_ts=_now, timeout=0, drain=0)
+                          growth_act=_act_n, growth_ts=_now,
+                          timeout=0, drain=0)
         strategy = _pick_strategy(
             stop_kind=stop_kind, streak=streak,
             pending_rejected=pending_rejected, frozen=frozen,
@@ -4850,7 +4871,10 @@ class Bridge:
             family_marginal=fam_marg,
             inspiration_reset=inspiration_reset,
             random_available=rnd_used < rnd_quota,
-            drained=drained, milestone_fired=bk.get("milestone"))
+            drained=drained, milestone_fired=bk.get("milestone"),
+            compose_fired=(int(bk["compose_fired"])
+                           if isinstance(bk.get("compose_fired"), int)
+                           else None))
         # 里程碑消费（边沿触发）：query 挂出即记账（幂等；崩溃最坏丢一条
         # 里程碑不重发——不会回到电平触发）
         if strategy is not None and strategy.get("type") == "query":
@@ -4858,6 +4882,17 @@ class Bridge:
                 lane_drive_bk_update(self.state_root, lane,
                                      milestone=accepted_n)
                 bk["milestone"] = accepted_n
+            except Exception:
+                pass
+        # compose 消费（2026-09-20 边沿触发，同里程碑模式）：挂出即按当前
+        # 库存量记账——同一库存不重发；新 pass 到库/入册消化（库存量变化）
+        # 再发一次
+        if strategy is not None and strategy.get("type") == "compose":
+            try:
+                lane_drive_bk_update(
+                    self.state_root, lane,
+                    compose_fired=max(pass_n - accepted_n, 0))
+                bk["compose_fired"] = max(pass_n - accepted_n, 0)
             except Exception:
                 pass
         if strategy is not None and strategy.get("type") == "random":
@@ -4872,11 +4907,14 @@ class Bridge:
         #      静默，死线收官与 finalize 是仅有的结束方式 ----
         g = {"action": "none"}
         if strategy is not None:
+            # era 键 = 试验数:活动数（09-20）——只编试验数时"活动增长而
+            # 试验不涨"的两个世代会撞键，注入器 sameKey 去重会把本该
+            # 推送的换向指令静默吞掉
             g = _govern_decide(
                 bk, now=_now, growth=_growth,
                 async_running=bool(getattr(self, "_async_jobs", None)),
                 chosen_type=strategy.get("type"),
-                lane_trials=n_trials_lane)
+                lane_trials=f"{n_trials_lane}:{_act_n}")
             act = g.get("action")
             if act == "drain_hold":
                 strategy["key"] = str(g.get("key"))
@@ -4891,7 +4929,7 @@ class Bridge:
                     pass
             elif act in ("rotate_hold", "rotate_emit"):
                 strategy = _timeout_rotate_strategy(
-                    int(g.get("count") or 1), n_trials_lane,
+                    int(g.get("count") or 1), f"{n_trials_lane}:{_act_n}",
                     int(MINING_CONFIG.get("stuck_after_s", 1800)))
                 strategy["key"] = str(g.get("key") or strategy["key"])
                 if act == "rotate_emit":
@@ -4936,6 +4974,7 @@ class Bridge:
                                               if isinstance(bk.get("growth_ts"),
                                                             (int, float))
                                               else _now)),
+                "activity_n": _act_n,
                 "drain_emitted": int(bk.get("drain", 0) or 0),
                 "timeout_rotates": int(bk.get("timeout", 0) or 0),
                 "milestone_consumed": bk.get("milestone"),
@@ -4945,8 +4984,9 @@ class Bridge:
                     "stuck_after_s": int(MINING_CONFIG.get("stuck_after_s", 1800)),
                     "drain_max": int(MINING_CONFIG.get("drain_max_emissions", 3)),
                 },
-                "policy": ("超时换向制：无落账超窗 → 注入 rotate 重置灵感"
-                           "（无上限无终态，死线前永不静默）"),
+                "policy": ("超时换向制：无引擎活动（试验落账/评估派发/随机"
+                           "生成）超窗 → 注入 rotate 重置灵感（无上限无终态，"
+                           "死线前永不静默；叙事不算活动）"),
             },
             "pending_hypothesis": pending,
             "pending_rejected": pending_rejected,
@@ -5160,6 +5200,12 @@ class Bridge:
             if hit is not None:
                 return self._wrap_diagnosis(env_id, source, "development",
                                             {**hit, "eval_cache": "hit"})
+        # 引擎可见活动记账（09-20 增长轴）：cache-miss 评估派发 = 真实
+        # 挖掘活动（命中/轮询不计——防重发同评估喂钟）
+        try:
+            lane_activity_tick(self.state_root, current_lane())
+        except Exception:
+            pass
         # 层 0c：缓存未命中 → 异步作业（默认；R2 契约分叉——缓存命中同步
         # 直接返回 diagnosis，未命中返回 job_id 由 agent 轮询；响应自描述）
         if self._async_evaluate_enabled(params):
@@ -5186,6 +5232,11 @@ class Bridge:
         env_fp = self._env_full_fingerprint(env_id)
         params = {**params, "source_hash": source_fingerprint(source),
                   **({"env_fp": env_fp} if env_fp else {})}
+        # 引擎可见活动记账（09-20 增长轴）：组合评估派发 = 挖掘活动
+        try:
+            lane_activity_tick(self.state_root, current_lane())
+        except Exception:
+            pass
         if params.get("async"):
             return self._async_submit("factor.evaluate_composite", source,
                                       params, env, env_id,
@@ -5242,6 +5293,11 @@ class Bridge:
         _, trail_std_pre = self._trial_stats(None, h_b, env_id)
         pool_std_pre, _det_pre = self._resolve_pool_std(env_id, trail_std_pre, h_b)
         params = {**params, "horizon": h_b, "pool_std": pool_std_pre}
+        # 引擎可见活动记账（09-20 增长轴）：批次派发 = 挖掘活动
+        try:
+            lane_activity_tick(self.state_root, current_lane())
+        except Exception:
+            pass
         # R24：async 分支——因果门随作业线程逐成员执行（causality_sources；
         # 此前 async 完全绕过因果门），A1 计账/重算由轮询侧后处理完成
         if params.get("async"):
@@ -5562,6 +5618,11 @@ class Bridge:
             seed_note = (f"seed_used={seed}（运行时自动派生，与 null 校准 seed={null_seed} "
                          "不冲突；复现本批结果时用该 seed）")
         rng = np.random.default_rng(seed)
+        # 引擎可见活动记账（09-20 增长轴）：explore 派发 = 真实挖掘活动
+        try:
+            lane_activity_tick(self.state_root, current_lane())
+        except Exception:
+            pass
         # spread 分位参照（WS-C 2026-08-27）：landscape 指纹匹配时取主
         # horizon 的 spread 段——light_ic_scan 里做查表插值（spread_pct）；
         # 无 landscape / 指纹不匹配 → None（spread_pct 缺省，不炸）

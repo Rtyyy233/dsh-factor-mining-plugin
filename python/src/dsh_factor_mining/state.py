@@ -85,7 +85,7 @@ MINING_CONFIG = {
     # ①拒收词族扩充否决（治标不治本，模型会造新词绕过）②随机因子是
     # "无路可走"的标准出口——写入指令文本③数据新鲜度出插件范围④注入
     # 去引擎标识、改用户口吻（TS 侧）⑤判窗 30min → 10min。
-    "stuck_after_s": 600,           # 无动作判窗（兼超时换向重发间隔：每 10min 一注）
+    "stuck_after_s": 600,           # 无引擎活动判窗（试验/评估/生成任一刷新；兼超时换向重发间隔：每 10min 一注）
     "drain_repush_spacing_s": 600,  # drain（库存清空供数指令）重发间隔
     "drain_max_emissions": 3,       # drain 发射预算，耗尽后由超时换向接管
 }
@@ -419,6 +419,29 @@ def lane_drive_bk_update(root: str | os.PathLike | None = None,
         bucket["drive_bk"] = bk
         _atomic_write_json(_path("mining_state", root), st)
         return dict(bk)
+
+
+def lane_activity(st: dict[str, Any], lane: str | None = None) -> int:
+    """读本线引擎可见活动计数（快照读，锁外安全）。"""
+    bucket = (st.get("lanes") or {}).get(lane or DEFAULT_LANE) or {}
+    return int(bucket.get("act_n", 0) or 0)
+
+
+def lane_activity_tick(root: str | os.PathLike | None = None,
+                       lane: str | None = None) -> None:
+    """本线引擎可见活动 +1（2026-09-20 增长轴扩宽：rotate 过度开火修复）。
+
+    计入：cache-miss 评估派发（evaluate/composite/batch——真实烧引擎
+    算力）、随机生成派发（explore）。不计入：一切叙事（trail 文字碰不
+    到本计数器，反叙事性质保持）；cache 命中（防重发同评估喂钟）；
+    job_id 轮询（纯取回不是挖掘）。
+    规格对齐：用户设计语是"一段时间没有触发挖掘"——评估在跑=挖掘在
+    触发；旧实现只认试验入账，重税墙下入账稀缺（个股线 5h 一笔），
+    合法打磨期每 10min 被注 rotate（09-19/20 六注全被吸收实证）。"""
+    with state_write_lock(resolve_state_root(root)):
+        st, bucket = _lane_bucket_mut(root, lane)
+        bucket["act_n"] = int(bucket.get("act_n", 0) or 0) + 1
+        _atomic_write_json(_path("mining_state", root), st)
 
 
 def lane_explore_hashes_extend(root: str | os.PathLike | None = None,
