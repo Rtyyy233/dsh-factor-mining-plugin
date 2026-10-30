@@ -51,8 +51,23 @@ async function runTool(ctx: Context, name: string, args: Record<string, unknown>
 function parseBody(result: ToolResult): Record<string, unknown> {
   expect(result.isError).toBe(false)
   const first = result.content[0]
-  if (first === undefined || first.type !== 'text') throw new Error(`${JSON.stringify(result)}: no text content`)
+  if (first === undefined || first.type !== 'text') throw new Error(`${JSON.stringify(result)}
+: no text content`)
   return JSON.parse((first as { type: 'text'; text: string }).text) as Record<string, unknown>
+}
+
+/** ASYNC-BY-DEFAULT evaluate (2026-08-31): submit -> poll job_id until the
+ * diagnosis (a cache-hit direct return is also legal). */
+async function evaluateViaTool(ctx: Context, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const first = parseBody(await runTool(ctx, 'factor_evaluate', args))
+  if (first.job_id === undefined) return first
+  const deadline = Date.now() + 120_000
+  for (;;) {
+    const poll = parseBody(await runTool(ctx, 'factor_evaluate', { envId: 'primary', job_id: first.job_id as string }))
+    if (poll.job_id === undefined && poll.status === undefined) return poll
+    if (Date.now() > deadline) throw new Error('job did not finish in 120s')
+    await new Promise(r => setTimeout(r, 500))
+  }
 }
 
 async function setup(stateRoot: string) {
@@ -131,7 +146,7 @@ describe('tool-factor-mining cold start (real user path, no pre-seeded config)',
       expect(load.ok).toBe(true)
       expect(load.T).toBe(600)
 
-      const diag = parseBody(await runTool(ctx, 'factor_evaluate', { envId: 'primary', source: FACTOR_SOURCE, stage: 'development' }))
+      const diag = await evaluateViaTool(ctx, { envId: 'primary', source: FACTOR_SOURCE, stage: 'development' })
       expect(typeof diag.ic_ir_train).toBe('number')
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -154,9 +169,9 @@ describe('tool-factor-mining cold start (real user path, no pre-seeded config)',
       // P0-1 regression: the full diagnosis flows through the TOOL layer into the bridge.
       // Before batch 2a the tool interface had no `diagnosis` parameter at all, so every
       // registry_submit through DSH failed with "registry_submit needs diagnosis".
-      const diag = parseBody(await runTool(ctx, 'factor_evaluate', {
+      const diag = await evaluateViaTool(ctx, {
         envId: 'primary', source: FACTOR_SOURCE, stage: 'development',
-      }))
+      })
       expect(typeof diag.ic_ir_train).toBe('number')
       expect(diag.verdict).toBeDefined()
 
@@ -186,7 +201,14 @@ describe('tool-factor-mining cold start (real user path, no pre-seeded config)',
       }))
       expect(report.ok).toBe(true)
 
-      // state_reset(mining) removes the engine trail too, with a backup
+      // Reset hard-block (2026-08-22): registry non-empty -> self-serve mining
+      // reset is REJECTED without user authorization (confirm is deliberately
+      // NOT exposed on the tool layer — agents cannot launder their trail).
+      const blocked = await runTool(ctx, 'factor_state_reset', { scope: 'mining' })
+      expect(blocked.isError).toBe(true)
+      // Authorized sequence here: clear registry (unguarded scope) first,
+      // then the mining reset proceeds and removes the engine trail + backup.
+      parseBody(await runTool(ctx, 'factor_state_reset', { scope: 'registry' }))
       const reset = parseBody(await runTool(ctx, 'factor_state_reset', { scope: 'mining' }))
       expect(reset.removed).toContain('trail_engine.json')
       expect(reset.backup).toBeTruthy()
@@ -194,7 +216,7 @@ describe('tool-factor-mining cold start (real user path, no pre-seeded config)',
       rmSync(dir, { recursive: true, force: true })
       await dispose()
     }
-  })
+  }, 180_000)
 
   it('state rebuilds from the convention file after bridge restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-factor-restart-'))

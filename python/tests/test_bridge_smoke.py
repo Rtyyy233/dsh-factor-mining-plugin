@@ -72,6 +72,37 @@ def _make_bridge(root: Path, T=1200, N=40, seed=4, start="2019-01-02") -> tuple[
     return bridge, data_path
 
 
+def _poll_evaluate(bridge, submit, timeout_s: float = 120.0):
+    """层 0c（2026-08-31）：worker 模式 evaluate 默认异步——提交返回 job_id，
+    轮询直到 diagnosis/异常（缓存命中会同步直接返回 diagnosis，两种都收）。"""
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    if "job_id" not in submit:
+        return submit  # 缓存命中（R2 契约分叉的同步侧）
+    while _t.monotonic() < deadline:
+        r = bridge.dispatch("factor.evaluate",
+                            {"envId": "primary", "job_id": submit["job_id"]})
+        if r.get("status") in ("running", "queued", "submitted"):
+            _t.sleep(0.3)
+            continue
+        # 作业线程收尾（job.json 落 done + 从登记表摘除）先于测试清理——
+        # Windows 下并发打开的文件删不掉（WinError 32），双条件等静止
+        settle = _t.monotonic() + 15.0
+        while _t.monotonic() < settle:
+            settled = submit["job_id"] not in getattr(bridge, "_async_jobs", {})
+            if settled:
+                try:
+                    jp = Path(bridge.state_root) / "worker_runs" / submit["job_id"] / "job.json"
+                    if json.loads(jp.read_text(encoding="utf-8")).get("status") in ("done", "failed"):
+                        break
+                except Exception:
+                    pass
+            _t.sleep(0.2)
+        return r  # done → _async_result 返回完整 diagnosis（或抛错）
+    raise AssertionError(f"作业 {submit['job_id']} 超时未完成: "
+                         + str(list((Path(bridge.state_root) / "worker_runs").glob("*/*"))))
+
+
 def _run_bridge_smoke():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -90,8 +121,9 @@ def _run_bridge_smoke():
                                  {"envId": "primary", "source": BASELINE_SOURCE})
         assert causal["verdict"] == "causal", causal
 
-        diag = bridge.dispatch("factor.evaluate",
-                               {"envId": "primary", "source": BASELINE_SOURCE, "stage": "development"})
+        diag = _poll_evaluate(bridge, bridge.dispatch(
+            "factor.evaluate",
+            {"envId": "primary", "source": BASELINE_SOURCE, "stage": "development"}))
         assert "ic_ir_train" in diag and "column_perm_train" in diag, diag
         assert np.isfinite(diag["ic_ir_train"]), diag
 
@@ -106,10 +138,12 @@ def _run_bridge_smoke():
         lib = bridge.dispatch("library.query", {"query": "momentum"})
         assert lib["configured"] is False and lib["hits"] == []
 
-        # worker 运行临时目录不应残留（每次调用后清理）
+        # worker 运行临时目录不应残留（每次调用后清理）——异步作业目录
+        # （job-*）按 C2 设计保留收尸，不计残留；只查同步路径的 tmp* 目录
         worker_runs = Path(bridge.state_root) / "worker_runs"
         if worker_runs.exists():
-            leftovers = [p for p in worker_runs.iterdir() if p.is_dir()]
+            leftovers = [p for p in worker_runs.iterdir()
+                         if p.is_dir() and p.name.startswith("tmp")]
             assert leftovers == [], f"worker_runs 残留 {len(leftovers)} 个临时目录"
 
         return {"status": status["environments"], "ic_ir_train": diag["ic_ir_train"],
@@ -210,8 +244,10 @@ def test_bridge_test_stage_consumes_lock():
                          "source_hash": source_fingerprint(BASELINE_SOURCE),
                          "accepted": True, "source": BASELINE_SOURCE}],
                        root=str(root / "state"))
-        r1 = bridge.dispatch("factor.evaluate",
-                             {"envId": "primary", "source": BASELINE_SOURCE, "stage": "test"})
+        r1 = _poll_evaluate(bridge, bridge.dispatch(
+            "factor.evaluate",
+            {"envId": "primary", "source": BASELINE_SOURCE, "stage": "test"}),
+            timeout_s=180.0)
         assert r1.get("region") == "test", r1
         try:
             bridge.dispatch("factor.evaluate",

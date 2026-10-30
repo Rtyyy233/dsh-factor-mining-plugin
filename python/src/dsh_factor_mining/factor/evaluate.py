@@ -332,8 +332,18 @@ def _beta_exposure(F, env):
 
 
 def _top_n_excess(F, fwd, pit, env, top_n=None, cost=None, t0=0, t1=None):
+    """top-N 组合超额模拟（topn 指标 / G1 placebo / tail topn 段共用）。
+
+    口径统一（2026-09-02）：calibration.k_frac 显式配置时，本函数与 spread
+    三件套用同一套动态比例持仓（k_t = round(k_frac × 当日有效池)）——
+    消除「组差按比例、组合按固定只数」的双口径裂缝（比赛线 363 vs 500
+    实测：符号不翻转但净收益量级差至 6 倍，判定边缘因子门结论可反转）。
+    k_frac=None（未配置）：固定只数路径位级保留（cal.top_n，旧行为）。
+    显式传参 top_n（测试/特殊用途）始终只数语义，优先级最高。
+    """
     cal = env.calibration
-    if top_n is None:
+    use_rate = top_n is None and cal.k_frac is not None
+    if top_n is None and not use_rate:
         top_n = cal.top_n
     if cost is None:
         cost = cal.cost
@@ -349,15 +359,22 @@ def _top_n_excess(F, fwd, pit, env, top_n=None, cost=None, t0=0, t1=None):
         if ti + hz >= T:
             continue
         m = pit[ti] & np.isfinite(F[ti]) & np.isfinite(fwd[ti])
-        if m.sum() < top_n:
-            continue
-        order = np.argsort(-F[ti][m], kind='stable')[:top_n]
+        n_valid = int(m.sum())
+        if use_rate:
+            if n_valid < 8:  # 与 spread 三件套的有效截面下限一致
+                continue
+            k = max(1, int(round(cal.tail_k * n_valid)))
+        else:
+            if n_valid < top_n:
+                continue
+            k = int(top_n)
+        order = np.argsort(-F[ti][m], kind='stable')[:k]
         cols = np.where(m)[0][order]
         top_set = set(cols.tolist())
         if holdings is None:
             turn = 1.0
         else:
-            turn = len(top_set.symmetric_difference(holdings)) / (2 * top_n)
+            turn = len(top_set.symmetric_difference(holdings)) / (2.0 * k)
         holdings = top_set
         pool_mean = np.nanmean(fwd[ti][m])
         top_mean = np.nanmean(fwd[ti][cols])
@@ -367,15 +384,22 @@ def _top_n_excess(F, fwd, pit, env, top_n=None, cost=None, t0=0, t1=None):
     return pd.DataFrame(rows, columns=['date', 'gross', 'net', 'turn'])
 
 
+_MIN_ALIGN = 60  # R 进样的最低 sketch 长度(计价审计 2026-09-13,见 _build_R)
+
+
 def _tail_aligned_corr(sa: list | None, sb: list | None,
-                       min_overlap: int = 20) -> float | None:
-    """尾对齐 IC 相关（v3 F1 修复）：可测必测，缺证据才保守。
+                       min_overlap: int = _MIN_ALIGN) -> float | None:
+    """尾对齐 IC 相关(v3 F1 修复;v4 2026-09-13 重叠下限 20→60)。
 
     v2 按 sketch **长度**分组测相关——长度=序列长度随回看窗变化（41~85
     点、18 种长度），2701 对里只实测 275 对（10.2%），2426 对被静默置
     独立。IC 序列共享同一 train 窗口，尾部天然对齐：取尾部 min(la,lb)
-    重叠段实测。重叠 < min_overlap（短窗口噪声相关不可信）→ None
-    （调用方按独立计——独立是 E[max|X|] 的最贵假设，缺证据=保守）。"""
+    重叠段实测。重叠 < min_overlap → None（调用方按独立计——独立是
+    E[max|X|] 的最贵假设，缺证据=保守）。下限 60 的依据：20 点级重叠的
+    |r| 在零假设下期望 ≈ 1/√20 ≈ 0.22——短重叠段的相关几乎全是噪声，
+    且正向膨胀平均相关(计价审计生产实测:逐对短重叠 + abs() 把 R 的
+    平均相关从 0.165 虚抬到 0.267)。返回**签名**值(± 对 E[max|X|]
+    同价;abs 由调用方历史误用,已移除)。"""
     if not isinstance(sa, (list, tuple)) or not isinstance(sb, (list, tuple)):
         return None
     k = min(len(sa), len(sb))
@@ -394,8 +418,9 @@ def _tail_aligned_corr(sa: list | None, sb: list | None,
 class _LuckSampler:
     """选择运气采样器（v3 2026-08-21）：E[max|X|] 直算。
 
-    X ~ N(0, R)，R = trail 试验 IC 相关矩阵（尾对齐 |ρ| 全对实测，
-    缺测对 → 跨 horizon 先验 → 0）。bar_sigma = E[max_i |X_i|]（σ 单位）。
+    X ~ N(0, R)，R = trail 试验 IC 相关矩阵（v4 2026-09-13：共同尾对齐
+    一次 Gram，签名相关；短 sketch 不进 R。缺测对 → 跨 horizon 先验 → 0）。
+    bar_sigma = E[max_i |X_i|]（σ 单位）。
 
     实现：公共随机数（CRN）——Z 列独立固定种子，条件采样增列
     x_new = X@v + √s·z（v=R⁻¹r，s=1−rᵀv）。旧列不动、加试验只多一个
@@ -414,6 +439,13 @@ class _LuckSampler:
 
     K = 20_000
     SEED = 42
+    # max 统计量取侧：True=双侧 max|X|（IC 线：agent 按 |IC| 挑最优，符号
+    # 事后翻转也算选择）；False=单侧 max X（尾部墙 v2：准入规则
+    # spread_ir ≥ bar 本就单侧，双侧数值更大、无谓抬门——tailgate 同款
+    # 单侧纪律）。2026-10-07 尾部墙 v2（PLAN-tail-wall-v2-and-rescan）：
+    # 参数化代替复制整个采样器——仅三处 max 源切换，IC 线行为由 golden
+    # 测试钉死（test_tailwall.py::test_two_sided_golden）。
+    _abs_max = True
 
     def __init__(self):
         self._keys: list = []
@@ -429,18 +461,53 @@ class _LuckSampler:
         return np.random.default_rng(_LuckSampler.SEED + 1000 * (j + 1)).standard_normal(k)
 
     def _build_R(self, trials: dict, prior_fn=None) -> np.ndarray:
-        """R：对角 1；尾对齐 |ρ| 全对实测；缺测对 → prior_fn(i,j) → 0。"""
+        """R(v4 2026-09-13 计价审计):共同尾对齐一次 Gram,签名相关。
+
+        事故链(生产两根线实测):逐对尾对齐——每对用不同重叠段,估计
+        互不一致 → R 天然非 PSD;再 abs() 抹掉符号 → 3662 试验的 R 带
+        1360 个负特征值(min −50);PSD 投影剪掉负特征值后残余**巨型伪
+        共同因子**(top 特征值 ≈ 总质量 32%),把弥散相关从真实的 0.165
+        虚构成 0.267,E[max|X|] 被推到 4.58——超过 iid 上限 4.35,数学
+        上不可能是诚实值(独立重算 3.35)。
+
+        修复:①≥_MIN_ALIGN 点的 sketch 截到**公共尾长**一次 Gram——
+        单一 Gram 矩阵 PSD by construction,不依赖投影;②签名相关——
+        ± 对 E[max|X|] 同价,符号携带族间抵消结构(动量↔反转);③短
+        sketch 与重叠不足对不进 R(噪声膨胀源);缺测对 → prior_fn → 0
+        (独立=最贵假设,缺证据=保守)。先验注入是小扰动,PSD 兜底投影
+        仍在 _rebuild。"""
         keys = list(trials)
         M = len(keys)
         R = np.eye(M)
-        for i in range(M):
-            for j in range(i + 1, M):
-                c = _tail_aligned_corr(trials[keys[i]], trials[keys[j]])
-                if c is None and prior_fn is not None:
+        idx, sigs = [], []
+        for i, k in enumerate(keys):
+            s = trials[k]
+            if isinstance(s, (list, tuple)) and len(s) >= _MIN_ALIGN:
+                a = np.asarray(s, dtype=np.float64)
+                if np.isfinite(a).all() and a.std() > 0:
+                    idx.append(i)
+                    sigs.append(a)
+        if len(idx) >= 2:
+            L = min(len(a) for a in sigs)
+            X = np.stack([a[-L:] for a in sigs])
+            X = X - X.mean(axis=1, keepdims=True)
+            nrm = np.linalg.norm(X, axis=1)
+            ok = nrm > 0
+            pos = [j for j, o in enumerate(ok) if o]
+            Xn = X[pos] / nrm[pos, None]
+            C = Xn @ Xn.T
+            for a_ in range(len(pos)):
+                for b_ in range(a_ + 1, len(pos)):
+                    R[idx[pos[a_]], idx[pos[b_]]] = \
+                        R[idx[pos[b_]], idx[pos[a_]]] = float(C[a_, b_])
+        if prior_fn is not None:
+            for i in range(M):
+                for j in range(i + 1, M):
+                    if R[i, j] != 0.0:
+                        continue
                     p = prior_fn(keys[i], keys[j])
-                    c = float(p) if isinstance(p, (int, float)) else None
-                if c is not None and np.isfinite(c):
-                    R[i, j] = R[j, i] = abs(c)
+                    if isinstance(p, (int, float)) and np.isfinite(p):
+                        R[i, j] = R[j, i] = float(p)
         return R
 
     @staticmethod
@@ -467,7 +534,8 @@ class _LuckSampler:
         self._R = R
         self._Rinv = (V / w) @ V.T
         self._X = Z @ A.T
-        self._mx = np.abs(self._X).max(axis=1)
+        _src = np.abs(self._X) if self._abs_max else self._X
+        self._mx = _src.max(axis=1)
 
     def _extend(self, new_key, r: np.ndarray, Rinv: np.ndarray,
                 sig: tuple | None = None) -> bool:
@@ -491,7 +559,8 @@ class _LuckSampler:
         self._sig = self._sig + [sig]
         self._R, self._Rinv = R_new, Rinv_new
         self._X = np.column_stack([self._X, x_new])
-        self._mx = np.maximum(self._mx, np.abs(x_new))
+        _cand = np.abs(x_new) if self._abs_max else x_new
+        self._mx = np.maximum(self._mx, _cand)
         return True
 
     def _pop_last(self) -> None:
@@ -513,7 +582,8 @@ class _LuckSampler:
         self._Rinv = P11 if i > 0 else None
         self._X = self._X[:, :i] if i > 0 else None
         if self._X is not None and self._X.shape[1] > 0:
-            self._mx = np.abs(self._X).max(axis=1)
+            _src = np.abs(self._X) if self._abs_max else self._X
+            self._mx = _src.max(axis=1)
         else:
             self._mx = None
 
@@ -561,7 +631,7 @@ class _LuckSampler:
                     p = prior_fn(k, keys[j])
                     c = float(p) if isinstance(p, (int, float)) else None
                 if c is not None and np.isfinite(c):
-                    r[i] = abs(c)
+                    r[i] = c  # v4(2026-09-13):签名相关——± 对 E[max|X|] 同价
             if not self._extend(keys[j], r, self._Rinv, sig=new_sig[j]):
                 self._rebuild(trials, prior_fn)
                 return
@@ -836,13 +906,14 @@ def _region_diagnostic(F, fwd, pit, env, region_ic, region_name, t0_date, t1_dat
     # 混入计价/准入。
     if region_name == "test":
         try:
-            from .tail import K_FRAC, _topk_block
+            from .tail import _topk_block
+            _kf = env.calibration.tail_k
             step = max(int(env.calibration.sample_step), 1)
             sig = np.arange(0, env.T, step)
             rows = sig[(sig >= int(t0))
                        & (sig < (env.T if t1 is None else int(t1)))]
             spreads, tail_ics, _ics, ks, _pairs, _turns = _topk_block(
-                F, fwd, pit, rows, K_FRAC)
+                F, fwd, pit, rows, _kf)
             tail = None
             if len(spreads) >= 10:
                 sp = np.array(spreads)
@@ -850,7 +921,7 @@ def _region_diagnostic(F, fwd, pit, env, region_ic, region_name, t0_date, t1_dat
                 ti = np.array(tail_ics) if tail_ics else None
                 tail = {
                     "region": "test",
-                    "k_frac": K_FRAC,
+                    "k_frac": _kf,
                     "spread_ir": (round(float(sp.mean() / sd), 4) + 0.0
                                   if sd > 0 else None),
                     "tail_ic": (round(float(ti.mean() / ti.std(ddof=1)), 4) + 0.0
@@ -1008,10 +1079,20 @@ def corr_with_registered(F, env, registry_factors):
     return _max_corr_with_registered(F, env, registry_factors)
 
 
-def evaluate_composite(composite_F, parts, env, train_end=None):
+def evaluate_composite(composite_F, parts, env, train_end=None, eval_fn=None):
+    """eval_fn(tag, F, env, train_end) → 与 evaluate 同型的结果；None 时
+    行为与旧版完全一致。C1（修正案 A 2026-08-28）：worker 注入缓存版
+    eval——成分是 trail 里已评估过的源，命中后 (K+1)×evaluate 降到
+    1×。tag 取 "__composite__" 或成分名。"""
     train_end = train_end or env.calibration.dev_end
-    comp = evaluate(composite_F, env, train_end=train_end)
-    part_evals = {name: evaluate(G, env, train_end=train_end) for name, G in parts.items()}
+    if eval_fn is None:
+        comp = evaluate(composite_F, env, train_end=train_end)
+        part_evals = {name: evaluate(G, env, train_end=train_end)
+                      for name, G in parts.items()}
+    else:
+        comp = eval_fn("__composite__", composite_F, env, train_end)
+        part_evals = {name: eval_fn(name, G, env, train_end)
+                      for name, G in parts.items()}
 
     def _topnet(r):
         t = r.get('topn') if isinstance(r, dict) else None

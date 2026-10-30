@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from .env import FactorEnv
+from .env import FactorEnv, TAIL_K_FRAC_DEFAULT
 
-#: 主指标 K 占比（池的 20%，钉死；改动 = 新试验进 tail 账本）
-K_FRAC = 0.2
+#: 主指标 K 占比历史默认。可配化（2026-08-30）：Calibration.k_frac 显式
+#: 配置时走配置（换口径 = 换指纹 + tail 账本按 k_frac 分账）；本常量仅是
+#: 未配置时的兜底，唯一权威在 Calibration.tail_k。
+K_FRAC = TAIL_K_FRAC_DEFAULT
 
 
 def spread_turn_stats(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
@@ -99,9 +101,14 @@ def spread_ir_statistic(F, fwd, pit, sample_step, k_frac: float = K_FRAC,
     [0, t_end) 行（WS1：null 校准的 spread 段与 tail_metrics 同口径，
     K = round(0.2·n)，行集 arange(0, t_end, sample_step)）。
     cost（WS-T2）：net 模式——G2 噪声门在 net 基下把合成世界的组差
-    同样按 2·cost·turn 净掉（与 G3 判定口径一致，一个成本模型）。"""
-    return spread_turn_stats(F, fwd, pit, sample_step, k_frac,
-                             t_end=t_end, cost=cost).get("spread_ir")
+    同样按 2·cost·turn 净掉（与 G3 判定口径一致，一个成本模型）。
+    2026-08-30 修复：cost 给定时返回 net_spread_ir（此前误取毛字段
+    spread_ir——spread_cost/net_basis 从未真正进过 null 分布与 G2，
+    首次开启 net_basis 时实测 std 逐位等于毛段暴露）。"""
+    d = spread_turn_stats(F, fwd, pit, sample_step, k_frac,
+                          t_end=t_end, cost=cost)
+    return (d.get("net_spread_ir") if cost is not None
+            else d.get("spread_ir"))
 
 
 def rank_autocorr(F, pit, rows, lag: int):
@@ -258,13 +265,17 @@ def _topk_block(F, fwd, pit, rows, k_frac):
     return spreads, tail_ics, ics, ks, pairs, turns
 
 
-def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float = K_FRAC,
+def tail_metrics(F: np.ndarray, env: FactorEnv, k_frac: float | None = None,
                  placebo_draws: int | None = None,
                  placebo_seed: int = 20260825) -> dict | None:
     """尾部三件套（见模块 docstring）。截面样本不足（<10 日或 <8 资产）
     → None。placebo_draws 默认按面板规模自适应（大面板降抽样防每次
-    evaluate 都跑重 placebo）。失败可由调用方捕获记 error，不阻断评估。"""
+    evaluate 都跑重 placebo）。失败可由调用方捕获记 error，不阻断评估。
+    k_frac=None → env.calibration.tail_k（未配置 = 0.2 历史默认）。"""
     from .evaluate import _forward_returns, _pit_mask, _top_n_excess
+
+    if k_frac is None:
+        k_frac = env.calibration.tail_k
 
     F = np.asarray(F, dtype=np.float64)
     fwd = _forward_returns(env)

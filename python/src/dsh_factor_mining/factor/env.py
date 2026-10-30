@@ -17,6 +17,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
+#: tail 线（spread 三件套）K 占比的历史默认；唯一权威在 Calibration.tail_k。
+#: tail.K_FRAC 引用本常量保持同名兼容。
+TAIL_K_FRAC_DEFAULT = 0.2
+
 
 @dataclass
 class Calibration:
@@ -48,6 +52,10 @@ class Calibration:
     limit_up_down_mask: bool = False   # 一字板 bar 剔除（近似 h==l，个股 T+1 不可成交）
     ic_sample_every: int = 0           # 不重叠 IC 采样步长；0 = 用 horizon
     top_n: int = 10                    # top-N 组合宽度
+    # tail 线（spread 三件套）K 占比。None = 历史默认 0.2（tail.K_FRAC），
+    # 且 None 不参与环境指纹（与 horizons 同款先例：不配置的既有部署指纹
+    # 逐字节不变）；显式配置 = 换口径 → 指纹变 → null 校准自动要求重跑。
+    k_frac: float | None = None
     bars_per_day: int = 0              # minute 专用：每日 bar 数（0 = 不适用）
 
     @property
@@ -64,6 +72,11 @@ class Calibration:
         if self.horizons:
             return [int(h) for h in self.horizons]
         return [self.horizon]
+
+    @property
+    def tail_k(self) -> float:
+        """tail 线 K 占比；未配置 = 历史默认 0.2。"""
+        return TAIL_K_FRAC_DEFAULT if self.k_frac is None else float(self.k_frac)
 
 
 class FactorEnv:

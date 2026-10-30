@@ -92,7 +92,15 @@ def tail_ledger(trail_engine: list) -> list[dict]:
 
 
 def tail_n_eff(ledger: list[dict]) -> tuple[int, int]:
-    """名单 Jaccard 贪心聚类 → (聚类数 = N_eff, 总试验数)。
+    """名单 Jaccard 并查集连通分量 → (聚类数 = N_eff, 总试验数)。
+
+    名实修正（2026-10-07 出身审计）：出生提交 2a074431 起本函数就是
+    **并查集传递闭包**（对 selection_similarity ≥ _LINEAGE 的对做
+    parent[find(j)]=find(i)），docstring 原写"贪心聚类"与实现不符——
+    贪心代表制（种子一跳收编、无传递闭包，evidence.cluster_families
+    同款）实测族数差 +113~1244%（NOTE-bar-estimators-three-methods
+    §方法二）。计数式估计的三重病（链式/巨连通/定义敏感）与 v2 取代
+    方案见 factor/tailwall.py 与 PLAN-tail-wall-v2-and-rescan-2026-10-07。
 
     无 selection_mh 的旧条目按独立试验计（保守方向：N_eff 只多不少）。"""
     n = len(ledger)
@@ -153,7 +161,8 @@ def tail_deflation_bar(n_eff: int, n_days: int,
                        alpha_track: float = 0.0253,
                        s0_emp: float | None = None,
                        spread_ir: float | None = None,
-                       moments: dict | None = None) -> dict:
+                       moments: dict | None = None,
+                       emax_override: float | None = None) -> dict:
     """尾部线 deflation 门参数（WS4 2026-08-25：高阶矩修正版）。
 
     s0 = null 下 spread_ir 的标准差——s0_emp（本面板随机因子 spread_ir
@@ -161,6 +170,12 @@ def tail_deflation_bar(n_eff: int, n_days: int,
     （s0_source="empirical"），否则解析式 1/√采样日数（"analytic"）。
     sr0 = E[max X](N_eff)·s0（B-LP 单侧正态——与 IC 线 _LuckSampler
     同一高斯假设，对齐水平不超纲）。
+
+    emax_override（2026-10-07 尾部墙 v2，PLAN-tail-wall-v2-and-rescan）：
+    名单重叠相关矩阵上的单侧 CRN E[max X]（tailwall.tail_wall_v2_bar）
+    在场时取代 B-LP(n_eff) 计数式——v1 连通分量计数有链式/巨连通/定义
+    敏感三重病（NOTE-bar-estimators 出身审计实测：etf N_eff=18/2797，
+    巨连通 99%）。out["wall"]="v1"|"v2" 随 bar 落盘（双报遥测判据）。
 
     G3 判定（与 evaluate._dsr_p_from_stats 完全同构：sr→spread_ir，
     sr0→emax·s0，n→采样日数）：
@@ -190,9 +205,19 @@ def tail_deflation_bar(n_eff: int, n_days: int,
         s0 = 1.0 / np.sqrt(float(n_days))
         s0_source = "analytic"
     z_req = NormalDist().inv_cdf(1 - alpha_track)
-    emax = _blp_sigma(float(n_eff))
+    # E[max] 项来源（2026-10-07 尾部墙 v2）：emax_override（名单重叠相关
+    # 矩阵上的单侧 CRN，tailwall.tail_wall_v2_bar）在场且有效时取代
+    # B-LP(n_eff) 计数式；out["wall"] 随 bar 落盘 = v1/v2 双报遥测判据。
+    if (isinstance(emax_override, (int, float))
+            and np.isfinite(float(emax_override))
+            and float(emax_override) >= 0.0):
+        emax = float(emax_override)
+        wall = "v2"
+    else:
+        emax = _blp_sigma(float(n_eff))
+        wall = "v1"
     out = {"ok": True, "s0": round(s0, 6), "s0_source": s0_source,
-           "n_eff": n_eff,
+           "n_eff": n_eff, "wall": wall,
            "alpha_track": alpha_track,
            "emax_sigma": round(emax, 4),
            "bar": round(emax * s0, 4)}
@@ -253,8 +278,15 @@ def tail_admission(tail_block: dict, ledger: list[dict],
                    s0_emp: float | None = None,
                    placebo_z_gate: float | None = None,
                    placebo_m: int | None = None,
-                   net_basis: bool = False) -> dict:
+                   net_basis: bool = False,
+                   v2_wall: dict | None = None) -> dict:
     """尾部轨准入判定（纯函数；IC 轨照旧走 _passes_acceptance）。
+
+    v2_wall（2026-10-07 尾部墙 v2）：tailwall.tail_wall_v2_bar 的返回
+    （名单重叠相关矩阵上的单侧 CRN）。ok 时其 emax 经 emax_override 取代
+    B-LP(n_eff) 计数式进 G3，bar["wall"]="v2"，diag["wall_v2"] 带全量
+    摘要（v1/v2 双报遥测：|Δbar|>0.05 由 bridge 出漂移警告）。None/不 ok
+    = 现行 v1 行为逐比特不变（开关默认关）。
 
     s0_emp（WS1）：landscape spread 段的经验 s0，bridge 负责读取与指纹
     校验后传入；纯函数性质不变。
@@ -301,10 +333,15 @@ def tail_admission(tail_block: dict, ledger: list[dict],
     # G3 deflation（跨轨 Šidák α_track；WS4：spread_moments 在场走
     # t 分母偏度/峰度修正，缺矩 legacy = 现行公式；net 基下矩用
     # net_spread_moments——被净掉的序列形状不同，矩必须同口径）
+    # 尾部墙 v2（2026-10-07）：v2_wall ok 时 emax_override 生效。
+    _v2_ok = (isinstance(v2_wall, dict) and v2_wall.get("ok"))
     bar = tail_deflation_bar(max(n_eff, 1), int(n_days or 0), s0_emp=s0_emp,
                              spread_ir=spread_ir,
-                             moments=_moments)
+                             moments=_moments,
+                             emax_override=(v2_wall.get("emax_sigma")
+                                            if _v2_ok else None))
     diag = {"n_eff": n_eff, "n_trials_tail": n_total, "bar": bar,
+            "wall_v2": (v2_wall if _v2_ok else None),
             "placebo_z": placebo_z, "placebo_draws": m_used,
             "placebo_m": placebo_m if gate_ok else None,
             "placebo_degraded": placebo_degraded,

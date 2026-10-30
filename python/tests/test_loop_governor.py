@@ -397,6 +397,114 @@ def test_compose_edge_trigger():
         pass_unadmitted=2, compose_fired=4))["type"] == "continue"
 
 
+# ---- 线级 async 守卫（2026-09-22）：超时换向豁免只认本线在途作业 ----
+
+def test_async_running_for_lane_isolation(tmp_path):
+    """桥全局判据回归：其它线的在途作业不得压制本线超时换向。"""
+    b = Bridge(state_root=str(tmp_path / "state"), execution_mode="in_process")
+    # 空表 → 无在途
+    assert b._async_running_for_lane("lane-a") is False
+    # 其它线在途 → 本线不豁免（旧全局判据会误判 True）
+    b._async_jobs["j1"] = "submitted"
+    b._async_job_lanes["j1"] = "lane-b"
+    assert b._async_running_for_lane("lane-a") is False
+    assert b._async_running_for_lane("lane-b") is True
+    # 本线在途 → 豁免
+    b._async_job_lanes["j2"] = "lane-a"
+    b._async_jobs["j2"] = "queued"
+    assert b._async_running_for_lane("lane-a") is True
+    # 作业结束清理 → 豁免解除
+    b._async_jobs.pop("j2"); b._async_job_lanes.pop("j2")
+    assert b._async_running_for_lane("lane-a") is False
+
+
+# ---- 2026-09-29 送达通道加固：D1=B（explore 撤出活动轴）/ D2 全幅文本
+# ---- / D3（async 豁免限时）
+
+
+def test_timeout_rotate_directive_sentences():
+    """D2 全幅文本回归：句1 堵最小合规动作（纯 explore 批不算已换向，
+    幸存者须逐一 evaluate 落账）、句2 堵监控态（死线=最低工作期限，
+    引擎持续重推直到有评估落账——09-14 无自设停止点纪律的指令面强化）；
+    窗口句口径随 D1=B 同步（随机生成撤出活动轴，但兜底句保留——
+    09-19 定稿二第②点"随机因子=无路可走的标准出口"不变）。"""
+    s = _timeout_rotate_strategy(3, 11, 600)
+    d = s["directive"]
+    assert "纯 explore 批不构成对换向的响应" in d
+    assert "evaluate 落账后才算已换向" in d
+    assert "监控/保持/等待状态属违规" in d
+    assert "每 10 分钟重推直到有评估落账" in d
+    assert "死线是最低工作期限，不是终点线" in d
+    # 窗口口径：只认评估派发+试验落账
+    assert "无评估派发、无试验落账" in d
+    assert "无随机生成" not in d
+    # 兜底句保留（不引导红线：出口给出，方向仍归模型）
+    assert "factor_random_generate" in d
+
+
+def test_random_generate_explore_not_activity(tmp_path):
+    """D1=B 回归（09-29 ETF 事故：纯 explore 心跳是模型绕过超时窗的
+    豁免通道——"governor satisfied"原话，双会话提前 5h 弃挖转监控态）：
+    explore 派发不再计活动轴（本线/别线 act_n 均不动）；评估派发照常
+    +1（对照组，cache-miss）。"""
+    from dsh_factor_mining.state import read_mining_state
+    b = _make_bridge(tmp_path)
+    out = b.dispatch("factor.random_generate",
+                     {"lane": "s1", "mode": "explore", "n": 3,
+                      "top_k": 1, "seed": 7})
+    assert out.get("mode") == "explore"
+    st = read_mining_state(b.state_root)
+    assert lane_activity(st, "s1") == 0
+    assert lane_activity(st, "default") == 0
+    # 对照组：cache-miss 评估派发照常记活动
+    b.dispatch("factor.evaluate",
+               {"lane": "s1", "source": BASELINE_SOURCE,
+                "stage": "development"})
+    st = read_mining_state(b.state_root)
+    assert lane_activity(st, "s1") == 1
+
+
+def test_async_exempt_time_limit(tmp_path):
+    """D3 回归（批次 2a）：超时换向的"评估在途"豁免限时——超龄作业
+    （启动 >async_exempt_max_s）不再豁免本线换向，且就地收尸三件套：
+    摘在途登记 + 释放 dedup（重试不再并入死作业）+ 墓志 failed
+    （零入账可重试）。worker 子进程挂死不再造成该线换向永久豁免。"""
+    import json as _json
+    import os as _os
+    b = Bridge(state_root=str(tmp_path / "state"), execution_mode="in_process")
+    # 新鲜作业 → 豁免成立
+    b._async_jobs["j-fresh"] = "submitted"
+    b._async_job_lanes["j-fresh"] = "lane-a"
+    b._async_job_t0["j-fresh"] = time.time()
+    assert b._async_running_for_lane("lane-a") is True
+    assert b._async_running_for_lane("lane-b") is False
+    # 超龄作业：先备好 run 目录（收尸要写墓志）
+    rd = Path(b.state_root) / "worker_runs" / "j-stale"
+    rd.mkdir(parents=True)
+    (rd / "job.json").write_text(_json.dumps(
+        {"job_id": "j-stale", "method": "factor.evaluate",
+         "status": "running", "pid": _os.getpid()}), encoding="utf-8")
+    b._async_jobs["j-stale"] = "running"
+    b._async_job_lanes["j-stale"] = "lane-a"
+    b._async_job_t0["j-stale"] = time.time() - 2701
+    b._async_dedup["dk"] = "j-stale"
+    b._async_dedup_rev["j-stale"] = "dk"
+    # 新鲜仍在 → 豁免成立（超龄的已被摘除）
+    assert b._async_running_for_lane("lane-a") is True
+    assert "j-stale" not in b._async_jobs
+    assert "j-stale" not in b._async_job_lanes
+    assert "j-stale" not in b._async_job_t0
+    assert "dk" not in b._async_dedup          # 重试不再并入死作业
+    j = _json.loads((rd / "job.json").read_text(encoding="utf-8"))
+    assert j["status"] == "failed" and j.get("error_code") == -32005
+    assert "可原样重试" in j.get("error", "")
+    # 只剩超龄（新鲜清掉）→ 豁免解除
+    b._async_jobs.pop("j-fresh", None)
+    b._async_job_lanes.pop("j-fresh", None)
+    b._async_job_t0.pop("j-fresh", None)
+    assert b._async_running_for_lane("lane-a") is False
+
+
 if __name__ == "__main__":
     fns = [test_pick_strategy_drain_branch,
            test_pick_strategy_milestone_edge_trigger,
@@ -410,11 +518,21 @@ if __name__ == "__main__":
            test_evaluation_activity_disarms_timeout,
            test_lane_activity_tick_isolation,
            test_evaluate_ticks_request_lane_activity,
-           test_compose_edge_trigger]
+           test_compose_edge_trigger,
+           test_async_running_for_lane_isolation,
+           test_timeout_rotate_directive_sentences,
+           test_random_generate_explore_not_activity,
+           test_async_exempt_time_limit]
     failures = []
     for fn in fns:
         try:
-            fn(Path(tempfile.mkdtemp()) if "tmp_path" in fn.__code__.co_varnames else fn())
+            # 修存量 bug：原单行 `fn(x if cond else fn())` 的条件表达式整体
+            # 被解析为 fn 的实参——0 参测试被传 None 必炸（此前只跑 pytest
+            # 未暴露）。显式分支才是"有 tmp_path 形参才传参"的本义。
+            if "tmp_path" in fn.__code__.co_varnames:
+                fn(Path(tempfile.mkdtemp()))
+            else:
+                fn()
             print(f"PASS {fn.__name__}")
         except Exception as e:
             failures.append((fn.__name__, e))

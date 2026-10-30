@@ -98,7 +98,7 @@ CALIBRATION_PROFILES: dict[str, dict[str, Any]] = {
 
 ALLOWED_CAL_KEYS = {"frequency", "horizon", "horizons", "cost_bps", "execution",
                     "dev_end", "sel_end", "annualization", "limit_up_down_mask",
-                    "ic_sample_every", "top_n", "bars_per_day"}
+                    "ic_sample_every", "top_n", "k_frac", "bars_per_day"}
 
 
 def resolve_calibration(raw: dict[str, Any] | None) -> dict[str, Any]:

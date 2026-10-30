@@ -239,10 +239,25 @@ export interface DataLoadRequest {
   envId?: string
 }
 
+/** Status request; `lane` scopes the embedded loop directive to that
+ * parallel lane (intent layer only — pricing counters stay global). */
+export interface StatusRequest {
+  lane?: string | undefined
+}
+
 /** Request carrying one user factor source snippet. */
 export interface FactorSourceRequest {
   envId?: string
   source: string
+  /** Parallel-lane id (2026-08-31 方案 A): session-stable identity stamped by
+   *  the tool layer. Intent-layer engine state (pending hypothesis, family
+   *  chain, direction budget) is isolated per lane; pricing (n_trials /
+   *  deflation / tail bar) stays global. */
+  lane?: string | undefined
+  /** Async contract (2026-08-31 计算利用层): pass a previous job_id to poll
+   *  its result; set async to run as a background job instead of blocking. */
+  job_id?: string | undefined
+  async?: boolean | undefined
 }
 
 /** Development-stage selector. */
@@ -251,6 +266,12 @@ export type EvaluationStage = 'development' | 'selection' | 'test'
 /** Request shape for factor evaluation. */
 export interface EvaluateRequest extends FactorSourceRequest {
   stage?: EvaluationStage
+  /** Horizon declaration: an integer from the environment menu or 'scan'
+   *  (profile every menu horizon). Defaults to the main horizon. */
+  horizon?: string | undefined
+  /** Stable journal line (host-config stamped) — the evaluate mirror resolves
+   *  expectations from this line when set, instead of the session lane. */
+  journal_lane?: string | undefined
 }
 
 /** Request shape for composite evaluation. */
@@ -261,7 +282,17 @@ export interface CompositeRequest extends FactorSourceRequest {
 /** Request shape for batch evaluation. */
 export interface BatchRequest {
   envId?: string
-  sources: Record<string, string>
+  /** Optional only for job_id polls — a real submission requires it. */
+  sources?: Record<string, string> | undefined
+  /** Declared horizon for the whole batch (integer from the menu; no scan). */
+  horizon?: string | undefined
+  /** Parallel-lane id — see FactorSourceRequest.lane. */
+  lane?: string | undefined
+  /** Stable journal line (host-config stamped; overrides the per-session lane for journal binding — cross-session belief inheritance). */
+  journal_lane?: string | undefined
+  /** Async contract — see FactorSourceRequest. */
+  job_id?: string | undefined
+  async?: boolean | undefined
 }
 
 /** Request shape for walk-forward evaluation. */
@@ -278,12 +309,14 @@ export interface LibraryQueryRequest {
 }
 
 /** Path-query layer names. */
-export type PathLayer = 'explored' | 'search_paths'
+export type PathLayer = 'explored' | 'search_paths' | 'trail_similarity'
 
 /** Path query request. */
 export interface PathQueryRequest {
   layer: PathLayer
   query: string
+  /** trail_similarity only: candidate factor source code. */
+  source?: string
   top_k?: number
 }
 
@@ -329,13 +362,19 @@ export interface ArxivSearchRequest {
 export interface RandomGenerateRequest {
   envId?: string
   /** explore (default): generate + light-IC scan + top_k sources; null-calibration: empirical null landscape. */
-  mode?: 'explore' | 'null-calibration'
+  mode?: 'explore' | 'null-calibration' | 'collision-card'
   /** number of random factors to generate (default 50). */
   n?: number
   /** reproducibility seed (default 42). */
   seed?: number
   /** explore only: return top_k sources by |IC_IR| (default 5). */
   top_k?: number
+  /** collision-card only: concept count per card, 1-3 (default 2). */
+  k?: number
+  /** Parallel-lane id — see FactorSourceRequest.lane. Explore survivor hashes
+   *  (origin=random bookkeeping) are lane-scoped; without it everything
+   *  silently lands on the default lane (R17 third strike, 2026-09-29). */
+  lane?: string | undefined
 }
 
 /** One light-IC diagnostic over a generated random factor. */
@@ -414,9 +453,14 @@ export interface StateResetResult extends JsonRecord {
   note?: string
 }
 
-/** Trail aggregate summary request (no parameters; merges engine + agent trails). */
+/** Trail aggregate summary request (merges engine + agent trails; latest
+ *  engine entries and counters are lane-scoped, global facts stay global). */
 export interface TrailSummaryRequest {
   envId?: string
+  /** Parallel-lane id — see FactorSourceRequest.lane. */
+  lane?: string | undefined
+  /** Stable journal line (host-config stamped; overrides the per-session lane for journal binding — cross-session belief inheritance). */
+  journal_lane?: string | undefined
 }
 
 /** Trail aggregate summary result. */
@@ -446,3 +490,145 @@ export interface ExportReportResult extends JsonRecord {
   content?: string
   error?: string
 }
+
+// ---- Reasoning journal（构造面 v7 2026-09-12：双层记忆的解释层）----
+
+/** Progressive-disclosure journal read: 0=INDEX (L0), 1=live (L1), 2=one entry by id (L2). */
+export interface JournalReadRequest {
+  level?: number
+  entry_id?: string
+  /** Parallel-lane id — see FactorSourceRequest.lane. */
+  lane?: string | undefined
+  /** Stable journal line (host-config stamped; overrides the per-session lane for journal binding — cross-session belief inheritance). */
+  journal_lane?: string | undefined
+}
+
+/** Journal read result — fields depend on level (index / live / entry). */
+export interface JournalReadResult extends JsonRecord {
+  exists?: boolean
+  level?: number
+  index?: string
+  live?: string
+  live_chars?: number
+  entry?: string
+  where?: string
+  hint?: string
+}
+
+/** Append entry block(s) to the lane journal live area. First-line convention
+ *  `## <id> <status> <title>`; status `registered` requires a `ref:<source_hash>`
+ *  line — the evaluate mirror joins on it. */
+export interface JournalAppendRequest {
+  content: string
+  /** Factor source for `registered` entries — the engine hashes it into the
+   *  ref line (the model cannot know source_hash before evaluation). */
+  source?: string
+  lane?: string | undefined
+}
+
+export interface JournalAppendResult extends JsonRecord {
+  appended?: string[]
+  live_chars?: number
+  cap_warn?: boolean
+  hint?: string
+}
+
+/** Status transition or note: open→registered→adjudicated→resolved|stale,
+ *  active→retired; a same-status call appends the note. */
+export interface JournalUpdateRequest {
+  id: string
+  status: string
+  note?: string
+  lane?: string | undefined
+}
+
+export interface JournalUpdateResult extends JsonRecord {
+  id?: string
+  from?: string
+  to?: string
+  note?: boolean
+}
+
+/** Arc-boundary distillation. Engine snapshots the old live into raw/ (audit,
+ *  anti-gaslight), archives dropped terminal entries with epitaphs, rewrites
+ *  live; dropped active entries are auto-kept with a warning. */
+export interface JournalDistillRequest {
+  new_live: string
+  lane?: string | undefined
+}
+
+export interface JournalDistillResult extends JsonRecord {
+  snapshot?: string
+  archived?: string[]
+  kept_active?: string[]
+  warning?: string
+  live_chars?: number
+}
+
+/** Journal telemetry: live counts, registration rate, distill stats. */
+export interface JournalStatsRequest {
+  lane?: string | undefined
+}
+
+export interface JournalStatsResult extends JsonRecord {
+  exists?: boolean
+  counts?: JsonRecord
+  stats?: JsonRecord
+  registration_rate?: number
+  live_chars?: number
+  live_char_cap?: number
+  hint?: string
+}
+
+/** Standby-line view request (derived read-only; rescue channels' sourcing surface). */
+export interface StandbyViewRequest {
+  min_abs_sr?: number
+  top_n?: number
+  family_dedup?: boolean
+}
+
+/** Standby-line view result — near-miss survivors awaiting rescue channels. */
+export interface StandbyViewResult extends JsonRecord {
+  exists?: boolean
+  count_raw?: number
+  count_family_dedup?: number
+  count_mechanism_stratum?: number
+  rows?: JsonRecord[]
+  meta?: JsonRecord
+}
+
+/** Channel-3 rule-based combination request (engine-fixed rule; agent only triggers). */
+export interface StandbyCombineRequest {
+  envId?: string
+  k?: number
+  ortho_th?: number
+  min_abs_sr?: number
+  async?: boolean
+  /** Parallel-lane id — see FactorSourceRequest.lane. Combine dispatches an
+   *  async composite job whose lane tag feeds the per-lane async exemption
+   *  and activity bookkeeping (2026-09-29 audit). */
+  lane?: string | undefined
+}
+
+export interface StandbyCombineResult extends JsonRecord {}
+
+/** Channel-5 incubation: enqueue a cohort (agent free choice — statistically free). */
+export interface IncubateEnqueueRequest {
+  hashes: string[]
+  window_days?: number
+  start_date?: string
+}
+
+export interface IncubateEnqueueResult extends JsonRecord {}
+
+/** Channel-5 cohort status / one-shot judgment. */
+export interface IncubateStatusRequest {}
+
+export interface IncubateStatusResult extends JsonRecord {}
+
+export interface IncubateJudgeRequest {
+  cohort_id: string
+  envId?: string
+}
+
+export interface IncubateJudgeResult extends JsonRecord {}

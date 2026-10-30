@@ -220,19 +220,20 @@ def test_explored_papers_marks_exhausted(tmp_path):
 # ---- F5: 种子轮转 ----
 
 def test_literature_seed_rotation():
-    """literature 指令携带按检索数轮转的正交种子（v6：边际驱动触发）。"""
+    """literature 指令携带按检索数轮转的正交种子（v6：边际驱动触发；
+    2026-09-22 三源轮转：literature 位 = lit_search_count % 3 == 0）。"""
     base = dict(stop_kind=None, streak=9, pending_rejected=None,
                 frozen=False, plateau=False, pass_unadmitted=0,
                 accepted_n=0, agent_rounds=1, n_trials=1,
                 family_marginal={"enough_data": True, "marginal": -0.15,
                                  "family_best": 0.8, "recent_best": 0.65})
     s1 = _pick_strategy(**base, lit_search_count=0)
-    s2 = _pick_strategy(**base, lit_search_count=1)
+    s2 = _pick_strategy(**base, lit_search_count=3)
     assert s1["type"] == "literature" and s2["type"] == "literature"
     assert s1["directive"] != s2["directive"]
     assert "种子查询" in s1["directive"] and "papers" in s1["directive"]
-    # 2026-09-01 D2 轮转：lit_search_count % 3 == 2 → random（原 14 回位点
-    # 现是轮转槽）；15 % 14 = 1 → 回到 s2 的种子
-    s_wrap = _pick_strategy(**base, lit_search_count=15)
+    # 2026-09-22 三源轮转：%3==1 → random、%3==2 → mechanism，
+    # literature 只在 %3==0 位；种子周期 14 → 42（lcm(3,14)）步回绕到 s1
+    s_wrap = _pick_strategy(**base, lit_search_count=42)
     assert s_wrap["type"] == "literature"
-    assert s_wrap["directive"] == s2["directive"]
+    assert s_wrap["directive"] == s1["directive"]

@@ -124,3 +124,25 @@ def dsr_p_from_stats(sr, g3, g4, n, bar_sigma: float | None,
         return None
     t_stat = (abs(sr) - sr0) * (n - 1) ** 0.5 / denom ** 0.5
     return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
+
+
+def dsr_t_from_stats(sr, g3, g4, n, bar_sigma: float | None,
+                     pool_std: float | None) -> float | None:
+    """充分统计量 → deflated t 统计量（dsr_p_from_stats 的 erfc 前身）。
+
+    调度器（2026-09-29 任务书）的消费面：周对账配对（F6：父态在子代
+    评估时刻的池态下重算——同池态差分消掉公共漂移）、r̂ 成功判据
+    （F7：墙单位增益 g=(t_child−t_parent)/b_N）、重放反事实池态
+    （F10）。数值与 dsr_p_from_stats 内部完全同式。"""
+    try:
+        sr, g3, g4, n = float(sr), float(g3), float(g4), int(n)
+    except (TypeError, ValueError):
+        return None
+    if n < 5:
+        return None
+    denom = 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr * sr
+    denom = max(denom, 1e-8)
+    sr0, _ = dsr_sr0(bar_sigma, pool_std)
+    if sr0 is None:
+        return None
+    return (abs(sr) - sr0) * (n - 1) ** 0.5 / denom ** 0.5

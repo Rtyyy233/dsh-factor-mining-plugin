@@ -671,10 +671,13 @@ def _train_end_of(v) -> int:
     return int(np.searchsorted(v.dates, pd.Timestamp(_train_end_date(v))))
 
 
-def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress=None,
+def run_null_calibration(env, state_root, n=200, seed=42, opset=None, on_progress=None,
                          env_fingerprint=None, horizons=None,
                          cost_model_version=None, spread_cost=None):
     """null 地形：n 个随机因子的 IC_IR 经验分布，持久化。
+
+    n 缺省 200（2026-10-06 假阴性救助线 A.4 小样本修复：n=50 下 p90/p10
+    的 pool_std 估计误差约 ±7%，n=200 减半；此前缺省 50）。
 
     返回 dict：分位数 + 元信息。后续因子诊断可引用
     "相对随机基线 p95 的分位"（bridge 的 factor.null_landscape 查询）。
@@ -807,6 +810,32 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
             if rhos:
                 cross_h[f"{min(h1, h2)}|{max(h1, h2)}"] = round(float(np.mean(rhos)), 4)
 
+    # 证据分位段（2026-10-06 假阴性救助线 A.4）：同批随机树原始 IC 序列的
+    # a4_dd（累计回撤比）与 famsize（|ρ|≥0.6 贪心聚类族规模）null 分布——
+    # 人审回扫卡片证据列的分位基线。同源公式见 factor.evidence（单一权威
+    # 定义）；只写 null_landscape.json，不进任何评估响应面。
+    from .evidence import (a4_dd_ratio, cluster_families, quantile_dict,
+                           truncate_common)
+    a4_out, fam_out = {}, {}
+    for h in menu:
+        sers = list(series_by_h[h])
+        a4s = [v for v in (a4_dd_ratio(list(map(float, s))) for s in sers)
+               if v is not None]
+        a4_out[str(h)] = {**quantile_dict(a4s), "n": len(a4s)}
+        if len(sers) >= 2:
+            try:
+                sk = truncate_common([list(map(float, s)) for s in sers])
+                fam_h, _dep, size_h = cluster_families(
+                    sk, [str(i) for i in range(len(sers))])
+                famsizes = [float(size_h[int(fam_h[i])])
+                            for i in range(len(sers))]
+                fam_out[str(h)] = {**quantile_dict(famsizes),
+                                   "n_families": int(len(size_h))}
+            except Exception:
+                fam_out[str(h)] = {**quantile_dict([]), "n_families": 0}
+        else:
+            fam_out[str(h)] = {**quantile_dict([]), "n_families": 0}
+
     # 生产可见性（2026-08-20）：某 horizon 全空 = 该赌注无基线（下游 pool_std
     # None → D7 拒绝），静默 0-valid 是审计盲区——必须 stderr 可见
     for h in menu:
@@ -832,6 +861,12 @@ def run_null_calibration(env, state_root, n=50, seed=42, opset=None, on_progress
         "ic_ir": ic_ir_out,
         "spread": spread_out,
         "cross_horizon_corr": cross_h,
+        # 证据分位段（2026-10-06 A.4）：a4_dd=同批随机树的累计回撤比分布；
+        # famsize=同批随机树 |ρ|≥0.6 聚类族规模分布（随机树绝大多数
+        # 孤立，famsize null≈1——真候选的大族规模在此基线下才算异常）。
+        # 消费面= rescue_ops 人审回扫卡片（只读），模型面零暴露
+        "a4_dd": a4_out,
+        "famsize": fam_out,
         # 换手定价（2026-08-28）：成本口径戳——net 段与毛段的地形互不
         # 可比；_landscape_tail_s0 的指纹门只认同版本
         "cost_model_version": cost_model_version,

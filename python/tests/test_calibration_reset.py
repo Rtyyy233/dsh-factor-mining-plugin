@@ -229,7 +229,7 @@ def test_config_calibration_roundtrip_and_worker_apply():
         assert b.dispatch("data.load", {"envId": "primary"})["ok"] is True
         # worker 路径（默认 executionMode=worker）必须应用 horizon=5（分界自适应同式）
         diag = b.dispatch("factor.evaluate",
-                          {"envId": "primary", "source": FACTOR_SOURCE, "stage": "development"})
+                          {"envId": "primary", "source": FACTOR_SOURCE, "stage": "development", "async": False})
         exp_dev, exp_sel = _auto_regions(df)
         env_direct = _make_env(df, Calibration(horizon=5, cost_bps=5,
                                                 dev_end=exp_dev, sel_end=exp_sel))

@@ -409,16 +409,20 @@ def test_strategy_query_on_accepted_milestone(tmp_path):
 
 
 def test_strategy_none_only_on_silent_terminals(tmp_path):
-    """v8 分流：静默终态（finalize/fail_streak——convergence 已退役，
-    2026-08-26 族收敛纯 must_rotate）strategy=None、注入器静默；
-    方向预算停点（arc/簇/族收敛）strategy 强制 rotate/literature。"""
+    """永续化（2026-10-02 总任务书 A.2/A.3）：静默终态分支已删除——
+    _pick_strategy 永不返回 None（finalize/fail_streak kind 由
+    check_termination 永续化保证不再产出；未知/遗留 kind 落常规优先级，
+    保险丝语义）；方向预算停点（arc/簇/族收敛）strategy 强制
+    rotate/literature。"""
     from dsh_factor_mining.bridge import _pick_strategy
     base = dict(streak=3, pending_rejected=None, frozen=False,
                 plateau=False, pass_unadmitted=0, accepted_n=0,
                 agent_rounds=1, n_trials=1)
-    # 静默终态 → None
-    for kind in ("finalize", "fail_streak"):
-        assert _pick_strategy(**base, stop_kind=kind) is None, kind
+    # 永续：任何 stop_kind（含遗留的 finalize/fail_streak 字面量）都不再
+    # 产出 None——注入器永远有指令可推
+    for kind in ("finalize", "fail_streak", "direction_budget", None):
+        s = _pick_strategy(**base, stop_kind=kind)
+        assert s is not None, kind
     # 方向预算 → 强制 rotate（族小无边际数据）或 literature（边际枯竭）
     s = _pick_strategy(**base, stop_kind="direction_budget")
     assert s is not None and s["type"] == "rotate", s

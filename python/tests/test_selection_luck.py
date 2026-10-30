@@ -135,21 +135,51 @@ def test_nu_telemetry_twin_vs_independent():
 # ---- F1：尾对齐相关实测 ----
 
 def test_tail_aligned_corr_crosses_length_boundary():
-    """不同长度 sketch 的尾部共享段必须实测（v2 长度分组返回 None → 置独立）。"""
+    """不同长度 sketch 的尾部共享段必须实测（v2 长度分组返回 None → 置独立）。
+    v4（2026-09-13 计价审计）：重叠下限 20→60——短重叠段 |r| 零假设期望
+    ≈1/√20≈0.22，纯噪声且正向膨胀平均相关（生产事故成分之一）。"""
     rng = np.random.default_rng(5)
     a = list(rng.normal(0, 0.1, 85))              # 85 点
-    # b（60 点）= a 尾 60 点的强相关变体：长度不同（v2 分组互测不到），
-    # 尾部天然对齐 → 取 last-60 实测 ≈0.95
+    # b（60 点）= a 尾 60 点的强相关变体：重叠 60 ≥ 下限 → 实测 ≈0.95
     b = [0.95 * x for x in a[-60:]]
     c = _tail_aligned_corr(a, b)
     assert c is not None and c > 0.85, c
-    # 更短的 sketch（30 点）同样可测（v2 直接跳过）
+    # 重叠不足（<60，v4 前为 20）→ None（保守按独立计——短重叠=噪声源）
     short = [0.9 * x for x in a[-30:]]
-    c2 = _tail_aligned_corr(a, short)
-    assert c2 is not None and c2 > 0.8, c2
-    # 重叠不足（<20）→ None（保守按独立计）
+    assert _tail_aligned_corr(a, short) is None
     tiny = list(rng.normal(0, 0.1, 10))
     assert _tail_aligned_corr(a, tiny) is None
+
+
+def test_build_r_incident_regression_psd_and_cluster_discount():
+    """计价事故回归（2026-09-13）：混合长度+族间负相关的试验集——
+
+    旧实现(逐对短重叠+abs+PSD 投影)把此类结构虚构成巨型共同因子,
+    E[max] 超 iid 上限(生产实测 4.58 > 4.35)。修复后:
+    ①R 最小特征值 ≥ 0(单 Gram 构造,无需救投影);
+    ②聚簇结构享受折扣:bar 明显低于 iid M 试验值。
+    """
+    rng = np.random.default_rng(21)
+    trials = {}
+    n_grp, grp = 8, 5
+    for g in range(n_grp):
+        base = rng.normal(0, 1, 84)
+        if g % 2 == 1:
+            base = -base  # 奇数族与偶数族负相关(abs 时代的伤害点)
+        for i in range(grp):
+            trials[(f"g{g}_{i}", 20)] = list(base + rng.normal(0, 0.3, 84))
+    # 混入一个短 sketch(<60)——不进 R,按独立计
+    trials[("tiny", 20)] = list(rng.normal(0, 0.1, 30))
+    smp = _LuckSampler()
+    smp.sync(trials)
+    w = np.linalg.eigvalsh(smp._R)
+    assert w.min() > -1e-8, ("R 非 PSD", w.min())  # ① 修复:构造即 PSD
+    bar = smp.bar_sigma()
+    # ② 聚簇折扣:40 试验若全独立 ≈ E[max|Z|]_40 ≈ 2.35;8 族 → ≈2.0±
+    iid_41 = _LuckSampler()
+    iid_41.sync({(f"x{i}", 20): list(np.random.default_rng(100 + i).normal(0, 0.1, 84))
+                 for i in range(41)})
+    assert bar < iid_41.bar_sigma() - 0.15, (bar, iid_41.bar_sigma())
 
 
 def test_sampler_r_uses_tail_alignment_across_lengths():
@@ -232,25 +262,22 @@ def _entry(h: str, sketch: list | None, horizon: int = 20, **kw) -> dict:
     return e
 
 
-def test_n_eff_from_entries_pending_floor_and_envelope():
+def test_n_eff_from_entries_pending_floor_and_gate_ignores_stale_stamps():
     b = Bridge(state_root="unused-state-root-for-unit", execution_mode="in_process")
     # 空 trail + pending 单例 → M=1 底价 E|Z|
     stats = b._n_eff_from_entries([], source_hash="abc", horizon=20)
     assert stats["n_trials"] == 1
     assert abs(stats["bar_sigma"] - E_ABS_Z) < 0.02, stats
-    # 单调包络（σ 章）：伪造/陈旧的 bar_sigma_at_write 章封死 rebuild 回退
+    # v4（2026-09-13 计价审计）：包络摘除——伪造/陈旧的 bar_sigma_at_write
+    # 章不得回读进门。生产事故:章棘轮把诚实 3.35 锁死到 4.58(超 iid 上限)。
     entries = [_entry("h1", list(np.random.default_rng(1).normal(0, 0.1, 60)),
                       bar_sigma_at_write=5.0)]
     stats2 = b._n_eff_from_entries(entries, source_hash="h2", horizon=20)
-    assert stats2["bar_sigma"] >= 5.0, stats2
-    # v2 旧章（无量纲谱 N_eff）B-LP 换算后参与包络
+    assert stats2["bar_sigma"] < 2.0, stats2  # 两独立试验的诚实价,不是章的 5.0
+    # v2 旧章(谱 N_eff)换算同样不进门(双无 sketch=2 次独立试验,诚实≈1.12)
     entries_v2 = [_entry("h1", None, n_eff_at_write=100.0)]
     stats3 = b._n_eff_from_entries(entries_v2, source_hash="h2", horizon=20)
-    assert stats3["bar_sigma"] >= _blp_sigma(100.0) - 1e-9, stats3
-    # 章只抬不压：正常值低于章 → bar=章；高于章 → bar=当前值
-    entries_hi = [_entry("h1", None, bar_sigma_at_write=0.1)]
-    stats4 = b._n_eff_from_entries(entries_hi, source_hash="h2", horizon=20)
-    assert stats4["bar_sigma"] > 0.1
+    assert stats3["bar_sigma"] < 1.5 < _blp_sigma(100.0), stats3
 
 
 def test_n_eff_from_entries_twin_family_cheaper_than_independent():
@@ -274,14 +301,14 @@ def test_evaluate_chain_stamps_bar_sigma_and_rises(tmp_path):
     b.dispatch("factor.random_generate",
                {"envId": "primary", "mode": "null-calibration", "n": 5})
     r1 = b.dispatch("factor.evaluate",
-                    {"envId": "primary", "source": GOOD, "stage": "development"})
+                    {"envId": "primary", "source": GOOD, "stage": "development", "async": False})
     d1 = r1["deflated_train"]
     assert d1.get("bar_sigma", 0) >= E_ABS_Z - 0.05, d1  # 冷启动底价在场
     assert d1.get("p") is not None and d1.get("pool_std"), d1
     assert "recomputed_at_trail" in d1
     # 第二个试验入 trail → bar 抬升（单调），nu 遥测在场
     r2 = b.dispatch("factor.evaluate",
-                    {"envId": "primary", "source": VARIANT, "stage": "development"})
+                    {"envId": "primary", "source": VARIANT, "stage": "development", "async": False})
     d2 = r2["deflated_train"]
     assert d2["bar_sigma"] >= d1["bar_sigma"] - 1e-9, (d1, d2)
     assert isinstance(d2.get("nu"), dict) or d2.get("nu") is None
@@ -297,7 +324,7 @@ def test_evaluate_worker_mode_forwards_bar_sigma(tmp_path):
     b.dispatch("factor.random_generate",
                {"envId": "primary", "mode": "null-calibration", "n": 5})
     r = b.dispatch("factor.evaluate",
-                   {"envId": "primary", "source": GOOD, "stage": "development"})
+                   {"envId": "primary", "source": GOOD, "stage": "development", "async": False})
     d = r["deflated_train"]
     assert d.get("bar_sigma", 0) >= E_ABS_Z - 0.05, d
     assert d.get("p") is not None, d
@@ -322,7 +349,7 @@ def test_submit_recompute_carries_bar_sigma(tmp_path):
     b.dispatch("factor.random_generate",
                {"envId": "primary", "mode": "null-calibration", "n": 5})
     diag = b.dispatch("factor.evaluate",
-                      {"envId": "primary", "source": GOOD, "stage": "development"})
+                      {"envId": "primary", "source": GOOD, "stage": "development", "async": False})
     res = b.dispatch("registry.submit",
                      {"name": "f_luck", "signal": "momentum20",
                       "source": GOOD, "diagnosis": diag})
@@ -334,7 +361,7 @@ def test_cold_start_without_baseline_rejects_p(tmp_path):
     """空 trail + 无 null 基线：M=1 的 E|Z| 底价也要求 pool_std——p=None 拒给。"""
     b = _setup(tmp_path)
     r = b.dispatch("factor.evaluate",
-                   {"envId": "primary", "source": GOOD, "stage": "development"})
+                   {"envId": "primary", "source": GOOD, "stage": "development", "async": False})
     d = r["deflated_train"]
     assert d.get("p") is None
     assert "pool_std" in d.get("note", ""), d

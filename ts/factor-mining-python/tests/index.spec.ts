@@ -74,7 +74,7 @@ describe('FactorMiningPythonService', () => {
       rmSync(dir, { recursive: true, force: true })
       await dispose()
     }
-  })
+  }, 180_000)
 
   it('loads synthetic data and evaluates a baseline factor', async () => {
     const { service, dir, dispose } = await setup()
@@ -87,7 +87,19 @@ describe('FactorMiningPythonService', () => {
       const causal = await service.checkCausality({ envId: 'primary', source })
       expect(causal.verdict).toBe('causal')
 
-      const diag = await service.evaluate({ envId: 'primary', source, stage: 'development' })
+      // ASYNC BY DEFAULT (2026-08-31): submit -> poll job_id; a cache hit
+      // returns the diagnosis directly. Both are legal terminals.
+      const first = await service.evaluate({ envId: 'primary', source, stage: 'development' }) as Record<string, unknown>
+      let diag = first as { ic_ir_train?: number }
+      if (first.job_id !== undefined) {
+        const deadline = Date.now() + 120_000
+        for (;;) {
+          const poll = await service.evaluate({ envId: 'primary', job_id: first.job_id as string }) as Record<string, unknown>
+          if (poll.job_id === undefined && poll.status === undefined) { diag = poll as { ic_ir_train?: number }; break }
+          if (Date.now() > deadline) throw new Error('job did not finish in 120s')
+          await new Promise(r => setTimeout(r, 500))
+        }
+      }
       expect(typeof diag.ic_ir_train).toBe('number')
 
       const lib = await service.queryLibrary({ query: 'momentum' })
@@ -96,5 +108,5 @@ describe('FactorMiningPythonService', () => {
       rmSync(dir, { recursive: true, force: true })
       await dispose()
     }
-  })
+  }, 180_000)
 })

@@ -107,12 +107,12 @@ def test_timeout_error_actionable(tmp_path, monkeypatch):
     with pytest.raises(BridgeError) as ei:
         b.dispatch("factor.evaluate",
                    {"envId": "primary", "source": BASELINE_SOURCE,
-                    "stage": "development"})
+                    "stage": "development", "async": False})
     err = ei.value
     assert err.code == -32005, err.code
     msg = err.message
     assert "factor.evaluate" in msg, msg           # 方法名
-    for kw in ("可立即重试", "零写入", "向量化", "修实现"):
+    for kw in ("零写入", "向量化", "修实现"):
         assert kw in msg, f"超时消息缺要素「{kw}」: {msg}"
     # 行为纪律：超时不是对研究方向的判定
     assert "不换假设" in msg, msg
@@ -187,7 +187,7 @@ def test_loop_infra_failures_guidance(tmp_path):
     assert inf["recent_count"] == 1, inf
     assert inf["last_method"] == "factor.evaluate"
     assert "勿因超时更换研究方向" in inf["note"], inf["note"]
-    assert "可立即重试" in inf["note"], inf["note"]
+    assert "workerRuns" in inf["note"], inf["note"]   # R7：先看队列再重试
     # 无失败文件 → loop 无该键（纯附加，不污染常规响应）
     (state / "tool_failures.json").unlink()
     st2 = b.dispatch("status", {})

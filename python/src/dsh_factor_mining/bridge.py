@@ -46,6 +46,7 @@ from .discipline import (
 from .factor import audit as audit_mod
 from .factor.causality import check_causality
 from .factor.eval_cache import cache_read, eval_key_from_parts
+from .factor.gates import dsr_t_from_stats as _dsr_t_from_stats
 from .factor.evaluate import (
     _dsr_p_from_stats,
     _LuckSampler,
@@ -59,6 +60,7 @@ from .factor.evaluate import (
 from .library.contract import LibraryError, UserLibrary, query_entries
 from .filelock import pid_alive, state_write_lock
 from .lane import (
+    DEFAULT_LANE,
     current_lane,
     entry_lane,
     normalize_lane,
@@ -97,7 +99,10 @@ from .state import (
     lane_drive_bk,
     lane_drive_bk_update,
     lane_explore_hashes_extend,
+    lane_inspiration_mode,
+    lane_mechanism_used,
     lane_random_used,
+    mechanism_emit_count,
     random_emit_count,
     read_json_list,
     read_mining_state,
@@ -393,8 +398,12 @@ _ARXIV_ID_RE = re.compile(r"(?:arxiv\.org/abs/)?(abs/)?(\d{4}\.\d{4,5})(v\d+)?$"
 # 灵感重置声明（2026-09-01 规划书 WS-B/D1）：next_hypothesis 前缀语法。
 # 判定序在 _surrender_match 之前——换源宣言不是停笔宣言，理由里出现
 # 「无新假设」等措辞不该被连坐拒收。半/全角冒号都收。
+# 2026-09-22 灵感源二代（PLAN-inspiration-mechanism）：枚举扩 mechanism
+# ——自提机制假设（模型自己提出经济学/金融数学假设，自己推导验证；
+# 内容零校验——零脚手架是用户红线）。注意与 _trial_stats(stratum=
+# "mechanism"——方案B 影子机制的统计分层)同名不同域：此处是策略类型。
 _INSPIRATION_RESET_RE = re.compile(
-    r"^\s*\[灵感重置[:：](?P<mode>literature|random)\]\s*(?P<reason>.+)$",
+    r"^\s*\[灵感重置[:：](?P<mode>literature|random|mechanism)\]\s*(?P<reason>.+)$",
     re.DOTALL)
 
 
@@ -431,8 +440,8 @@ _STRATEGY_DIRECTIVES = {
                "evaluate_batch deflation）。幸存者是选择不是结论——未超 "
                "null p95 或门链未过的如实入账；对幸存者的改造（换窗口/换"
                "算子/加条件）按普通假设驱动试验推进。"),
-    "compose": ("做中阶合成：从 trail 中挑已验证但未入册的单因子，构造"
-                "正交组合（目标截面相关 < 0.7），用 factor_evaluate_composite 验证。"),
+    "compose": ("做中阶合成：从试验账（trail）中挑已验证但未入册的单因子，"
+                "构造正交组合（目标截面相关 < 0.7），用 factor_evaluate_composite 验证。"),
     "query": ("正交性审计：计算最近入册因子与既有入册因子的截面相关性，"
               "确认是否带来增量信息；发现高相关就记录 explored 并构造去重组合。"),
     "drain": ("机械库存已清空（无未消化假设、无近失待深化、无组合库存）——"
@@ -442,6 +451,18 @@ _STRATEGY_DIRECTIVES = {
               "deflation）；随机通道不可用或连续失败时改从文献找灵感"
               "（factor_arxiv_search，种子查询见 literature 指令）。供数型"
               "探索：幸存者是选择不是结论，未过门如实入账。"),
+    # 灵感源二代（2026-09-22 PLAN-inspiration-mechanism WS-2A）：内容
+    # 100% 归模型——引擎只提供出口与查重/抽卡工具，零内容校验（用户
+    # 红线：零脚手架）。指令三句式全部遥测口吻。
+    "mechanism": ("提出你自己的经济学或金融数学机制假设，把它推导到本面板"
+                  "可验证的构造，走标准管线验证——机制内容完全归你定。落假设"
+                  "前先查重：factor_journal_read 读自己的推理日志、"
+                  "factor_query_paths 查已试路径，表达式层可用 "
+                  "factor_query_paths(layer='trail_similarity', source=候选"
+                  "源码) 做结构相似预检——查重只杀重复劳动，不设新颖性标准。"
+                  "一时没有机制头绪，可抽一张随机概念刺激卡"
+                  "（factor_random_generate(mode='collision-card')），连接、"
+                  "变形或弃权都行——弃权免费，再抽即可。"),
 }
 
 
@@ -461,8 +482,11 @@ def _govern_decide(bk: dict, *, now: float, growth: bool, async_running: bool,
         循环，不发终态。
       - 增长 = **本线引擎试验数前进 或 引擎可见活动前进**（09-20 复轴：
         只认试验入账在重税墙下过度开火——入账稀缺，合法打磨期被注
-        rotate 全吸收；活动 = cache-miss 评估派发/随机生成，叙事碰不到，
-        反叙事性质保持——等待环的一句话每轮写一条 trail 喂不进活动轴）。
+        rotate 全吸收；活动 = cache-miss 评估派发（evaluate/composite/
+        batch），叙事碰不到，反叙事性质保持——等待环的一句话每轮写
+        一条 trail 喂不进活动轴。2026-09-29 D1=B：随机生成派发撤出
+        活动轴——纯 explore 心跳是模型绕过超时窗的豁免通道（"governor
+        satisfied"实测），撤出后 rotate 每 10min 持续到有真实评估落账）。
         键编 era 令牌（试验数:活动数，跨世代唯一）与序号（每次超时换新
         键恰好推送一注）。
       - 误报无害化：评估在途（异步作业守卫）不判超时。
@@ -513,11 +537,16 @@ def _govern_decide(bk: dict, *, now: float, growth: bool, async_running: bool,
 
 def _timeout_rotate_strategy(n: int, lane_trials: "int | str",
                              stuck_after_s: int) -> dict:
-    """超时换向指令（2026-09-19 用户方案；09-20 轴扩宽）：无引擎活动
-    （试验落账/评估派发/随机生成任一）超窗 → 注入 rotate 重置灵感。
+    """超时换向指令（2026-09-19 用户方案；09-20 轴扩宽；09-29 文本全幅）。
+    无引擎活动（试验落账/评估派发任一）超窗 → 注入 rotate 重置灵感。
     type 复用 rotate（注入器非可重推→同键去重静默），键编超时序号+era
     令牌（试验数:活动数——era 保证跨世代键唯一，sameKey 去重不误吞）。
-    误报无害化：评估或构造在途时模型回报进度并继续、不必换向。"""
+    误报无害化：评估或构造在途时模型回报进度并继续、不必换向。
+    2026-09-29 全幅文本（D2 拍板，守住 09-18"不引导"红线——只定义合规
+    响应，不指定方向）：句1 堵最小合规动作（纯 explore 批不算已换向，
+    幸存者须逐一 evaluate 落账）；句2 堵监控态（死线=最低工作期限非
+    终点线，引擎持续重推直到有评估落账——09-14 无自设停止点纪律的
+    指令面强化）。活动口径同日 D1=B：explore 撤出活动轴。"""
     mins = max(1, int(stuck_after_s // 60))
     return {
         "type": "rotate",
@@ -525,13 +554,17 @@ def _timeout_rotate_strategy(n: int, lane_trials: "int | str",
         "why": (f"距上次引擎活动已超 {mins} 分钟且无在途评估——"
                 f"超时换向重置灵感（第 {n} 次，无上限）"),
         "directive": (
-            f"距上次挖掘活动已超过 {mins} 分钟（期间无评估、无试验落账、"
-            "无随机生成）。若评估或构造正在进行，回报进度并继续即可；"
+            f"距上次挖掘活动已超过 {mins} 分钟（期间无评估派发、无试验"
+            "落账）。若评估或构造正在进行，回报进度并继续即可；"
             "否则立即换一个方向：先用 "
             "factor_query_paths 查已试路径避免重复，再从一个未覆盖的维度"
             "构造新假设并验证；一时没有新方向，就用 "
             "factor_random_generate(mode='explore') 生成随机因子找灵感，"
-            "幸存者逐个走标准管线（causality→evaluate→evaluate_batch）。"),
+            "幸存者逐个走标准管线（causality→evaluate→evaluate_batch）。"
+            "纯 explore 批不构成对换向的响应——幸存 top_k 须逐一走 "
+            "evaluate 落账后才算已换向。死线是最低工作期限，不是终点线；"
+            "转入监控/保持/等待状态属违规，引擎会持续每 "
+            f"{mins} 分钟重推直到有评估落账。"),
     }
 
 
@@ -542,31 +575,34 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
                    family_marginal: dict | None = None,
                    inspiration_reset: dict | None = None,
                    random_available: bool = True,
+                   mechanism_available: bool = True,
                    drained: bool = False,
                    milestone_fired: int | None = None,
                    compose_fired: int | None = None) -> dict | None:
     """下一轮方向类型选择（纯函数，供注入器与 loop 指令共用）。
 
-    停点分流（2026-08-25 arc 化 + 2026-08-26 v8 族收敛）：
-    - stop_kind ∈ {finalize, fail_streak} → None（真终态，注入器静默——
-      交还用户；convergence 已退役：全局/族内枯竭都只做换向信号）
+    停点分流（2026-08-25 arc 化；2026-10-02 永续化）：
+    - 永续不变量：本函数永不返回 None——finalize/fail_streak 静默终态
+      分支已删除（check_termination 永续化后不再产出这两类 kind；
+      test 一次性锁保留为工具级硬锁+状态页告警）
     - inspiration_reset（2026-09-01 灵感源规划书 WS-B/D1：agent 声明
-      [灵感重置:literature|random] 且配额已扣）→ 强制挂对应策略，
-      优先于 direction_budget 与 R1-R8——声明本身就是换源换向动作；
-      random 配额在声明受理时已查（D3），此处不再判 random_available
+      [灵感重置:literature|random|mechanism] 且配额已扣）→ 强制挂对应
+      策略，优先于 direction_budget 与 R1-R8——声明本身就是换源换向
+      动作；random/mechanism 配额在声明受理时已查（D3），此处不再判
+      random_available / mechanism_available
     - stop_kind == direction_budget（arc/簇上限/族内收敛）→ 强制
-      rotate/literature/random（双枯竭时经 _exhausted_source 轮转，
-      族边际 <-0.10 偏 literature），跳过 R3-R8——预算耗尽/族收敛的
-      方向不允许 continue/refine 原地续推；换向断链自动重置预算，
-      注入器照常推进
+      rotate/literature/random/mechanism（双枯竭时经 _exhausted_source
+      三源轮转），跳过 R3-R8——预算耗尽/族收敛的方向不允许
+      continue/refine 原地续推；换向断链自动重置预算，注入器照常推进
     - stop_kind == None（running）→ 常规优先级
 
     常规优先级（v6 2026-08-25：家族升级改边际收益驱动，删 streak 绝对阈值；
     2026-08-27 双轨化：R1/R2 与族收敛同口径——**两线都枯竭**才触发，单线
     枯竭只出 escalation（IC 平但尾部有苗头的方向不被强制换向））：
     R1 IC 与尾部线边际都严重枯竭（<-0.10）→ _exhausted_source
-       （D2 轮转：lit_search_count % 3 == 2 且 random 配额可用 → random，
-       否则 literature——文献连注两发仍未破局时给无先验探索一次机会）
+       （2026-09-22 三源确定性轮转：lit_search_count % 3——1 → random、
+       2 → mechanism、0 → literature；配额尽的轮转位回落 literature 并
+       如实说明）
     R2 IC 与尾部线边际都枯竭（<-0.05）→ rotate
     R3 streak≥3 且族内平台 plateau → refine（有最优载体+边际枯竭
        → 深挖载体特性补正强化）
@@ -585,9 +621,12 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
        同一库存只提示一次，库存量变化（新 pass 到库/入册消化）再提示）
     R8 兜底 → continue
     尾部线无数据（tail_marginal.enough_data=False）→ 回到 IC 单轨判定。
-    key：常规类型含 round/n_trials（单调保证新鲜）；query 用 accepted。"""
-    if stop_kind in ("finalize", "fail_streak"):
-        return None
+    key：常规类型含 round/n_trials（单调保证新鲜）；query 用 accepted。
+
+    永续（2026-10-02 总任务书 A.2/A.3）：停点分流分支 1（finalize/
+    fail_streak→None）已删除——check_termination 永续化后这两类 kind
+    不再产出，本函数永不返回 None（未知/遗留 kind 按常规优先级处理，
+    保险丝语义）。"""
     fam = family_marginal or {}
     fam_m = fam.get("marginal")
     fam_ok = fam.get("enough_data") and isinstance(fam_m, (int, float))
@@ -603,23 +642,34 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
         return (not tail_ok) or tail_m < level
 
     def _exhausted_source(lead: str, close: str) -> tuple[str, str]:
-        """双严重枯竭（-0.10 档）的换源选择（D2 轮转）：每第 3 次
-        （lit_search_count % 3 == 2）换 random——确定性轮转，无随机数，
-        与 _LITERATURE_SEEDS 同一可复现原则；random 配额尽（本方向段
-        已发射过）回落 literature 并如实说明。lead/close 拼接原文案；
-        random 分支不拼 close（换族语义由 direction_budget 后缀覆盖）。"""
+        """双严重枯竭（-0.10 档）的换源选择（2026-09-22 三源确定性轮转，
+        D2 拍板：literature → random → mechanism 循环）：按
+        lit_search_count % 3 轮转——0 → literature、1 → random、
+        2 → mechanism。确定性轮转，无随机数，与 _LITERATURE_SEEDS 同一
+        可复现原则；轮转位配额尽（本方向段已发射过）回落 literature 并
+        如实说明。lead/close 拼接原文案；random/mechanism 分支不拼 close
+        （换族语义由 direction_budget 后缀覆盖）。"""
         mtxt = (f"（IC {fam_m:+.3f}"
                 + (f"，尾部 {tail_m:+.3f}" if tail_ok else "，尾部线无数据")
                 + "）")
-        if lit_search_count % 3 == 2 and random_available:
+        slot = lit_search_count % 3
+        if slot == 1 and random_available:
             return ("random",
                     f"{lead}边际均严重枯竭{mtxt}——文献检索累计 "
                     f"{lit_search_count} 次，轮转到无先验探索"
                     "（随机因子空间不依赖假设源是否枯竭）")
-        if lit_search_count % 3 == 2:
+        if slot == 2 and mechanism_available:
+            return ("mechanism",
+                    f"{lead}边际均严重枯竭{mtxt}——文献检索累计 "
+                    f"{lit_search_count} 次，轮转到自提机制假设"
+                    "（你自己的经济学/金融数学假设，推导到本面板可验证构造）")
+        if slot != 0:
+            _miss = ("random 配额已用" if slot == 1
+                     else "mechanism 配额已用")
             return ("literature",
-                    f"{lead}边际均严重枯竭{mtxt}——本应轮转随机探索但本方向段 "
-                    "random 配额已用，仍走文献注入" + close)
+                    f"{lead}边际均严重枯竭{mtxt}——本应轮转"
+                    f"{'随机探索' if slot == 1 else '自提机制'}但本方向段 "
+                    f"{_miss}，仍走文献注入" + close)
         return ("literature",
                 f"{lead}边际均严重枯竭{mtxt}——内生假设源枯竭，必须文献注入"
                 + close)
@@ -634,6 +684,10 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
             t = "random"
             why = (f"灵感重置（agent 声明）：{_reason}"
                    "——当前方向整体作废，从随机因子探索重启")
+        elif inspiration_reset.get("mode") == "mechanism":
+            t = "mechanism"
+            why = (f"灵感重置（agent 声明）：{_reason}"
+                   "——当前方向整体作废，从你自提的机制假设重启")
         else:
             t = "literature"
             why = (f"灵感重置（agent 声明）：{_reason}"
@@ -706,12 +760,19 @@ def _pick_strategy(*, stop_kind: str | None = None, streak: int,
     if inspiration_reset is not None:
         # D4 冷启动语义（区别于普通 literature 注入）：方向整体作废，
         # pending 已作废不回显，papers 字段对 literature 必填
+        _mode_txt = {
+            "literature": ("新假设必须来自未被标 exhausted 的新论文，trail 的 "
+                           "papers 字段必填"),
+            "random": "幸存者走标准管线验证，试验将以 origin=random 入账",
+            "mechanism": ("新假设必须是你自提的机制假设（落假设前先查重——"
+                          "factor_journal_read + factor_query_paths；卡壳可抽"
+                          "概念刺激卡 factor_random_generate(mode='collision-card')），"
+                          "试验将以 origin=mechanism 入账"),
+        }[t]
         directive = (directive
                      + "（灵感重置已确认：当前方向整体作废，上一方向的 "
                        "next_hypothesis 不再回显——断链后方向段预算自动重置；"
-                       + ("新假设必须来自未被标 exhausted 的新论文，trail 的 "
-                          "papers 字段必填" if t == "literature" else
-                          "幸存者走标准管线验证，试验将以 origin=random 入账")
+                       + _mode_txt
                        + "；同族参数微调不算换源。）")
     if stop_kind == "direction_budget":
         directive = (directive
@@ -895,6 +956,19 @@ class Bridge:
         # 提交即登记（job.json 由 _async_submit 入队即落盘——R5 消灭提交/
         # 轮询竞态；此字典降级为内存快查）
         self._async_jobs: dict[str, str] = {}
+        # 作业归属线（2026-09-22 线级守卫）：超时换向的"评估在途豁免"按
+        # 线判——桥全局判据会让其它线的在途作业压制本线超时换向（两线
+        # 共享桥实测：一线作业期间另一线换向停发数小时直至重启）
+        self._async_job_lanes: dict[str, str] = {}
+        # 作业启动时刻（2026-09-29 D3 豁免限时）：_async_jobs 原本只在
+        # 作业线程 finally 清理，worker 子进程挂死 = 该线换向永久豁免
+        # （机制上无超时）。豁免只认启动 <async_exempt_max_s 的作业，
+        # 超龄作业由 _async_running_for_lane 收尸（标 failed 可重试）
+        self._async_job_t0: dict[str, float] = {}
+        # 本线最后一次 job_id 轮询时刻（2026-10-02 三原语 C3 欠账判据：
+        # 在途作业存在 ∧ 距上次轮询 >5min → 轮询欠账。进程内存态——重启
+        # 后未知，C3 以最旧在途作业启动时刻为参考，不误报）
+        self._lane_poll_ts: dict[str, float] = {}
         # 启动收尸（R6）：上一进程留下的 queued/running 作业标 failed
         self._reap_orphan_jobs()
         if Path(self.data_config_path).exists():
@@ -1017,25 +1091,42 @@ class Bridge:
         return ok
 
     def _inspiration_origin(self, source_hash: str | None, lane: str) -> str:
-        """WS-C 灵感源判定（2026-09-01 规划书）：证据强度排序——
+        """WS-C 灵感源判定（2026-09-01 规划书；2026-09-22 二代扩两值）：
+        证据强度排序——
 
         - random：source_hash 命中本线 explore 幸存者哈希台账（生成器
           返回的原文直进管线；agent 改造过的哈希不同，如实回落——
           改造即假设驱动）
+        - collision：本线最新叙事条目带 collision_card 字段且 card_id
+          在碰撞日志中（模型对刺激卡的连接构造——卡 id 由抽卡工具
+          落日志，模型无法凭空声明；哈希证据不可能有，与 literature
+          同为叙事自报+台账校验）
         - literature：本线最新叙事 trail 条目 papers 非空（写入口已
           校验合法 arxiv_id 列表——文献驱动假设的可审计标记；族内
           变体继承标记，直到新的无 papers 叙事条目出现）
+        - mechanism：本线灵感声明模式窗（bucket.inspiration_mode ==
+          "mechanism"，声明受理时写、arc 断链清空——窗口内试验按
+          机制策略归因；比 narrative 字段弱，排在其后）
         - hypothesis：缺省（含旧条目无键的回读口径）
         判定失败静默回落 hypothesis（标注不阻断账本）。"""
         try:
-            if source_hash:
+            bucket = {}
+            if source_hash or True:
                 bucket = ((read_mining_state(self.state_root).get("lanes") or {})
                           .get(lane) or {})
-                if source_hash in set(bucket.get("explore_hashes") or []):
-                    return "random"
+            if source_hash and source_hash in set(bucket.get("explore_hashes") or []):
+                return "random"
             own = own_entries(read_json_list("trail", self.state_root), lane)
-            if own and isinstance(own[-1], dict) and own[-1].get("papers"):
+            last = own[-1] if own and isinstance(own[-1], dict) else {}
+            cid = last.get("collision_card")
+            if isinstance(cid, str) and cid.strip():
+                from .collision import known_card_ids
+                if cid.strip() in known_card_ids(self.state_root):
+                    return "collision"
+            if last.get("papers"):
                 return "literature"
+            if bucket.get("inspiration_mode") == "mechanism":
+                return "mechanism"
         except Exception:
             pass
         return "hypothesis"
@@ -1077,6 +1168,9 @@ class Bridge:
             # 断链自然断——两个计数器在同一事件上重置，判定谓词同为
             # _entries_linked。
             chain_broke = False
+            # 1b 事件日志（2026-09-29 调度器任务书）：每条入账是否新试验
+            # 单元（dedup-miss）——expand 事件的 new_candidate 统计记账开关
+            new_flags: list[bool] = []
             for source_hash, stage, result, suspects in items:
                 sketch = None
                 horizon = None
@@ -1181,6 +1275,7 @@ class Bridge:
                     chain_broke = True
                 entries.append(entry)
                 new_entries.append(entry)
+                new_flags.append(not prior)
             # v3 单调包络盖章（σ 单位）：写盘时刻的 E[max|X|]（尾对齐 R +
             # 跨 horizon 先验）。CRN 采样器保证估计量天然单调，章防 rebuild
             # 重估噪声与跨版本回退。谱 n_eff_at_write 章保留为遥测。
@@ -1211,6 +1306,71 @@ class Bridge:
                     arc_rounds_bump(self.state_root, reset=True, lane=my_lane)
                 except Exception:
                     pass
+            # 分支级事件日志（调度器 1b，2026-09-29 任务书）：expand 事件
+            # 即刻落账——全项目唯一越拖越贵的票。纯增量（新文件+图节点），
+            # 零碰既有判定；失败可见不阻断（I5 关闭等价纪律同款）
+            try:
+                self._derivation_note_expands(entries, new_entries, new_flags)
+            except Exception as _de:
+                try:
+                    import sys as _ds
+                    _ds.stderr.write(
+                        f"[derivation] expand 事件落账失败(不阻断): {_de!r}\n")
+                except Exception:
+                    pass
+            # 证据侧账（2026-10-06 假阴性救助线任务 A.1）：每次评估的证据
+            # 原始值追加 evidence_ledger.jsonl——A4 累计回撤比是人审回扫的
+            # 定价证据，只落引擎侧旁路账本，不进 trail/不进响应（暴露=
+            # 激励适配，校准被侵蚀）。开关 MINING_CONFIG["evidence"]
+            # ["enabled"]（缺省开，关=旁路整段跳过=逐比特现状）；写失败仅
+            # stderr 可见不阻断评估；公式与 null 地形/回扫同源
+            # （factor.evidence 单一权威定义，禁止此处重写）。
+            try:
+                if (MINING_CONFIG.get("evidence") or {}).get("enabled", True):
+                    from .factor.evidence import (
+                        a4_dd_ratio, latest_fit_version, load_fit)
+                    _fitv = None
+                    try:
+                        _fitv = latest_fit_version(load_fit(self.state_root))
+                    except Exception:
+                        _fitv = None
+                    _lines = []
+                    for _e in new_entries:
+                        _sk = _e.get("ic_series_sketch")
+                        if not (isinstance(_sk, list) and len(_sk) >= 5):
+                            continue
+                        _a4 = a4_dd_ratio(_sk)
+                        if _a4 is None:
+                            continue
+                        _dsr = _e.get("dsr_stats") or {}
+                        _sr = _dsr.get("sr_hat")
+                        if not (isinstance(_sr, (int, float)) and math.isfinite(_sr)):
+                            _sr = _e.get("ic_ir")
+                        if not (isinstance(_sr, (int, float)) and math.isfinite(_sr)):
+                            continue
+                        _lines.append(json.dumps({
+                            "ts": _e.get("ts"), "hash": _e.get("source_hash"),
+                            "horizon": _e.get("horizon"),
+                            "sr_abs": round(abs(float(_sr)), 6),
+                            "origin": _e.get("origin"),
+                            "a4_dd_ratio": round(_a4, 6), "fit_v": _fitv,
+                        }, ensure_ascii=False))
+                    if _lines:
+                        _lp = Path(self.state_root) / "evidence_ledger.jsonl"
+                        # 跨进程写锁（review 修复 2026-10-06）：双宿主可对同一
+                        # root 并发跑桥，裸 append 会交错撕行——与 registered_ledger
+                        # 同协议（filelock 进程内可重入，嵌套安全）
+                        with state_write_lock(self.state_root):
+                            with open(_lp, "a", encoding="utf-8") as _f:
+                                for _ln in _lines:
+                                    _f.write(_ln + "\n")
+            except Exception as _ee:
+                try:
+                    import sys as _es
+                    _es.stderr.write(
+                        f"[evidence_ledger] 追加失败(不阻断): {_ee!r}\n")
+                except Exception:
+                    pass
         except Exception as e:
             # trail 是「不可瞒报」防线——写入失败必须可见（stderr 进 client 的 64KB 环形缓冲）
             try:
@@ -1218,6 +1378,155 @@ class Bridge:
                 _sys.stderr.write(f"[trail_engine] 写入失败: {type(e).__name__}: {e}\n")
             except Exception:
                 pass
+
+    def _derivation_note_expands(self, entries: list, new_entries: list,
+                                 new_flags: list[bool]) -> None:
+        """试验入账 → 派生图节点 + expand 事件（调度器 1b，2026-09-29）。
+
+        边来源三纪律（任务书 1a）：
+        - origin=random → farm_seed 根（农场种子）
+        - 调度器 pick 点名命中（pick 目标与本条目 _entries_linked 或同
+          hash）→ order 挂边（op=deepen_variant）并消费 pick 记账键
+        - 否则最近同族前驱（_entries_linked 双信号）→ declared
+        - 再否则诚实根 root_unlinked
+
+        expand 快照自带 dsr 四元组 + per-horizon 池参数 + p_def/t_def +
+        墙单位增益 gain + a_parent——r̂（F7 冻结 null）、周对账（F6 同池态
+        差分）、重放（F10）自足于事件流。零计入活动数（红线 5）。"""
+        from . import derivation as _dv
+        from . import scheduler as _scheduler
+        my_lane = current_lane()
+        env_id = next(iter(self.envs), None) if getattr(self, "envs", None) \
+            else None
+        try:
+            st = _scheduler.read_scheduler_state(self.state_root)
+            pending = [p for p in (st.get("pending_picks") or [])
+                       if isinstance(p, dict) and p.get("hash")]
+        except Exception:
+            pending = []
+        pick_target_entries = {}
+        for p in reversed(pending):
+            th = p.get("hash")
+            if th and th not in pick_target_entries:
+                pick_target_entries[th] = next(
+                    (e for e in reversed(entries)
+                     if isinstance(e, dict) and e.get("source_hash") == th),
+                    None)
+        a_map = _scheduler.latest_a_by_hash(self.state_root)
+        pool_cache: dict = {}
+        n_units = len({(e.get("source_hash"), e.get("horizon"))
+                       for e in entries if isinstance(e, dict)
+                       and e.get("source_hash")}) or 1
+        for entry, is_new in zip(new_entries, new_flags):
+            h = entry.get("source_hash")
+            if not isinstance(h, str) or not h:
+                continue
+            origin = entry.get("origin")
+            # ---- 边来源推断 ----
+            parent = op = None
+            edge_source = "root_unlinked"
+            consumed_key = None
+            if origin == "random":
+                edge_source = "farm_seed"
+            else:
+                # 点名命中优先（调度器 pick：执行灰度 4a 的消费面）
+                for th, te in pick_target_entries.items():
+                    if te is not None and _entries_linked(te, entry):
+                        parent, op, edge_source = th, "deepen_variant", "order"
+                        consumed_key = _scheduler.consume_pick(
+                            self.state_root, h, th)
+                        break
+                if parent is None:
+                    ts_now = entry.get("ts") or ""
+                    for prev in reversed(entries):
+                        if not isinstance(prev, dict):
+                            continue
+                        if prev.get("source_hash") == h:
+                            continue
+                        # 只认更早（或同秒批内先处理——entries 顺序即处理
+                        # 顺序，锁内串行确定）：>= 会把同批同秒的合法
+                        # 前驱全部跳过（批内变体挂不上族）
+                        if (prev.get("ts") or "") > ts_now:
+                            continue
+                        if _entries_linked(prev, entry):
+                            parent = prev.get("source_hash")
+                            op = "variant"
+                            edge_source = "declared"
+                            break
+            # ---- 评估时点快照（现价口径：per-horizon 池参数 + bar 包络）----
+            dsr_raw = entry.get("dsr_stats") or {}
+            hor = entry.get("horizon")
+            snap = {"dsr": {k: dsr_raw.get(v) for k, v in
+                            (("sr", "sr_hat"), ("skew", "skew"),
+                             ("kurt", "kurt"), ("n", "n_obs"))},
+                    "family": None, "a_parent": a_map.get(parent)}
+            try:
+                if env_id is not None and hor not in pool_cache:
+                    pool_cache[hor] = self._resolve_pool_std(env_id, None, hor)[0]
+            except Exception:
+                pool_cache.setdefault(hor, None)
+            pool_std = pool_cache.get(hor)
+            bar_sigma = entry.get("bar_sigma_at_write")
+            dsr = snap["dsr"]
+            t_def = p_def = gain = None
+            near_miss = False
+            if pool_std and isinstance(bar_sigma, (int, float)) \
+                    and dsr.get("sr") is not None:
+                p_def = _dsr_p_from_stats(dsr.get("sr"), dsr.get("skew"),
+                                          dsr.get("kurt"), dsr.get("n"),
+                                          float(bar_sigma), pool_std)
+                t_def = _dsr_t_from_stats(dsr.get("sr"), dsr.get("skew"),
+                                          dsr.get("kurt"), dsr.get("n"),
+                                          float(bar_sigma), pool_std)
+                if isinstance(p_def, (int, float)):
+                    near_miss = 0.05 < p_def <= 0.30
+                snap.update({"pool_std": pool_std,
+                             "bar_sigma": float(bar_sigma),
+                             "n_trials": n_units, "p_def": p_def,
+                             "t_def": None if t_def is None else round(t_def, 4),
+                             "near_miss_flag": near_miss})
+            # 墙单位增益（F7）：父态在子代池态下重算——同池态差分
+            if t_def is not None and parent:
+                prev_snap = _scheduler._latest_snapshot(
+                    _dv.load_events(self.state_root), parent)
+                pd_sr = (prev_snap or {}).get("dsr") or {}
+                if pd_sr.get("sr") is not None:
+                    t_par = _dsr_t_from_stats(
+                        pd_sr.get("sr"), pd_sr.get("skew"),
+                        pd_sr.get("kurt"), pd_sr.get("n"),
+                        float(bar_sigma), pool_std)
+                    gain = _scheduler.success_gain(t_def, t_par, n_units)
+                if gain is None:
+                    # 父无事件快照（1b 上线前的存量节点）——用图外 trail 兜底
+                    pe = next((e for e in reversed(entries)
+                               if isinstance(e, dict)
+                               and e.get("source_hash") == parent
+                               and (e.get("dsr_stats") or {}).get("sr_hat")
+                               is not None), None)
+                    if pe is not None:
+                        d2 = pe["dsr_stats"]
+                        t_par = _dsr_t_from_stats(d2.get("sr_hat"),
+                                                  d2.get("skew"),
+                                                  d2.get("kurt"),
+                                                  d2.get("n_obs"),
+                                                  float(bar_sigma), pool_std)
+                        gain = _scheduler.success_gain(t_def, t_par, n_units)
+            if gain is not None:
+                snap["gain"] = round(float(gain), 4)
+            if consumed_key is not None:
+                snap["via_pick"] = consumed_key.get("key")
+            fam = _scheduler._family_of(_dv.load_events(self.state_root),
+                                        parent) if parent else None
+            snap["family"] = fam or parent
+            _dv.note_node(self.state_root, h, parent, op, edge_source,
+                          ts=entry.get("ts"), lane=my_lane,
+                          origin=origin, status="frontier")
+            _dv.note_expand(self.state_root, h, parent, op, edge_source,
+                            compute={"cpu_s": entry.get("cpu_s"), "slots": 1},
+                            new_candidate=bool(is_new), lane=my_lane,
+                            origin=origin, ts=entry.get("ts"),
+                            horizon=hor, stage=entry.get("stage"),
+                            extra=snap)
 
     def _wrap_diagnosis(self, env_id: str, source: str, stage: str,
                         result: Any) -> Any:
@@ -2122,7 +2431,7 @@ class Bridge:
                         f"worker 超时（墙钟 {timeout_s:.0f}s，实际仅获得 "
                         f"{verdict['cpu_s']:.1f}s CPU，占比 {verdict['ratio']:.0%}）——"
                         "机器超订（并行会话/其他进程挤占 CPU）所致，不是 factor 实现慢。"
-                        "本次调用零写入（registry/trail 均未动，不烧名）。"
+                        "本次调用零写入（registry/trail 均未动，名字与试验计数都不消耗）。"
                         "修法：直接重试同一因子即可（未计入账本）；若反复出现，"
                         "降低并行（设 DSH_FACTOR_JOBS，多会话加总 ≤ 核数）。"
                         "这是基础设施事件——不修实现、不换假设，也不作为对因子的判定。")
@@ -2150,7 +2459,7 @@ class Bridge:
                     -32005,
                     f"worker 超时（>{timeout_s:.0f}s）——{method} 的 worker 子进程已终止"
                     "并清理；bridge 本体未受影响，无需等待恢复，可立即重试。本次调用"
-                    f"零写入（registry/trail 均未动，不烧名）。{cause}"
+                    f"零写入（registry/trail 均未动，名字与试验计数都不消耗）。{cause}"
                     "这是基础设施事件，不是对因子/研究方向的判定"
                     f"——修实现，不换假设。{cpu_note}")
 
@@ -2182,7 +2491,7 @@ class Bridge:
                 raise BridgeError(
                     -32005,
                     f"worker 无结果输出(rc={proc.returncode}): {tail}{hint}{limit_note}"
-                    "｜bridge 本体未受影响，本次调用零写入（不烧名），可立即重试")
+                    "｜bridge 本体未受影响，本次调用零写入（名字与试验计数都不消耗），可立即重试")
             result = json.loads(out_path.read_text(encoding="utf-8"))
             if not result.get("ok"):
                 err = result.get("error") or {}
@@ -2338,7 +2647,7 @@ class Bridge:
         瞬时 smoke 子进程数——burst 下不超出权重核算的进程超订；等待上限
         120s，超时抛 infra 错（调用侧 fail-open 放行）。"""
         if not self._smoke_spawn_sem.acquire(timeout=120.0):
-            raise BridgeError(-32005, "烟测并发位繁忙（等 120s 未获得）——本次跳过烟测")
+            raise BridgeError(-32005, "冒烟预检并发位繁忙（等 120s 未获得）——本次跳过冒烟预检")
         try:
             return self._run_worker("factor.smoke", source, sp, env,
                                     timeout_s=timeout_s)
@@ -2736,6 +3045,8 @@ class Bridge:
             if start_now:
                 self._async_weight_active += weight
                 self._async_jobs[run_id] = "submitted"
+                self._async_job_lanes[run_id] = run_meta.get("lane") or DEFAULT_LANE
+                self._async_job_t0[run_id] = time.time()
                 # 公平游标（层 3）：直接启动的作业同样推进 lane_last——
                 # 否则首个 pump 会按 FIFO 取同线作业，公平性失效
                 self._async_lane_last = run_meta.get("lane")
@@ -2743,6 +3054,8 @@ class Bridge:
             else:
                 self._async_queue.append(item)
                 self._async_jobs[run_id] = "queued"
+                self._async_job_lanes[run_id] = run_meta.get("lane") or DEFAULT_LANE
+                self._async_job_t0[run_id] = time.time()
                 position = len(self._async_queue)
         # 锁外写盘（提交即落盘，R5——首次轮询必有 job.json；pid 供 R6 收尸）
         try:
@@ -2804,6 +3117,8 @@ class Bridge:
     def _rollback_started_item(self, item: dict, why: str) -> None:
         with self._async_lock:
             self._async_jobs.pop(item["run_id"], None)
+            self._async_job_lanes.pop(item["run_id"], None)
+            self._async_job_t0.pop(item["run_id"], None)
             self._async_weight_active = max(
                 0, self._async_weight_active - item["weight"])
         self._dedup_release(item["run_id"])
@@ -2844,6 +3159,10 @@ class Bridge:
                 self._async_weight_active += pick["weight"]
                 self._async_lane_last = (pick["run_meta"] or {}).get("lane")
                 self._async_jobs[pick["run_id"]] = "submitted"
+                self._async_job_lanes[pick["run_id"]] = (
+                    (pick["run_meta"] or {}).get("lane") or DEFAULT_LANE)
+                # 豁免限时（D3）钟取实际启动时刻：排队等待不吃豁免窗
+                self._async_job_t0[pick["run_id"]] = time.time()
                 starts.append(pick)
         for it in starts:
             self._async_start(it)
@@ -2889,6 +3208,8 @@ class Bridge:
             self._mark_run_failed(run_id, f"{type(e).__name__}: {e}")
         finally:
             self._async_jobs.pop(run_id, None)
+            self._async_job_lanes.pop(run_id, None)
+            self._async_job_t0.pop(run_id, None)
             self._dedup_release(run_id)
             with self._async_lock:
                 self._async_weight_active = max(
@@ -2946,6 +3267,12 @@ class Bridge:
                 f"未知 job_id: {job_id}——status 的 workerRuns 列最近 run"
                 f"（有界保留 {self._MAX_KEPT_RUNS} 个，过期作业只能重跑）")
         d, j = found
+        # C3 轮询时钟（2026-10-02 三原语）：任何 job_id 轮询都刷新本线
+        # last_poll——欠账判据只看「在途 ∧ 没轮询」，不看轮询结果
+        try:
+            self._lane_poll_ts[normalize_lane(j.get("lane"))] = time.time()
+        except Exception:
+            pass
         status = j.get("status")
         if status in ("queued", "submitted"):
             pos = None
@@ -3947,6 +4274,16 @@ class Bridge:
             if isinstance(p, (int, float)) and 0.05 < p <= 0.30:
                 rows.append((float(p), e))
         rows.sort(key=lambda r: r[0])
+        # 排序先行实验（2026-09-29 任务书 4 期前置门槛）：开关开启时深化
+        # 队列排序从「p 升序」换「按调度器影子分 A 降序」——零机制改动
+        # 的纯内容实验，测模型跟随率；无 score 的节点保持 p 序在后（打分
+        # 器没覆盖的不换序，诚实不虚挂）。默认关闭 = 现状逐比特一致
+        try:
+            from . import scheduler as _scheduler
+            if _scheduler.rank_by_a_enabled(self.state_root):
+                rows = _scheduler.resort_by_a(self.state_root, rows)
+        except Exception:
+            pass
         # ---- 深化战役(用户 2026-09-15 拍板:浅挖近失逐颗深挖,穷尽由引擎
         # 机械判定——变体 ≥ 预算,模型无权宣布穷尽)----
         # 状态文件 stateRoot/deepen_campaign.json:
@@ -4357,10 +4694,12 @@ class Bridge:
         _smp = self._luck
         if stratum == "mechanism":
             # 批次1(方案B):机制层子集 = 台账注册 hash 的试验(影子口径,
-            # 正式翻转前不进门)。子集走独立 CRN 采样器,不扰动全局状态
-            _reg = self._registered_hashes()
-            entries = [e for e in entries
-                       if isinstance(e, dict) and e.get("source_hash") in _reg]
+            # 正式翻转前不进门)。子集走独立 CRN 采样器,不扰动全局状态。
+            # 2026-10-06 P1：改经 evidence.mechanism_trials——台账独有 hash
+            # 补无 sketch 合成独立单例，state.reset 删 trail 后层 bar 只升
+            # 不降（防塌缩；保守=独立=最贵假设）
+            from .factor.evidence import mechanism_trials
+            entries = mechanism_trials(self.state_root, entries)
             _smp = self._luck_mech
         stats = self._n_eff_from_entries(entries, source_hash, horizon,
                                          cross_h_prior=prior, main_horizon=main_h,
@@ -4601,6 +4940,57 @@ class Bridge:
                       f"{recent_best:.3f} 未超前窗口最佳 {prev_best:.3f} "
                       f"达 {delta}）"), diag
 
+    def _async_running_for_lane(self, lane: str) -> bool:
+        """本线是否仍有在途异步作业（2026-09-22 线级守卫；09-29 D3 限时）。
+
+        超时换向的误报豁免（"评估在途不判超时"）只应覆盖本线自己的
+        在途作业——旧桥全局判据下，其它线的长评估会压制本线换向（两线
+        共享桥实测：一线作业期间另一线超时换向停发数小时直至重启）。
+        读侧持同一把 _async_lock 防迭代竞态。
+
+        2026-09-29 D3（送达通道加固批次 2a）：豁免限时——_async_jobs
+        原本只在作业线程 finally 清理，worker 子进程挂死 = 该线换向
+        永久豁免（机制上无超时）。现豁免只认启动 <async_exempt_max_s
+        的作业；超龄作业就地收尸：摘在途登记 + 释放 dedup（重试不再
+        并入死作业）+ _mark_run_failed 墓志（轮询者看到 failed 可重试，
+        零入账）。线程若真完成，finally 的 pop 均带默认值——幂等兼容。
+        收尸后的磁盘 I/O 在锁外做（_dedup_release/_mark_run_failed
+        各自持锁/扫目录，锁内调用会自锁死）。"""
+        cfg_max = float(MINING_CONFIG.get("async_exempt_max_s", 2700))
+        stale: list[str] = []
+        fresh = False
+        try:
+            with self._async_lock:
+                for rid, jlane in list(self._async_job_lanes.items()):
+                    if jlane != lane:
+                        continue
+                    t0 = self._async_job_t0.get(rid)
+                    if t0 is not None and (time.time() - float(t0)) > cfg_max:
+                        stale.append(rid)
+                    else:
+                        fresh = True
+                for rid in stale:
+                    self._async_jobs.pop(rid, None)
+                    self._async_job_lanes.pop(rid, None)
+                    self._async_job_t0.pop(rid, None)
+        except Exception:
+            return bool(getattr(self, "_async_jobs", None))
+        for rid in stale:
+            self._dedup_release(rid)
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[async_reap] {rid} 超龄（>{int(cfg_max // 60)}min）"
+                    "——豁免摘除，标 failed 可重试\n")
+            except Exception:
+                pass
+            self._mark_run_failed(
+                rid,
+                f"作业超龄（启动后 >{int(cfg_max // 60)}min 未完成）——判定"
+                "挂死收尸，零入账，可原样重试",
+                code=-32005)
+        return fresh
+
     def _loop_directive(self) -> dict:
         """停走指令：引擎对 agent 的唯一停走真相源（注入关键工具响应）。
 
@@ -4651,19 +5041,38 @@ class Bridge:
         # finalize/fail_streak（全局枯竭不再自动判定）
         fam_conv = self._family_convergence(engine_own, mining)
         # stop_kind：None=running；direction_budget=换向可解除（注入器
-        # 推进，含族收敛）；finalize/fail_streak=静默终态（注入器让位用户）
+        # 推进，含族收敛）。永续（2026-10-02 总任务书 A.3）：finalize/
+        # fail_streak 停点已删——check_termination 任何输入下只可能产出
+        # direction_budget；未知 kind 一律按 direction_budget 处理（保险
+        # 丝，值域钉死后理论不可达）。loop.state 值域钉死 {running,
+        # must_rotate}，may_stop 退役
         stop_kind = None
         stop_reason = None
         if term.get("stop"):
-            stop_kind = term.get("kind") or "direction_budget"
+            stop_kind = "direction_budget"
             stop_reason = term["reason"]
         elif fam_conv[0]:
             stop_kind = "direction_budget"
             stop_reason = fam_conv[1] + "——必须换向（断链后判定自动重置）"
-        may_stop = stop_kind in ("finalize", "fail_streak")
-        state = ("running" if stop_kind is None
-                 else "must_rotate" if stop_kind == "direction_budget"
-                 else "may_stop")
+        state = "running" if stop_kind is None else "must_rotate"
+        # test 已烧告警（A.3.1：test 一次性锁保留为工具级硬锁——test 区
+        # 评估拒绝、任何 reset 不可重置；状态页如实告警，不再作 loop 停点）。
+        # 只认 consumed=True：test 的 claim→finalize 窗口内锁文件已在但
+        # 尚未消费，不算已烧（review 修复——防窗口期误亮）
+        test_burned = None
+        _tl_path = Path(self.state_root) / "test_lock.json"
+        _tl_burned = False
+        if _tl_path.exists():
+            try:
+                _tl_burned = bool(json.loads(
+                    _tl_path.read_text(encoding="utf-8")).get("consumed"))
+            except Exception:
+                _tl_burned = True  # 锁文件不可读按已烧保守处理
+        if _tl_burned or mining.get("finalized"):
+            test_burned = ("test 已烧（一次性锁仍在工具级生效）——本数据"
+                           "环境的信息增量已基本挖尽，建议数据集轮换（用户"
+                           "操作）。在此之前 development/selection 区照常"
+                           "可用，引擎照常推进")
         # 上一轮自己声明的下一步（引擎原样回显——执行或证伪，不得静默放弃）；
         # 停笔宣言不接受回显，降级为 pending_rejected 并点名拒收。
         # 灵感重置声明（2026-09-01 WS-B/D1）判定序最先：合法声明走配额
@@ -4769,9 +5178,9 @@ class Bridge:
                     "策略不强制")
         obligation = None
         if state == "running":
-            obligation = ("继续内循环——禁止停下来等用户指示。停点仅由引擎机械"
-                          "判据触发（方向段轮次/当前簇试验上限、IC_IR 改善收敛、"
-                          "finalize），穷尽宣告一律拒收")
+            obligation = ("继续内循环——禁止停下来等用户指示。停点仅由引擎"
+                          "机械判据触发（方向段轮次/当前簇试验上限——触发"
+                          "的是换向不是停笔），穷尽宣告一律拒收")
             if pending_rejected is not None:
                 obligation += (f"。上一轮 next_hypothesis 是停笔宣言（「"
                                f"{pending_rejected['text'][:80]}」——"
@@ -4795,10 +5204,6 @@ class Bridge:
                                    "（旧 live 自动快照入 raw/，终条目自动归档）")
             except Exception:
                 pass
-        else:
-            obligation = ((stop_reason or "停点触发")
-                          + "。此停点换方向无法解除，注入器已静默——数据集轮换"
-                            "是用户操作，向用户上报当前进展即可，不要停下来空等")
         if inspiration_reset is not None:
             obligation += ("。灵感重置已确认——按策略指令换源重启，上一方向的"
                            " pending 已作废，不得回旧假设族续推")
@@ -4826,27 +5231,63 @@ class Bridge:
         except Exception:
             accepted_n = 0
         lit_search_count = int(self._read_papers().get("searches", 0) or 0)
-        # random 配额快照读（WS-A/D3）：声明强制路径不查（受理时已查），
-        # 只供 R1 轮转决策；发射记账在策略挂出后（random_emit_count）
+        # random/mechanism 配额快照读（WS-A/D3 + 2026-09-22 二代 WS-2A）：
+        # 声明强制路径不查（受理时已查），只供三源轮转决策；发射记账在
+        # 策略挂出后（random_emit_count / mechanism_emit_count）
         rnd_used = lane_random_used(mining, lane)
         rnd_quota = int(mining.get("random_strategy_quota",
                                    MINING_CONFIG["random_strategy_quota"]))
+        mech_used = lane_mechanism_used(mining, lane)
+        mech_quota = int(mining.get("mechanism_strategy_quota",
+                                    MINING_CONFIG["mechanism_strategy_quota"]))
         # ---- 推进治理总闸（2026-09-19）：drain 判据 + 增长检测 ----
         # deepen 遥测提前算（drain 判据读队列；loop 响应复用同值）
         deepen_tel = self._deepen_telemetry(engine_trail)
         _dnote = str(deepen_tel.get("note") or "")
+        # 调度器影子 tick（2026-09-29 任务书 3a/4a）：enabled=False 零行为；
+        # 节流 600s；打分与日志零计入活动数/试验数（红线 5——打分不是
+        # 挖掘活动）；任何失败吃掉（I5 关闭等价）
+        sched_tel = None
+        try:
+            from . import scheduler as _scheduler
+            sched_tel = _scheduler.maybe_tick(self, engine_trail, deepen_tel)
+        except Exception:
+            sched_tel = None
+        # 特质奖励自动轮钩子（2026-10-06 PLAN-trait-reward-auto P3）：rescue_auto
+        # .maybe_round 节流自查（enabled=false 直接 None=逐比特现状，红线 15）；
+        # 结果不进 loop payload（红线 14：判据与放行对模型不可见）；静默
+        # （stdout 已在 quiet 路径重定向 stderr，RPC 通道不受污染）；失败吃掉
+        try:
+            from . import rescue_ops as _rescue_ops
+            _rescue_ops.maybe_round(self)
+        except Exception:
+            pass
         drained = (pending is None and pending_rejected is None
                    and inspiration_reset is None
                    and not (deepen_tel.get("queue") or [])
                    and "不可算" not in _dnote
                    and max(pass_n - accepted_n, 0) < 3)
+        # 4a drain 收编：执行灰度开启（enabled 且 exec_share>0）且调度器
+        # frontier 非空（含未消费 picks）→ 不算 drained——算力落点由调度器
+        # 点名，drain 阶梯让位。exec_share=0 时本块零作用（逐比特回退）
+        if drained:
+            try:
+                from . import scheduler as _scheduler
+                _sc = _scheduler.scheduler_config(mining)
+                if (_sc.get("enabled")
+                        and float(_sc.get("exec_share") or 0) > 0
+                        and _scheduler.has_active_frontier(self.state_root)):
+                    drained = False
+            except Exception:
+                pass
         bk = lane_drive_bk(mining, lane)
         _now = time.time()
         # 增长 = 本线引擎试验数前进 或 引擎可见活动前进（09-20 复轴）。
         # 09-19 复犯修正杀叙事喂钟用的轴是"只认试验入账"——但入账在
         # 重税墙下稀缺（个股线 5h 一笔），合法打磨期每 10min 被注 rotate
         # 且全被吸收（规格本义"没有触发挖掘"：评估派发就是挖掘在触发）。
-        # 活动轴只收引擎可见的机械事件（cache-miss 评估派发/随机生成），
+        # 活动轴只收引擎可见的机械事件（cache-miss 评估派发；09-29 D1=B
+        # 起随机生成不再计入——纯 explore 心跳不是挖掘活动），
         # 叙事碰不到——反叙事性质不变。
         _act_n = lane_activity(mining, lane)
         _growth = (n_trials_lane != bk.get("growth_trials")
@@ -4871,13 +5312,23 @@ class Bridge:
             family_marginal=fam_marg,
             inspiration_reset=inspiration_reset,
             random_available=rnd_used < rnd_quota,
+            mechanism_available=mech_used < mech_quota,
             drained=drained, milestone_fired=bk.get("milestone"),
             compose_fired=(int(bk["compose_fired"])
                            if isinstance(bk.get("compose_fired"), int)
                            else None))
+        # exec 接管期旧阶梯只作对账对照，不消费配额（防双计——exec 侧经
+        # primitives._after_emit 键幂等消费；governor 活跃时 exec 让位但
+        # drain/rotate 不吃这四类边沿，门控安全）
+        try:
+            from .primitives import primitives_config as _pcfg
+            _prim_exec = bool(_pcfg(mining).get("exec"))
+        except Exception:
+            _prim_exec = False
         # 里程碑消费（边沿触发）：query 挂出即记账（幂等；崩溃最坏丢一条
         # 里程碑不重发——不会回到电平触发）
-        if strategy is not None and strategy.get("type") == "query":
+        if (strategy is not None and strategy.get("type") == "query"
+                and not _prim_exec):
             try:
                 lane_drive_bk_update(self.state_root, lane,
                                      milestone=accepted_n)
@@ -4887,7 +5338,8 @@ class Bridge:
         # compose 消费（2026-09-20 边沿触发，同里程碑模式）：挂出即按当前
         # 库存量记账——同一库存不重发；新 pass 到库/入册消化（库存量变化）
         # 再发一次
-        if strategy is not None and strategy.get("type") == "compose":
+        if (strategy is not None and strategy.get("type") == "compose"
+                and not _prim_exec):
             try:
                 lane_drive_bk_update(
                     self.state_root, lane,
@@ -4895,10 +5347,19 @@ class Bridge:
                 bk["compose_fired"] = max(pass_n - accepted_n, 0)
             except Exception:
                 pass
-        if strategy is not None and strategy.get("type") == "random":
+        if (strategy is not None and strategy.get("type") == "random"
+                and not _prim_exec):
             try:
                 random_emit_count(self.state_root, lane, agent_rounds)
                 rnd_used = lane_random_used(
+                    read_mining_state(self.state_root), lane)
+            except Exception:
+                pass
+        if (strategy is not None and strategy.get("type") == "mechanism"
+                and not _prim_exec):
+            try:
+                mechanism_emit_count(self.state_root, lane, agent_rounds)
+                mech_used = lane_mechanism_used(
                     read_mining_state(self.state_root), lane)
             except Exception:
                 pass
@@ -4912,7 +5373,7 @@ class Bridge:
             # 推送的换向指令静默吞掉
             g = _govern_decide(
                 bk, now=_now, growth=_growth,
-                async_running=bool(getattr(self, "_async_jobs", None)),
+                async_running=self._async_running_for_lane(lane),
                 chosen_type=strategy.get("type"),
                 lane_trials=f"{n_trials_lane}:{_act_n}")
             act = g.get("action")
@@ -4941,6 +5402,60 @@ class Bridge:
                             last_ts=_now)
                     except Exception:
                         pass
+        # ---- 三原语影子 tick（2026-10-02 总任务书任务 A）：读侧记账 +
+        #      三段式状态页（账目/地图/指令坐标）。exec=false（默认）时
+        #      指令仍由上方旧阶梯产出（逐比特现状）；exec=true 时三原语
+        #      接管 strategy（迁移映射 A.2），消费记账同旧阶梯纪律。
+        #      任何失败吃掉（挂点零影响）----
+        prim_tel = None
+        try:
+            from . import primitives as _primitives
+            _jobs = [(rid, self._async_job_t0.get(rid))
+                     for rid, jl in (getattr(self, "_async_job_lanes", None)
+                                     or {}).items()
+                     if jl == lane and rid in (getattr(self, "_async_jobs",
+                                                       None) or {})]
+            prim_tel = _primitives.shadow_tick(self, {
+                "lane": lane, "state_root": self.state_root, "now": _now,
+                "pending": pending, "pending_rejected": pending_rejected,
+                "engine_trail": engine_trail, "engine_own": engine_own,
+                "agent_trail": agent_trail,
+                "growth_ts": (bk.get("growth_ts")
+                              if isinstance(bk.get("growth_ts"),
+                                            (int, float)) else None),
+                "running_jobs": _jobs,
+                "last_poll_ts": (getattr(self, "_lane_poll_ts", None)
+                                 or {}).get(lane),
+                "fam_marg": fam_marg, "plateau": plateau,
+                "deepen_tel": deepen_tel, "strategy": strategy,
+                "agent_rounds": agent_rounds, "n_trials": n_trials,
+                "n_trials_lane": n_trials_lane, "streak": streak, "arc": arc,
+                "max_rounds": int(effective.get(
+                    "max_rounds", MINING_CONFIG["max_rounds"])),
+                "max_cluster_trials": int(effective.get(
+                    "max_cluster_trials", MINING_CONFIG["max_cluster_trials"])),
+                "lit_search_count": lit_search_count,
+                "accepted_n": accepted_n, "milestone_fired": bk.get("milestone"),
+                "random_available": rnd_used < rnd_quota,
+                "mechanism_available": mech_used < mech_quota,
+                "inspiration_reset": inspiration_reset,
+            })
+        except Exception:
+            prim_tel = None
+        if prim_tel is not None:
+            _exec_strategy = prim_tel.pop("exec_strategy", None)
+            if _exec_strategy is not None:
+                if not str(g.get("action", "")).startswith("rotate"):
+                    strategy = _exec_strategy
+                else:
+                    # review 修复 1：超时换向（rotate_emit/rotate_hold）是
+                    # 卡死场景的唯一安全网——exec 的 C 欠账覆盖不了「无
+                    # pending 的停摆」，且 expand/E4 静态键会被注入器
+                    # sameKey 去重冻结，此时 exec 让位治理产出。drain 不让
+                    # （迁移映射 8.5：exec 期供数统一走 E4 三源轮转）。
+                    # 边沿消费（milestone/random/mechanism/R2）在 primitives
+                    # 侧键幂等完成（_after_emit），此处零记账。
+                    prim_tel["policy"] = "exec-yielded-to-governor"
         # WS-B 回执（agent 可见配额，与 pending_rejected 同一可见性原则）：
         # 受理回合用台账返回值（快照 mining 未含本次扣额），无声明时用快照
         _bucket = (mining.get("lanes") or {}).get(lane) or {}
@@ -4950,6 +5465,29 @@ class Bridge:
             _q_left = ir_quota["quota_left"]
         else:
             _q_left = max(0, _i_quota - int(_bucket.get("inspiration_used", 0) or 0))
+        # 导航层素材接驱动文本通道（C1/C2/C3，2026-10-14 任务书）：名词性
+        # 素材追加进策略指令——注入器以用户消息注入 directive 正文，素材随
+        # 之进入生成上下文。预算上限配置化；渲染器自带小数红线自检（宁缺
+        # 素材不漏分数）。短 TTL 缓存保证跨线实时性（一线填箱、他线可见）。
+        if strategy is not None:
+            try:
+                from . import navigation as _nav
+                if mining.get("navigation_materials",
+                              MINING_CONFIG.get("navigation_materials",
+                                                True)):
+                    _nb = _nav.navigation_material_block(
+                        self.state_root,
+                        int(mining.get(
+                            "navigation_budget_chars",
+                            MINING_CONFIG.get("navigation_budget_chars",
+                                              1200))),
+                        cfg={**MINING_CONFIG, **mining},
+                        engine_trail=engine_trail)
+                    if _nb:
+                        strategy["directive"] = (
+                            str(strategy.get("directive") or "") + "\n\n" + _nb)
+            except Exception:
+                pass
         loop = {
             "state": state,
             "stop_kind": stop_kind,
@@ -4984,9 +5522,10 @@ class Bridge:
                     "stuck_after_s": int(MINING_CONFIG.get("stuck_after_s", 1800)),
                     "drain_max": int(MINING_CONFIG.get("drain_max_emissions", 3)),
                 },
-                "policy": ("超时换向制：无引擎活动（试验落账/评估派发/随机"
-                           "生成）超窗 → 注入 rotate 重置灵感（无上限无终态，"
-                           "死线前永不静默；叙事不算活动）"),
+                "policy": ("超时换向制：无引擎活动（试验落账/评估派发）"
+                           "超窗 → 注入 rotate 重置灵感（无上限无终态，"
+                           "死线前永不静默；叙事/纯 explore 不算活动——"
+                           "explore 幸存者 evaluate 落账才重新计时）"),
             },
             "pending_hypothesis": pending,
             "pending_rejected": pending_rejected,
@@ -4995,9 +5534,12 @@ class Bridge:
                 "mode": (inspiration_reset or {}).get("mode"),
                 "quota_left": _q_left,
                 "random_available": rnd_used < rnd_quota,
-                "syntax": ("声明 = next_hypothesis 以 [灵感重置:literature] 或 "
-                           "[灵感重置:random] 开头 + 一句理由（声明即切；每方向段 "
-                           "≤2 次，random ≤1 次；断链换向自动重置配额）"),
+                "mechanism_available": mech_used < mech_quota,
+                "syntax": ("声明 = next_hypothesis 以 [灵感重置:literature] / "
+                           "[灵感重置:random] / [灵感重置:mechanism] 开头 + 一句"
+                           "理由（声明即切；每方向段声明 ≤2 次，random ≤1 次、"
+                           "mechanism ≤1 次——三模式共享声明配额；断链换向自动"
+                           "重置配额）"),
             },
             "obligation": obligation,
             "escalation": escalation,
@@ -5020,6 +5562,24 @@ class Bridge:
                 f"（其它线 {foreign} 条）。n_trials 与 tail bar 按全局计价"
                 "——其它线的试验照常抬高本线门槛（多重检验全量计数）；"
                 "pending/族链/方向预算只统计本线")
+        # 调度器遥测与选点（2026-09-29 任务书 3a/4a）：scheduler 块 = 影子
+        # 打分遥测（不执行）；scheduler_picks = 执行灰度的点名行——只含
+        # 事实（hash/操作类型/预算/消费记账键），不含方向论证（红线 2）。
+        # 点名通道 = loop 内容层（五处工具响应注入）+ runner 消费 loop
+        # 重写 ENGINE_ORDERS——投放层（drive.ts）零接触（红线 1）
+        if sched_tel is not None:
+            loop["scheduler"] = sched_tel
+            if sched_tel.get("picks"):
+                loop["scheduler_picks"] = sched_tel["picks"]
+        # 三原语状态页（2026-10-02 任务 A.4：账目/地图/指令坐标三段式图
+        # 投影；影子期 policy=shadow——指令仍由旧阶梯产出，新旧对照见
+        # primitives_shadow.jsonl）
+        if prim_tel is not None:
+            loop["primitives"] = prim_tel
+        # test 已烧告警（永续验收 A.3.1：工具级硬锁保留，状态页如实告警
+        # 「建议数据集轮换」，不再是 loop 停点）
+        if test_burned is not None:
+            loop["test_burned"] = test_burned
         # W3（2026-08-26 规划书）：最近 30 分钟 infra 失败（-32005）≥1 → 附加
         # 纠偏引导——超时后 agent 的下一个成功调用（status/evaluate/
         # trail_summary）即收到。纯附加遥测：不影响上面任何停走判定，
@@ -5035,7 +5595,7 @@ class Bridge:
                          "在途作业（去重），不会重复计算。严禁杀 bridge/python 进程"
                          "「解卡」——bridge 单线程忙是设计内行为，busy≠stuck；"
                          "杀掉后所有会话的 factor_* 全部挂起直至重启宿主"
-                         "（2026-08-31 实证）。等待或轮询，永远不动进程。"),
+                         "（已实测发生）。等待或轮询，永远不动进程。"),
             }
         return loop
 
@@ -5559,7 +6119,7 @@ class Bridge:
 
     # ---- 随机种子生成器（用户决策 2026-08-17：随机校准替代固定面板）----
     def _factor_random_generate(self, params):
-        """随机因子生成。mode: explore（生成+轻量IC+top_k 源码）| null-calibration（null 地形）。
+        """随机因子生成。mode: explore（生成+轻量IC+top_k 源码）| null-calibration（null 地形）| collision-card（概念刺激卡，2026-09-22 灵感源二代）。
 
         2026-08-18 生产审计修正（seed 重放）：explore 显式 seed 与 null 校准
         seed 相同时，前 n 棵树与 null 校准完全重放（信息量为零，但 duplicate
@@ -5572,6 +6132,18 @@ class Bridge:
         mode = params.get("mode", "explore")
         n = int(params.get("n", 50))
         opset = random_gen.effective_operator_set(self.state_root)
+
+        if mode == "collision-card":
+            # 灵感源二代 WS-2C：随机概念刺激卡（内容盲抽样，遥测非指令）。
+            # 不烧评估算力、不进任何管线——卡只喂推导层，连接/变形/弃权
+            # 归模型（弃权免费）。与 explore/null-calibration 同一 mode
+            # 分发先例，TS 侧仅 schema 枚举扩展。
+            from . import collision
+            seed = params.get("seed")
+            return collision.draw_card(
+                self.state_root,
+                seed=int(seed) if isinstance(seed, (int, float)) and not isinstance(seed, bool) else None,
+                k=max(1, min(int(params.get("k", 2) or 2), 3)))
 
         if mode == "null-calibration":
             env_id = params.get("envId", "primary")
@@ -5618,11 +6190,11 @@ class Bridge:
             seed_note = (f"seed_used={seed}（运行时自动派生，与 null 校准 seed={null_seed} "
                          "不冲突；复现本批结果时用该 seed）")
         rng = np.random.default_rng(seed)
-        # 引擎可见活动记账（09-20 增长轴）：explore 派发 = 真实挖掘活动
-        try:
-            lane_activity_tick(self.state_root, current_lane())
-        except Exception:
-            pass
+        # 活动轴不记 explore（2026-09-29 D1=B）：纯 explore 心跳是模型
+        # 绕过超时窗的豁免通道（不烧评估算力，实测"governor satisfied"
+        # 干等一夜）；幸存者逐一 evaluate 落账时才由评估派发重新计时。
+        # explore 幸存者哈希仍按线入台账（下方 lane_explore_hashes_extend
+        # ——origin=random 判据照常工作）。
         # spread 分位参照（WS-C 2026-08-27）：landscape 指纹匹配时取主
         # horizon 的 spread 段——light_ic_scan 里做查表插值（spread_pct）；
         # 无 landscape / 指纹不匹配 → None（spread_pct 缺省，不炸）
@@ -5838,6 +6410,11 @@ class Bridge:
         env_id = params.get("envId", "primary")
         status = self._landscape_fingerprint_status(landscape, env_id)
         out = {"calibrated": True, "fingerprint_match": status, **landscape}
+        # 红线 2（2026-10-06 假阴性救助线）：证据分位段（a4_dd/famsize）
+        # 是人审回扫卡片的校准基线，进模型面=暴露定价证据→激励适配。
+        # 只留在盘上文件供 rescue_ops 只读消费，响应面剥离。
+        for _k in ("a4_dd", "famsize"):
+            out.pop(_k, None)
         if status != "match":
             reason = ("旧版地形无指纹字段" if status == "legacy_no_field"
                       else "地形指纹与当前环境不匹配（数据/口径/引擎已变更）")
@@ -5855,8 +6432,10 @@ class Bridge:
 
     def _paths_query(self, params):
         layer = params.get("layer")
+        if layer == "trail_similarity":
+            return self._trail_similarity_query(params)
         if layer not in ("explored", "search_paths"):
-            raise BridgeError(-32602, "layer 必须是 explored 或 search_paths")
+            raise BridgeError(-32602, "layer 必须是 explored、search_paths 或 trail_similarity")
         entries = read_json_list(layer, self.state_root)
         result: dict[str, Any] = {"layer": layer}
         # explored_preset（开源用户预置的已证伪历史）：只读合并，标注来源。
@@ -5876,6 +6455,47 @@ class Bridge:
                                           f"{type(e).__name__}: {e}")[:200]
         result["hits"] = query_entries(entries, params.get("query", ""), int(params.get("top_k", 5)))
         return result
+
+    #: 相似度预检返回线（低于此 = 构造噪声，不上榜；族归属线 0.25 之下
+    #: 留一档可见带，让"接近但未入族"的邻居也可读）
+    _TRAIL_SIM_FLOOR = 0.15
+
+    def _trail_similarity_query(self, params) -> dict[str, Any]:
+        """表达式结构相似预检（2026-09-22 灵感源二代 WS-2B，只读）。
+
+        对 trail_engine 全部已测构造（MinHash 构造指纹）算相似，top-K
+        返回命中先例的硬事实（hash/verdict/IC）。**查重不查新**：工具
+        只报相似度事实，不做新颖性价值判断，不写任何状态、不拒任何
+        东西——是否推进归模型，机械闸（novelty gate/source_hash 去重/
+        正交门）照常在提交侧兜底（纵深防御各层只做本层的事）。烧试验
+        前的便宜预检：把复读消灭在评估之前。"""
+        source = params.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise BridgeError(-32602, "trail_similarity 需要 source 参数（候选因子源码）")
+        fp = _construction_fingerprint(source)
+        top_k = max(1, min(int(params.get("top_k", 5) or 5), 20))
+        hits = []
+        for ph, (pfp, pe) in self._novelty_index().items():
+            s = _fingerprint_similarity(fp, pfp)
+            if s < self._TRAIL_SIM_FLOOR:
+                continue
+            hits.append({"sim": round(s, 3), "source_hash": ph,
+                         "envId": pe.get("envId"), "ts": pe.get("ts"),
+                         "stage": pe.get("stage"), "ic_ir": pe.get("ic_ir"),
+                         "verdict": pe.get("verdict"),
+                         "origin": pe.get("origin")})
+        hits.sort(key=lambda h: -h["sim"])
+        best = hits[0]["sim"] if hits else 0.0
+        return {
+            "layer": "trail_similarity",
+            "scanned": True,
+            "best_sim": best,
+            "hits": hits[:top_k],
+            "note": ("查重不查新：本工具只报构造相似度事实（MinHash，≥0.25 "
+                     "视为同族先例），不判断该不该做。推进与否由你决定；"
+                     "本工具不写任何状态，提交侧的 novelty gate/source 去重/"
+                     "正交门照常兜底。"),
+        }
 
     # 记录层 schema（老 harness 纪律的代码化：证伪三条件 / trail 五要素）
     _RECORD_SCHEMAS = {
@@ -6054,22 +6674,77 @@ class Bridge:
         # 历史。投影每条 ≈150B，并前移到 loop 之后（即使未来再被截，最近
         # 历史最先存活）。
         def _trail_entry_compact(e) -> dict:
+            """名词化投影（注入面分数审计修复，2026-10-14 任务书 A3）：
+            只保留身份/出身/红旗名——IC_IR/verdict/spread/placebo 等评估
+            数字不再进历史滚动视图（评估分数滚动是模仿锚定的实测主因）。
+            本因子当次评估的完整数字仍在 evaluate 响应（直接反馈不裁）。"""
             if not isinstance(e, dict):
                 return {"ts": None, "source_hash": None}
-            tail = e.get("tail") if isinstance(e.get("tail"), dict) else {}
-            topn = tail.get("topn") if isinstance(tail.get("topn"), dict) else {}
             return {
                 "ts": e.get("ts"),
                 "source_hash": str(e.get("source_hash") or "")[:12],
                 "horizon": e.get("horizon"),
                 "stage": e.get("stage"),
                 "origin": e.get("origin"),
-                "ic_ir": e.get("ic_ir"),
-                "verdict": e.get("verdict"),
                 "red_flags": list(e.get("red_flags") or [])[:2],
-                "tail": {"spread_ir": tail.get("spread_ir"),
-                         "placebo_z": topn.get("placebo_z")},
             }
+
+        # B2 不相似示例选择（2026-10-14 任务书）：历史示例取材先剔除与本
+        # 线最近 K 次提交构造块重合度最高的前 prune 比例（防同族克隆墙滚
+        # 动喂给模型当模仿锚）。最新 1 条始终保留（当前状态可见性）。
+        shown_own = engine_own[-5:]
+        try:
+            from . import navigation as _nav
+            if mining.get("dissimilar_example_filter",
+                          MINING_CONFIG.get("dissimilar_example_filter",
+                                            True)):
+                _k = int(mining.get(
+                    "dissimilar_k", MINING_CONFIG.get("dissimilar_k", 10)))
+                _prune = float(mining.get(
+                    "dissimilar_prune",
+                    MINING_CONFIG.get("dissimilar_prune", 0.5)))
+                _cands = []
+                for e in reversed(engine_own[-(5 + _k):]):   # 新 → 旧
+                    _src = None
+                    try:
+                        _sp = factor_source_path(
+                            str(e.get("source_hash") or ""), self.state_root)
+                        if _sp.exists():
+                            _src = _sp.read_text(encoding="utf-8")
+                    except Exception:
+                        _src = None
+                    if isinstance(e, dict) and _src is not None:
+                        _cands.append({"entry": e, "source": _src})
+                if _cands:
+                    _recent = [c["source"] for c in _cands[:_k]]
+                    _kept = _nav.dissimilar_filter(_cands, _recent,
+                                                   k=_k, prune=_prune)
+                    _latest = _cands[0]["entry"]
+                    _sel_new2old = [_latest] + [
+                        c["entry"] for c in _kept
+                        if c["entry"] is not _latest][:4]
+                    shown_own = list(reversed(_sel_new2old))   # 旧 → 新
+        except Exception:
+            shown_own = engine_own[-5:]
+
+        # 导航层素材（C1/C2/C3 名词性材料——覆盖地图/采尽档位/构造禁忌）：
+        # 开场与查询通道。会话开场按纪律先读 trail_summary——素材随之装载；
+        # 驱动文本通道在 _loop_directive 侧另行接线（同一渲染器同一 TTL 缓存
+        # ——一线填箱后他线下次注入即见）。
+        nav_block = ""
+        try:
+            from . import navigation as _nav
+            if mining.get("navigation_materials",
+                          MINING_CONFIG.get("navigation_materials", True)):
+                nav_block = _nav.navigation_material_block(
+                    self.state_root,
+                    int(mining.get(
+                        "navigation_budget_chars",
+                        MINING_CONFIG.get("navigation_budget_chars", 1200))),
+                    cfg={**MINING_CONFIG, **mining},
+                    engine_trail=engine_trail)
+        except Exception:
+            nav_block = ""
 
         return {
             "generated_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -6078,12 +6753,11 @@ class Bridge:
             # 自主性停走指令（2026-08-21）：恢复会话/定方向前先看这里——
             # loop.state=running 必须继续内循环，不得停下来问用户
             "loop": self._loop_directive(),
-            "last_engine_trail": [_trail_entry_compact(e) for e in engine_own[-5:]],
+            "last_engine_trail": [_trail_entry_compact(e) for e in shown_own],
             "evaluations": {"total": len(engine_trail),
                             "lane": len(engine_own),
                             "foreign": len(engine_trail) - len(engine_own),
-                            "unique_sources": len({e.get("source_hash") for e in engine_trail}),
-                            "verdict_counts": verdicts},
+                            "unique_sources": len({e.get("source_hash") for e in engine_trail})},
             # 源码外挂库（2026-08-29）：source_hash 即键，按
             # sources/<hash[:2]>/<hash>.py 取全文
             "source_store": factor_source_stats(self.state_root),
@@ -6092,11 +6766,12 @@ class Bridge:
             "red_flagged": red_flagged[-10:],
             "pool": self._pool().stats(),
             "note": ("引擎层 trail 为 evaluate 自动记录（硬事实，不可瞒报）；"
-                     "last_engine_trail 为紧凑投影（每条 ≈150B，防呈现层截断）"
-                     "且只列本线最近 5 条（evaluations.lane/foreign 为分线计数，"
-                     "verdict_counts 仍全局）；完整条目人读 stateRoot/trail_engine.json；"
+                     "last_engine_trail 为名词化投影（身份+红旗名，评估数字"
+                     "不进历史滚动视图——当次评估的完整数字在 evaluate 响应）"
+                     "且只列本线最近 5 条（evaluations.lane/foreign 为分线计数）；"
+                     "verdict 明细人读 stateRoot/trail_engine.json；"
                      "agent 层叙事见 factor_query_paths(layer='trail' 不支持时读文件)"),
-        }
+        } | ({"navigation": nav_block} if nav_block else {})
 
     def _state_mining_get(self, params):
         return read_mining_state(self.state_root)
@@ -6373,6 +7048,35 @@ class Bridge:
                 "必须来自同一份 source 的 factor_evaluate。原样复制 evaluate "
                 "时传入的 source 字符串（字节级一致，含空格/换行/注释）"
                 "重新提交，不要重新输入或微调")
+        # ---- B1 提交顺序门（预注册先于评估 + 推导链词法对账）----
+        # 此点之前零写入——enforce 档违规 = 事务性拒绝（不落盘、不占名）。
+        # shadow 只记账；自动切档规则在 ordergate 内（切档事件落
+        # gate_audit.jsonl）。门基础设施失败不阻塞提交（与正交门降级
+        # 哲学一致：不冤枉、可追溯）。
+        gate_result = None
+        _gate_hash = str(source_hash or _diag_hash or "")
+        if _gate_hash:
+            try:
+                from . import ordergate as _og
+                from .journal import _lane_dir as _jl_dir
+                from .journal import resolve_journal_lane as _rjl
+                gate_result = _og.evaluate_and_record(
+                    self.state_root, str(params.get("source") or ""),
+                    _gate_hash, _jl_dir(self.state_root, _rjl()))
+                if (gate_result.get("mode") == "enforce"
+                        and gate_result.get("violation")):
+                    raise BridgeError(
+                        -32602, _og.rejection_message(gate_result["violation"]))
+            except BridgeError:
+                raise
+            except Exception as _ge:
+                gate_result = None
+                try:
+                    import sys as _gs
+                    _gs.stderr.write(
+                        f"[ordergate] 基础设施失败（不拒绝不烧名）: {_ge!r}\n")
+                except Exception:
+                    pass
         existing = read_registry(self.state_root)
         if source_hash:
             # hash 撞铁律 + 程序性治愈（2026-08-26）：同 hash 异名的旧条目
@@ -6794,10 +7498,56 @@ class Bridge:
                          ("z", "draws", "null_mean", "null_std",
                           "periods", "truncated")})
         from .factor.tailgate import tail_admission, tail_ledger
+        # 尾部墙 v2（2026-10-07，PLAN-tail-wall-v2-and-rescan）：E[max]
+        # 项从族计数换成名单重叠相关矩阵 + 单侧 CRN。开关 mining_state.
+        # tail_wall_v2（默认缺省=off，现行 v1 行为逐比特不变）；on 时
+        # v1/v2 双报进 tail_track.diag（wall_v2 与 bar["wall"]），两口径
+        # |Δbar|>0.05 出运维漂移警告（估计器回归监测，P5 防复发③）。
+        _v2_wall = None
+        try:
+            if bool(read_mining_state(self.state_root).get("tail_wall_v2")):
+                from .factor.tailwall import tail_wall_v2_bar
+                _led_v2 = tail_ledger(engine_trail)
+                _sigs_v2 = [r.get("selection_mh") for r in _led_v2]
+                if _sigs_v2 and all(s is not None for s in _sigs_v2):
+                    _cs_v2 = [r.get("k_frac") for r in _led_v2]
+                    _s0_v2 = _s0_emp
+                    if not (isinstance(_s0_v2, (int, float))
+                            and float(_s0_v2) > 0):
+                        # 解析兜底与 v1 同式：1/√采样期中位数
+                        _nps = sorted(r.get("n_periods") for r in _led_v2
+                                      if isinstance(r.get("n_periods"), (int, float)))
+                        _s0_v2 = (1.0 / np.sqrt(_nps[len(_nps) // 2])
+                                  if _nps else None)
+                    _v2_wall = (tail_wall_v2_bar(_sigs_v2, _cs_v2, s0=_s0_v2)
+                                if _s0_v2 else {"ok": False,
+                                                "reason": "s0 不可得"})
+        except Exception as e:
+            import sys as _sys
+            _sys.stderr.write(f"[tail_wall_v2] 计算失败（回退 v1）: "
+                              f"{type(e).__name__}: {e}\n")
+            _v2_wall = None
         tail_decision = tail_admission(
             tail_block, tail_ledger(engine_trail), _z_spread, s0_emp=_s0_emp,
             placebo_z_gate=_placebo_gate_z, placebo_m=_placebo_gate_m,
-            net_basis=_net_basis)
+            net_basis=_net_basis, v2_wall=_v2_wall)
+        try:
+            if (_v2_wall is not None and _v2_wall.get("ok")
+                    and isinstance(tail_decision.get("diag"), dict)):
+                from .factor.tailwall import check_sentinels as _tw_chk
+                _warn = _tw_chk(self.state_root, _v2_wall)
+                _bar_d = tail_decision["diag"].get("bar") or {}
+                _b_act, _b2 = _bar_d.get("bar"), _v2_wall.get("bar")
+                if (not (isinstance(_b_act, (int, float))
+                         and isinstance(_b2, (int, float))
+                         and abs(_b_act - _b2) <= 0.05)):
+                    _warn.append(f"接线哨兵：生效门值 {_b_act} ≠ v2 计算 {_b2}")
+                if _warn:
+                    import sys as _sys
+                    _sys.stderr.write("[tail_wall_v2] 哨兵告警："
+                                      + "；".join(_warn) + "\n")
+        except Exception:
+            pass
         # 尾块反查失败的可行动信息（2026-08-26 rank_persistence_w30 事故：
         # agent 提交的 source 与评估时字节不一致 → hash 漂移 → trail 查无
         # 此 hash → 「tail 块缺失」烧名。原始 reason 不含 hash 与修法指引，
@@ -6948,6 +7698,15 @@ class Bridge:
             "flatness": flatness_report,
             "admit_basis": admit_basis,
             "tail_track": tail_track,
+            # 准入时权威快照（2026-10-07 尾部墙 v2 P5④快照不可变）：准入
+            # 时刻的 G3 判定参数深拷贝固化。registry 条目的 diagnosis 会被
+            # 后续动作刷新，此字段只写一次、任何更新路径不得覆盖——存量
+            # 回扫（tail_rescan_v2）与事后审计以它为准，杜绝"入册时值丢失"。
+            **({"admitted_tail_diag": json.loads(json.dumps(
+                tail_track.get("diag")))
+                if (admit_basis == "tail"
+                    and isinstance(tail_track, dict)
+                    and isinstance(tail_track.get("diag"), dict)) else {}}),
             # 双轨完整标注（2026-08-25）：tracks = 两轨各自判定，
             # dual_pass = 双过（IC 强 + top-N 变现都过门——audit 实证
             # 仅 ~4/19，有区分度的信号质量维度）
@@ -7053,6 +7812,31 @@ class Bridge:
                 tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=1),
                                encoding="utf-8")
                 os.replace(str(tmp), str(ledger_path))
+            # 分支级事件日志（调度器 1b）：terminal 事件 = registry 判定。
+            # accepted → 图终态 admitted；rejected 不是图终态（拒绝非终点
+            # ——变体通道敞开，状态保持 frontier）。失败可见不阻断。
+            try:
+                from . import derivation as _dv
+                from . import scheduler as _scheduler
+                _dv.note_terminal(
+                    self.state_root, source_hash,
+                    verdict=("admitted" if accepted else "rejected"),
+                    t_def=_dsr_t_from_stats(
+                        (diagnosis.get("deflated_train") or {}).get("sr_hat"),
+                        (diagnosis.get("deflated_train") or {}).get("skew"),
+                        (diagnosis.get("deflated_train") or {}).get("kurt"),
+                        (diagnosis.get("deflated_train") or {}).get("n_obs"),
+                        dp_ledger.get("bar_sigma"), dp_ledger.get("pool_std")),
+                    p_def=dp_ledger.get("p"), lane=current_lane())
+                if accepted:
+                    _dv.update_status(self.state_root, source_hash, "admitted")
+            except Exception as _te:
+                try:
+                    import sys as _tsx
+                    _tsx.stderr.write(
+                        f"[derivation] terminal 事件落账失败(不阻断): {_te!r}\n")
+                except Exception:
+                    pass
         except Exception as e:
             try:
                 import sys as _ls
@@ -7073,6 +7857,10 @@ class Bridge:
                   "tail_track": tail_track,
                   "tracks": {"ic": ic_verdict, "tail": tail_verdict},
                   "dual_pass": dual_pass}
+        if gate_result is not None:
+            # B1 遥测：shadow 违规对模型可见（教学窗口——切 enforce 前
+            # 模型有机会适应预注册纪律）；enforce 档违规不会到达这里
+            result["submission_order_gate"] = gate_result
         if loop is not None:
             result["loop"] = loop
         if next_moves is not None:

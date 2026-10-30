@@ -65,6 +65,10 @@ MINING_CONFIG = {
     # 键覆盖（与 max_rounds 同一覆盖口径）
     "inspiration_quota": 2,      # 每方向段灵感重置声明上限（第 3 次起拒收）
     "random_strategy_quota": 1,  # 每方向段 random 策略发射上限（声明+R1 轮转共用）
+    # 机制策略发射上限（2026-09-22 灵感源二代 PLAN-inspiration-mechanism）：
+    # 与 random_strategy_quota 同构——声明与 D2 三源轮转共用；机制假设内容
+    # 零校验（零脚手架），引擎只管记账与轮转时机
+    "mechanism_strategy_quota": 1,
     # 正交门（2026-09-06）：提交时对候选与在册账本做值相关检查（dev 区
     # 平均秩相关）。动机：2026-09-05 全量正交审计实证——量价相关域与历史
     # IDO 系同源（|ρ|≈0.70，符号构造性相反）、tail vol_of_vol 八连注册
@@ -85,9 +89,57 @@ MINING_CONFIG = {
     # ①拒收词族扩充否决（治标不治本，模型会造新词绕过）②随机因子是
     # "无路可走"的标准出口——写入指令文本③数据新鲜度出插件范围④注入
     # 去引擎标识、改用户口吻（TS 侧）⑤判窗 30min → 10min。
-    "stuck_after_s": 600,           # 无引擎活动判窗（试验/评估/生成任一刷新；兼超时换向重发间隔：每 10min 一注）
+    # 2026-09-29 D1=B：随机生成撤出活动轴（纯 explore 心跳是绕过超时窗
+    # 的豁免通道）——判窗只认试验落账/评估派发。
+    "stuck_after_s": 600,           # 无引擎活动判窗（试验落账/评估派发任一刷新；兼超时换向重发间隔：每 10min 一注）
     "drain_repush_spacing_s": 600,  # drain（库存清空供数指令）重发间隔
     "drain_max_emissions": 3,       # drain 发射预算，耗尽后由超时换向接管
+    # 2026-09-29 D3（送达通道加固批次 2a）：async 豁免限时——超时换向的
+    # "评估在途"豁免只认启动后此时长（45min）内的作业；worker 子进程
+    # 挂死不再造成该线换向永久豁免（超龄作业收尸标 failed，agent 可重试）
+    "async_exempt_max_s": 2700,
+    # 研究预算调度器（2026-09-29 任务书 PLAN-scheduler-task-brief）：
+    # 影子开关独立于执行开关；exec_share=0 = 逐比特回退（默认）。
+    # 全部子键见 scheduler.SCHEDULER_DEFAULTS；mining_state 同名键可覆盖。
+    # 红线：权重只由人改并与 fn_version 绑定，禁止在线调权。
+    "scheduler": {
+        "enabled": False,
+        "exec_share": 0.0,
+    },
+    # ---- 推导优先 + 导航层（2026-10-14 任务书 PLAN-derivation-first）----
+    # C 系名词性素材（覆盖地图/采尽档位/构造禁忌）三通道直开（低风险
+    # 纯名词素材，配对照遥测）；预算与阈值全部可被 mining_state 覆盖。
+    "navigation_materials": True,        # 素材总开关（驱动文本/开场查询/灵感卡）
+    "navigation_budget_chars": 1200,     # 驱动文本+开场查询通道预算（≈600 token）
+    "navigation_cache_ttl_s": 120,       # 素材重算 TTL（跨线填箱可见窗）
+    "navigation_card_budget_chars": 320, # 灵感卡负约束素材预算
+    "taboo_min_support": 12,             # C3 禁忌模式最小支持度（试验数）
+    "taboo_top_k": 8,
+    "exhaustion_th_int": 0.6,            # C2 箱内冗余采尽阈（对齐族链 0.6）
+    "exhaustion_th_int_marginal": 0.4,   # 箱内冗余边际衰减阈
+    "exhaustion_th_ext": 0.5,            # 与池外重叠采尽阈
+    "exhaustion_min_density": 10,        # 采尽判的最低箱密度
+    "exhaustion_recency_days": 14,       # 密度达标且久无新试验 → 边际衰减
+    # B2 不相似示例选择（trail_summary 历史示例取材过滤）
+    "dissimilar_example_filter": True,
+    "dissimilar_k": 10,                  # 对照的最近提交窗口
+    "dissimilar_prune": 0.5,             # 剔除重合度最高的比例
+    # B1 提交顺序门初始档（运行态+计数器在 mining_state
+    # submission_order_gate_state；切档按任务书 §三 内嵌自动规则自动执行
+    # 并落 gate_audit.jsonl，无需人工拍板）
+    "submission_order_gate": "shadow",
+    "gate_min_window_n": 200,            # 切 enforce 观察窗：≥N 次提交
+    "gate_min_window_s": 2419200,        #   或满 4 周（先到为准）
+    "gate_rate_window": 50,              # 违规率窗口（最近 N 次提交）
+    "gate_rate_max": 0.10,               # 违规率 ≤10% 才切
+    "gate_giveup_n": 500,                # 维持 shadow 诊断线：≥N 次
+    "gate_giveup_s": 4838400,            #   或满 8 周仍 >10%
+    # D1 发散相多底并行（降级形态=跨 lane 模型混布；默认关，开启三前提
+    # 与对照判据见 divergence.py，启停事件落 gate_audit.jsonl）
+    "multi_model_divergence": False,
+    "d1_overlap_max": 0.3,               # 候选偏好重叠阈（top-5 族 Jaccard）
+    "d1_contrast_weeks": 4,              # 对照期（或每臂 ≥300 次提交）
+    "d1_contrast_min_subs": 300,
 }
 
 
@@ -284,6 +336,8 @@ def arc_rounds_bump(root: str | os.PathLike | None = None,
         if reset:
             bucket["inspiration_used"] = 0
             bucket["random_used"] = 0
+            bucket["mechanism_used"] = 0
+            bucket.pop("inspiration_mode", None)   # origin 模式窗随段终止
         _atomic_write_json(_path("mining_state", root), st)
     return int(bucket["arc_rounds"])
 
@@ -337,37 +391,54 @@ def inspiration_declare(root: str | os.PathLike | None = None,
     受理轮，同轮重放直接沿用判定。被拒的声明不记 decl_round（下轮重判
     同因，确定性一致）。mode=random 时叠加检查 random 配额（声明与 R1
     轮转共用）——受理不等于发射，random_used 在发射时刻计（见
-    random_emit_count）。"""
+    random_emit_count）。mode=mechanism 同构检查 mechanism 配额
+    （2026-09-22 灵感源二代；三模式共享 inspiration_quota——D1 拍板：
+    机制是出口不是特权，各源自配额=三连刷通道）。"""
     with state_write_lock(resolve_state_root(root)):
         st, bucket = _lane_bucket_mut(root, lane)
         quota = int(st.get("inspiration_quota",
                            MINING_CONFIG["inspiration_quota"]))
         rquota = int(st.get("random_strategy_quota",
                             MINING_CONFIG["random_strategy_quota"]))
+        mquota = int(st.get("mechanism_strategy_quota",
+                            MINING_CONFIG["mechanism_strategy_quota"]))
         used = int(bucket.get("inspiration_used", 0) or 0)
         rnd = int(bucket.get("random_used", 0) or 0)
+        mech = int(bucket.get("mechanism_used", 0) or 0)
         if bucket.get("inspiration_decl_round") == round_id:
             return {"accepted": True, "inspiration_used": used,
-                    "quota_left": max(0, quota - used), "random_used": rnd}
+                    "quota_left": max(0, quota - used), "random_used": rnd,
+                    "mechanism_used": mech}
         if used >= quota:
             return {"accepted": False,
                     "reason": (f"灵感重置声明超限（本方向段 {used}/{quota} 已用；"
                                "断链换向后配额自动重置）——本条按停笔宣言处理，"
                                "给出可执行的新假设"),
                     "inspiration_used": used, "quota_left": 0,
-                    "random_used": rnd}
+                    "random_used": rnd, "mechanism_used": mech}
         if mode == "random" and rnd >= rquota:
             return {"accepted": False,
                     "reason": (f"random 策略本方向段已用 {rnd}/{rquota}（声明与"
                                "引擎轮转共用配额）——改声明 [灵感重置:literature] "
                                "或先完成本次换向（断链后配额重置）"),
                     "inspiration_used": used,
-                    "quota_left": max(0, quota - used), "random_used": rnd}
+                    "quota_left": max(0, quota - used), "random_used": rnd,
+                    "mechanism_used": mech}
+        if mode == "mechanism" and mech >= mquota:
+            return {"accepted": False,
+                    "reason": (f"mechanism 策略本方向段已用 {mech}/{mquota}（声明与"
+                               "引擎轮转共用配额）——改声明 [灵感重置:literature] / "
+                               "[灵感重置:random] 或先完成本次换向（断链后配额重置）"),
+                    "inspiration_used": used,
+                    "quota_left": max(0, quota - used), "random_used": rnd,
+                    "mechanism_used": mech}
         bucket["inspiration_used"] = used + 1
         bucket["inspiration_decl_round"] = round_id
+        bucket["inspiration_mode"] = mode   # origin 模式窗（段内直至断链）
         _atomic_write_json(_path("mining_state", root), st)
         return {"accepted": True, "inspiration_used": used + 1,
-                "quota_left": max(0, quota - used - 1), "random_used": rnd}
+                "quota_left": max(0, quota - used - 1), "random_used": rnd,
+                "mechanism_used": mech}
 
 
 def random_emit_count(root: str | os.PathLike | None = None,
@@ -391,6 +462,36 @@ def lane_random_used(st: dict[str, Any], lane: str | None = None) -> int:
     """读本线 random 已发射次数（决策侧配额检查；快照读，锁外安全）。"""
     bucket = (st.get("lanes") or {}).get(lane or DEFAULT_LANE) or {}
     return int(bucket.get("random_used", 0) or 0)
+
+
+def mechanism_emit_count(root: str | os.PathLike | None = None,
+                         lane: str | None = None, round_id: int = -1) -> None:
+    """mechanism 策略发射计数（2026-09-22 灵感源二代 WS-2A）：声明强制与
+    D2 三源轮转共用，配额检查在决策侧（读 mechanism_used），本函数只在
+    策略真正挂出时记账。round_id 去重同 random_emit_count。全局
+    st["mechanism_runs"] 是纯遥测（origin=mechanism 通路总量）。"""
+    with state_write_lock(resolve_state_root(root)):
+        st, bucket = _lane_bucket_mut(root, lane)
+        if bucket.get("mechanism_emit_round") == round_id:
+            return
+        bucket["mechanism_used"] = int(bucket.get("mechanism_used", 0) or 0) + 1
+        bucket["mechanism_emit_round"] = round_id
+        st["mechanism_runs"] = int(st.get("mechanism_runs", 0) or 0) + 1
+        _atomic_write_json(_path("mining_state", root), st)
+
+
+def lane_mechanism_used(st: dict[str, Any], lane: str | None = None) -> int:
+    """读本线 mechanism 已发射次数（决策侧配额检查；快照读，锁外安全）。"""
+    bucket = (st.get("lanes") or {}).get(lane or DEFAULT_LANE) or {}
+    return int(bucket.get("mechanism_used", 0) or 0)
+
+
+def lane_inspiration_mode(st: dict[str, Any], lane: str | None = None) -> str | None:
+    """读本线 origin 模式窗（声明受理时写段内键，arc 断链清空；
+    快照读，锁外安全）。"""
+    bucket = (st.get("lanes") or {}).get(lane or DEFAULT_LANE) or {}
+    mode = bucket.get("inspiration_mode")
+    return mode if isinstance(mode, str) else None
 
 
 def lane_drive_bk(st: dict[str, Any], lane: str | None = None) -> dict[str, Any]:
@@ -429,12 +530,15 @@ def lane_activity(st: dict[str, Any], lane: str | None = None) -> int:
 
 def lane_activity_tick(root: str | os.PathLike | None = None,
                        lane: str | None = None) -> None:
-    """本线引擎可见活动 +1（2026-09-20 增长轴扩宽：rotate 过度开火修复）。
+    """本线引擎可见活动 +1（2026-09-20 增长轴扩宽：rotate 过度开火修复；
+    2026-09-29 D1=B 口径收窄）。
 
     计入：cache-miss 评估派发（evaluate/composite/batch——真实烧引擎
-    算力）、随机生成派发（explore）。不计入：一切叙事（trail 文字碰不
-    到本计数器，反叙事性质保持）；cache 命中（防重发同评估喂钟）；
-    job_id 轮询（纯取回不是挖掘）。
+    算力）。不计入：一切叙事（trail 文字碰不到本计数器，反叙事性质
+    保持）；cache 命中（防重发同评估喂钟）；job_id 轮询（纯取回不是
+    挖掘）；随机生成派发（2026-09-29 D1=B explore 撤出——纯 explore
+    心跳是模型绕过超时窗的豁免通道："governor satisfied"干等一夜实测；
+    幸存者逐一 evaluate 落账时经评估派发重新计时）。
     规格对齐：用户设计语是"一段时间没有触发挖掘"——评估在跑=挖掘在
     触发；旧实现只认试验入账，重税墙下入账稀缺（个股线 5h 一笔），
     合法打磨期每 10min 被注 rotate（09-19/20 六注全被吸收实证）。"""
@@ -477,27 +581,30 @@ def lane_decl_seen_update(root: str | os.PathLike | None = None,
 
 
 def check_termination(state: dict[str, Any] | None = None, root: str | os.PathLike | None = None) -> dict[str, Any]:
-    """合法停点只认机械判据（2026-08-24 用户决策；当晚二次修正：试验上限
-    按「当前簇」计；2026-08-25 arc 化：轮次上限按「当前方向段」计——
-    终身计数在 trail 只增不减的现实下 = 一次到顶永久停机）：
+    """方向预算停点判定（永续版，2026-10-02 总任务书 A.3）。
 
-    - finalized（test 一次性锁的自然终态）→ kind=finalize
+    永续不变量：除死线与用户指令外无任何终态机会——本函数任何输入下
+    永不返回 finalize/fail_streak（性质测试枚举边界值锁死）：
+    - finalized（test 一次性锁）保留为**工具级硬锁**（test 区评估拒绝，
+      test_lock.json 不入任何 reset scope）+ 状态页告警「test 已烧，建议
+      数据集轮换」，不再是 loop 停点；
+    - global_fail_streak 保留为信息字段（state.mining.record 裸 RPC 仍可
+      写），删 max_fail_streak 停点语义（stock 根 global_fail_streak=1 是
+      migration 遗迹，且「当前无喂入方，恒 0」——停点分支是死代码）。
+
+    机械停点只剩换向可解除的一类：
     - arc_rounds >= max_rounds（当前方向段叙事轮次上限）→ kind=direction_budget
     - cluster_trials >= max_cluster_trials（当前方向连续同族试验上限，
       state 需带 cluster_trials 键——由 bridge 侧用 family_streak 数学
       注入；换方向即断链重置）→ kind=direction_budget
-    - fail >= max_fail_streak（跨方向全局收敛；当前无喂入方，恒 0 不触发）
-      → kind=fail_streak
 
     kind 语义（注入器分流依据）：direction_budget = 方向预算耗尽，
-    换向断链自动解除——引擎照挂 rotate/literature 策略、注入器照常推进；
-    finalize / fail_streak = 真终态，注入器静默交还用户。
+    换向断链自动解除——引擎照挂 rotate/literature 策略、注入器照常推进。
     候选池满不是停点（12/12 假穷尽实证）。终身 n_trials 不做停点——
     只用于 deflation 多重检验计价（统计上必须全量计数）。
     IC_IR 改善收敛是机械停点但在 bridge 侧计算（族内滑窗对滑窗，
-    见 bridge._family_convergence；kind=direction_budget/must_rotate——
-    2026-08-26 v8：convergence 静默终态退役，族收敛只做换向信号），
-    不经本函数。"""
+    见 bridge._family_convergence；kind=direction_budget——族收敛只做
+    换向信号），不经本函数。"""
     st = state if state is not None else read_mining_state(root)
     arc = int(st.get("arc_rounds", 0))
     fail = int(st.get("global_fail_streak", 0))
@@ -505,26 +612,31 @@ def check_termination(state: dict[str, Any] | None = None, root: str | os.PathLi
     n_trials = int(st.get("n_trials", 0))
     n_cand = len(st.get("candidate_pool", []))
     max_rounds = int(st.get("max_rounds", MINING_CONFIG["max_rounds"]))
-    max_fail = int(st.get("max_fail_streak", MINING_CONFIG["max_fail_streak"]))
     max_cluster = int(st.get("max_cluster_trials",
                              MINING_CONFIG["max_cluster_trials"]))
-
+    # 永续（A.3.1）：finalize/fail_streak 停点分支已删除——finalized 只作
+    # 信息字段上抛（状态页告警+test 工具级硬锁在别处执行），fail streak
+    # 同为信息性。任何输入下 kind ∈ {None, direction_budget}。
+    info_bits = []
     if st.get("finalized"):
-        return {"stop": True, "kind": "finalize",
-                "reason": "已 finalize（test 已消费，这批结束）", "state": st}
+        info_bits.append("test 已烧（一次性锁仍在工具级生效）——建议数据集轮换")
+    if fail > 0:
+        info_bits.append(f"连续失败计数 {fail}（信息性，不参与停点）")
     if arc >= max_rounds:
+        _r = (f"方向段轮次上限（arc_rounds {arc} >= {max_rounds}，"
+              "换向断链自动重置）"
+              + (f"；{'；'.join(info_bits)}" if info_bits else ""))
         return {"stop": True, "kind": "direction_budget",
-                "reason": (f"方向段轮次上限（arc_rounds {arc} >= {max_rounds}，"
-                           "换向断链自动重置）"), "state": st}
+                "reason": _r, "state": st}
     if cluster >= max_cluster:
+        _r = (f"簇试验上限（当前方向连续 {cluster} >= "
+              f"{max_cluster}，换方向即断链重置）"
+              + (f"；{'；'.join(info_bits)}" if info_bits else ""))
         return {"stop": True, "kind": "direction_budget",
-                "reason": (f"簇试验上限（当前方向连续 {cluster} >= "
-                           f"{max_cluster}，换方向即断链重置）"), "state": st}
-    if fail >= max_fail:
-        return {"stop": True, "kind": "fail_streak",
-                "reason": f"全局连续失败（{fail} >= {max_fail}，跨方向收敛）", "state": st}
+                "reason": _r, "state": st}
     return {"stop": False, "kind": None,
             "reason": (f"继续（方向段轮次 {arc}/{max_rounds}，簇试验 {cluster}/{max_cluster}"
-                       f"（终身 {n_trials} 只计价不停），失败 {fail}/{max_fail}，"
-                       f"候选 {n_cand} 不计停）"),
+                       f"（终身 {n_trials} 只计价不停），候选 {n_cand} 不计停"
+                       + (f"；{'；'.join(info_bits)}" if info_bits else "")
+                       + "）"),
             "state": st}

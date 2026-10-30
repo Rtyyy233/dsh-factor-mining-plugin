@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-factor-mining",
   "description": "Model-facing tools for the DeepSeek Harness factor-mining capability seam",
-  "version": "0.1.17",
+  "version": "0.1.26",
   "publishConfig": {
     "access": "public"
   },
@@ -37,7 +37,7 @@
     "@deepseek-ai/cordis": "workspace:^"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "workspace:^"
+    "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-factor-mining": "workspace:^",

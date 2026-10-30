@@ -110,7 +110,9 @@ export class JsonRpcClient {
         reject(new Error(
           `factor-mining-python: request ${method} timed out after ${this.#config.requestTimeoutMs}ms.${progressNote} `
           + 'The bridge is single-threaded: this computation likely still runs in it, and requests '
-          + 'sent meanwhile queue behind it until it finishes (they may time out too). Wait, then retry with factor_status.'))
+          + 'sent meanwhile queue behind it until it finishes (they may time out too). Wait, then retry with factor_status. '
+          + 'NEVER kill the bridge/python process to "unstick" it — busy is not stuck '
+          + '(2026-08-31 incident: a force-killed busy bridge stalled every session until host restart).)'))
       }, this.#config.requestTimeoutMs)
       this.#pending.set(id, { resolve, reject, timer })
     })
@@ -136,6 +138,28 @@ export class JsonRpcClient {
   #handle: ReturnType<SubprocessRuntime['spawn']> | undefined
   #lastProgress: string | undefined
 
+  /**
+   * Bridge subprocess death handler (2026-08-31 incident productization).
+   * Rejects every pending request immediately, then — provided the exited
+   * handle is still the current one (a newer spawn may already have taken
+   * over) — clears the memoized ready/handle/stdin so the NEXT request()
+   * respawns a fresh bridge. Without the reset, the client kept writing
+   * into the dead pipe and every call hung until its full request timeout,
+   * forever: from the sessions' viewpoint the whole plugin was dead.
+   */
+  #onExited(handle: ReturnType<SubprocessRuntime['spawn']>, error: Error): void {
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    this.#pending.clear()
+    if (this.#handle === handle) {
+      this.#handle = undefined
+      this.#stdin = undefined
+      this.#ready = undefined
+    }
+  }
+
   async #start(): Promise<void> {
     const config = this.#config
     const handle = this.#subprocess.spawn({
@@ -153,24 +177,24 @@ export class JsonRpcClient {
       throw new Error('factor-mining-python: subprocess provider did not expose piped stdio')
     }
     this.#stdin = stdin
+    // Dead-pipe write guard (2026-08-31 incident: the mining agent force-killed
+    // the busy bridge; the next request wrote into the dead stdin pipe and its
+    // promise hung until the full request timeout, for every call thereafter).
+    // The exit handler below resets the client, but an in-flight write can
+    // still raise EPIPE asynchronously — swallow it here or it becomes an
+    // unhandled 'error' event; the associated pending is rejected by the
+    // exit/timeout paths instead.
+    stdin.on('error', () => {})
     stderr.setEncoding('utf8')
     stderr.on('data', (chunk: string) => {
       this.#stderr = (this.#stderr + chunk).slice(-64_000)
     })
     void handle.done.then(() => {
-      const error = new Error(`factor-mining-python: bridge exited with stderr tail: ${this.#stderr.slice(-2000)}`)
-      for (const pending of this.#pending.values()) {
-        clearTimeout(pending.timer)
-        pending.reject(error)
-      }
-      this.#pending.clear()
+      this.#onExited(handle, new Error(
+        `factor-mining-python: bridge exited with stderr tail: ${this.#stderr.slice(-2000)}`))
     }, (error: Error) => {
       this.#lastError = error
-      for (const pending of this.#pending.values()) {
-        clearTimeout(pending.timer)
-        pending.reject(error)
-      }
-      this.#pending.clear()
+      this.#onExited(handle, error)
     })
 
     const readyPromise = new Promise<void>((resolve, reject) => {

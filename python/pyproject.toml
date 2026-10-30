@@ -15,6 +15,9 @@ dependencies = [
   "numpy>=1.26",
   "pandas>=2.0",
   "pyarrow>=14.0",
+  # 效率编译层（2026-09-01）：自动 njit 加速。代码侧惰性 import、缺失时
+  # 优雅降级（烟测门只跳过 njit 探针，评估照常）——但完整能力需要它。
+  "numba>=0.61",
 ]
 
 [project.scripts]
@@ -25,3 +28,6 @@ packages = ["src/dsh_factor_mining", "src/dsh_strategy_lab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "slow: 真实超时等待类测试（烟测门死循环探针等，默认随全量跑）",
+]

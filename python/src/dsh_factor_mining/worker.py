@@ -21,6 +21,7 @@ import pandas as pd
 from .factor.audit import audit
 from .factor.causality import check_causality
 from .factor.env import FactorEnv
+from .factor.eval_cache import cached_evaluate
 from .factor.evaluate import (
     evaluate,
     evaluate_batch,
@@ -30,6 +31,17 @@ from .factor.evaluate import (
     evaluate_walk_forward,
 )
 from .factor.noise import factor_perf
+from .discipline import source_fingerprint
+from .panel_mmap import load_bundle_mmap
+from .smoke import (
+    EQUIV_ATOL,
+    EQUIV_RTOL,
+    SMOKE_INTERP_CAP_S,
+    SMOKE_SMALL_COLS,
+    SMOKE_SMALL_ROWS,
+    env_subsample,
+    env_view,
+)
 
 
 def write_env_npz(path, env: FactorEnv) -> None:
@@ -84,8 +96,18 @@ def _compile(source: str):
 _BATCH_CHILD_ENV: dict = {}
 
 
-def _batch_child_init(npz_path: str) -> None:
-    _BATCH_CHILD_ENV["env"] = load_env_npz(npz_path)
+def load_env_any(npz_path, pbin_path=None) -> FactorEnv:
+    """优先 mmap bundle（多进程共享物理页，2026-09-08），失败回退 npz。"""
+    if pbin_path:
+        try:
+            return load_bundle_mmap(pbin_path)
+        except Exception:  # noqa: BLE001 — 半写/损坏/版本差 → 回退压缩路径
+            pass
+    return load_env_npz(npz_path)
+
+
+def _batch_child_init(npz_path: str, pbin_path=None) -> None:
+    _BATCH_CHILD_ENV["env"] = load_env_any(npz_path, pbin_path)
 
 
 def _batch_child_eval(name: str, src: str, train_end, horizon, pool_std):
@@ -97,8 +119,10 @@ def _batch_child_eval(name: str, src: str, train_end, horizon, pool_std):
     return name, diag, F
 
 
-def _batch_parallel(sources: dict, npz_path: str, env, horizon, pool_std) -> dict:
-    """进程池并行批次（层 1）：env npz 一份共享（子进程各自加载只读），
+def _batch_parallel(sources: dict, npz_path: str, env, horizon, pool_std,
+                    pbin_path=None) -> dict:
+    """进程池并行批次（层 1）：env 一份共享（子进程各自加载只读；有
+    pbin 走 mmap 共享物理页，否则各自解压 npz），
     逐成员提交任务，部分失败只标记该成员（{"error": ...}，bridge 侧
     本就跳过 error 成员记账）。家族统计回到本进程 evaluate_batch。"""
     from concurrent.futures import ProcessPoolExecutor
@@ -112,7 +136,7 @@ def _batch_parallel(sources: dict, npz_path: str, env, horizon, pool_std) -> dic
     factors: dict = {}
     with ProcessPoolExecutor(max_workers=jobs,
                              initializer=_batch_child_init,
-                             initargs=(npz_path,)) as ex:
+                             initargs=(npz_path, pbin_path)) as ex:
         futs = {ex.submit(_batch_child_eval, name, src, train_end, horizon,
                           pool_std): name for name, src in tasks}
         for fut, name in futs.items():
@@ -127,8 +151,169 @@ def _batch_parallel(sources: dict, npz_path: str, env, horizon, pool_std) -> dic
                           factors=factors)
 
 
+def _min_two(call):
+    """双跑取 min（亚毫秒计时噪声缓解——spike F1c 实证 alpha 会漂）。"""
+    t0 = time.perf_counter()
+    call()
+    t1 = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    call()
+    t2 = time.perf_counter() - t0
+    return round(min(t1, t2), 4)
+
+
+def _smoke_request(req: dict, fn) -> dict:
+    """factor.smoke（内部方法，不进 _method 注册表——tail_placebo 先例）：
+    小子面板实测 + njit 探针 +（verify 模式）与原实现严格等价比对。
+    外推/判定逻辑全在 bridge 侧（smoke.classify_gate）——worker 只产实测
+    数字，单点可测。verify 模式下重写代码（LLM 产出）在本子进程内执行，
+    不经安全扫描+等价验证的代码绝不进主执行路径。"""
+    p = req.get("params") or {}
+    env = load_env_npz(req["npzPath"])   # 512x128 烟测面板（bridge 已切好）
+    small = env_subsample(env, int(p.get("small_rows", SMOKE_SMALL_ROWS)),
+                          int(p.get("small_cols", SMOKE_SMALL_COLS)))
+    out: dict = {"mode": p.get("mode", "gate"),
+                 "smoke_cells": int(env.T * env.N),
+                 "small_cells": int(small.T * small.N),
+                 "full_cells": int(p.get("full_cells") or 0)}
+    if out["mode"] == "verify":
+        fn_o = _compile(p["orig_source"])
+        try:
+            a = fn_o(small)
+        except Exception as e:  # noqa: BLE001 — 原实现在小面板失败=验证失败
+            out["verify_error"] = f"orig 运行失败: {type(e).__name__}: {e}"[:200]
+            return out
+        try:
+            b = fn(small)
+        except Exception as e:  # noqa: BLE001 — 重写版可运行性即验证一部分
+            out["run_error"] = f"{type(e).__name__}: {e}"[:200]
+            return out
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        if a.shape != b.shape:
+            out["equiv"] = False
+            out["shape"] = f"{a.shape}->{b.shape}"
+        else:
+            out["equiv"] = bool(np.allclose(a, b, rtol=EQUIV_RTOL,
+                                            atol=EQUIV_ATOL, equal_nan=True))
+        out["t_small_s"] = _min_two(lambda: fn(small))
+        out["t_smoke_s"] = _min_two(lambda: fn(env))
+        return out
+    # gate 模式
+    try:
+        fn(env_subsample(env, 8, 8))            # 预热（首次 numpy 触发等）
+    except Exception as e:  # noqa: BLE001 — 小面板跑不起来（窗口长度等）
+        out["interp_error"] = f"{type(e).__name__}: {e}"[:200]
+        return out
+    out["t_small_s"] = _min_two(lambda: fn(small))
+    t0 = time.perf_counter()
+    fn(env)
+    t1 = time.perf_counter() - t0
+    if t1 > SMOKE_INTERP_CAP_S:
+        # smoke 尺寸已超 CAP：必超预算，不再计时（省烟测预算给 njit 探针）
+        out["t_smoke_s"] = round(t1, 4)
+        out["too_slow"] = True
+        return out
+    t0 = time.perf_counter()
+    fn(env)
+    t2 = time.perf_counter() - t0
+    out["t_smoke_s"] = round(min(t1, t2), 4)
+    # njit 探针（惰性 import；未安装=available False，主路径照常解释执行）。
+    # 编译对象 = 剥白名单 import 后的预处理源码（平台因子惯例是函数内
+    # import numpy，numba 不支持 import 语句——与主路径 _njit_accelerate
+    # 共用 _compile_for_njit，等价性验证的对象即实际加速的对象）
+    nj: dict = {"available": False}
+    try:
+        import numba  # noqa: F401
+        nj["available"] = True
+        t0 = time.perf_counter()
+        fnj = numba.njit(cache=False)(_compile_for_njit(req["source"]))
+        fnj(env_view(small))                    # 首调触发编译
+        nj["compile_s"] = round(time.perf_counter() - t0, 2)
+        nj["compiled"] = True
+        a = np.asarray(fn(small), dtype=float)
+        b = np.asarray(fnj(env_view(small)), dtype=float)
+        nj["equiv"] = bool(a.shape == b.shape and np.allclose(
+            a, b, rtol=EQUIV_RTOL, atol=EQUIV_ATOL, equal_nan=True))
+        if nj["equiv"]:
+            nj["t_small_s"] = _min_two(lambda: fnj(env_view(small)))
+            nj["t_smoke_s"] = _min_two(lambda: fnj(env_view(env)))
+    except Exception as e:  # noqa: BLE001 — 编译失败是正常分支（pandas/nan 系）
+        nj["compiled"] = False
+        nj["error"] = f"{type(e).__name__}: {e}"[:160]
+    out["njit"] = nj
+    return out
+
+
+_NUMBA_MEMO: dict = {}
+
+# njit 预处理编译的命名空间：覆盖 `import numpy`（裸名）与
+# `import numpy as np` 两种绑定（smoke.njit_prepare 已剥离这些 import 行）
+_NJIT_NS_BASE = {"np": np, "pd": pd, "math": __import__("math"),
+                 "numpy": np, "pandas": pd}
+
+
+def _compile_for_njit(source: str):
+    """剥白名单 import 后在注入 ns 的命名空间编译——与烟测探针共用同一
+    预处理，保证等价性验证的对象就是主路径实际加速的对象。"""
+    import math as _math  # noqa: F401 — ns 绑定用
+    from .smoke import njit_prepare
+    prepared = njit_prepare(source)
+    ns = {**_NJIT_NS_BASE, "__name__": "dsh_factor_mining_worker_factor"}
+    exec(compile(prepared, "<factor_njit>", "exec"), ns)
+    if "factor" not in ns or not callable(ns["factor"]):
+        raise ValueError("njit 预处理后缺少可调用 factor")
+    return ns["factor"]
+
+
+def _njit_accelerate(fn, source: str):
+    """主执行路径的 njit 包装——仅在烟测门已验证（编译过+严格等价+投影
+    进预算）后被 params["smoke_engine"]=="njit" 启用。进程内按源码指纹
+    memo；编译/首调任何异常永久回退解释版：numba 层绝不破坏本可运行的
+    因子（spike 实测编译失败 0.01-0.4s 无害快速失败）。"""
+    try:
+        key = source_fingerprint(source) if source else str(id(fn))
+    except Exception:
+        key = str(id(fn))
+    st = _NUMBA_MEMO.get(key)
+    if st is None:
+        try:
+            import numba
+            fn_fast = _compile_for_njit(source)
+            st = {"mode": "njit", "fn": numba.njit(cache=False)(fn_fast)}
+        except Exception as e:  # noqa: BLE001 — numba 缺失/装坏/预处理失败
+            st = {"mode": "interp", "why": f"{type(e).__name__}: {e}"[:120]}
+        _NUMBA_MEMO[key] = st
+    if st["mode"] != "njit":
+        return fn
+
+    def _accel(env):
+        try:
+            return st["fn"](env_view(env))
+        except Exception:  # noqa: BLE001 — 编译期/首调异常：回退并永久降级
+            st["mode"] = "interp"
+            return fn(env)
+
+    return _accel
+
+
+def _engine_telemetry(params: dict) -> dict:
+    """效率编译层遥测并入 perf 块（烟测画像 / njit / 重写溯源）。"""
+    t: dict = {}
+    sm = params.get("smoke_telemetry")
+    if isinstance(sm, dict):
+        t["smoke"] = sm
+    rw = params.get("engine_rewrite")
+    if isinstance(rw, dict):
+        t["engine"] = "rewrite:llm-v1"
+        t["rewrite_provenance"] = rw
+    elif params.get("smoke_engine") == "njit":
+        t["engine"] = "njit"
+    return t
+
+
 def run_request(req: dict) -> dict:
-    env = load_env_npz(req["npzPath"])
+    env = load_env_any(req["npzPath"], req.get("pbinPath"))
     method = req["method"]
     # evaluate_batch 是多 source 方法（sources dict），无单个 source——
     # 入口编译跳过，由其分支自行编译每个 source（2026-08-18 修复：
@@ -136,6 +321,11 @@ def run_request(req: dict) -> dict:
     fn = _compile(req["source"]) if (req.get("source") and method != "factor.evaluate_batch") else None
     params = req.get("params") or {}
     state_root = params.get("state_root")
+    if method == "factor.smoke":
+        return _smoke_request(req, fn)
+    # 效率编译层（2026-09-01）：烟测门判 njit 可救时主执行也走编译版
+    if fn is not None and params.get("smoke_engine") == "njit":
+        fn = _njit_accelerate(fn, req.get("source") or "")
     if method == "factor.check_causality":
         return check_causality(fn, env)
     if method == "factor.evaluate":
@@ -166,8 +356,18 @@ def run_request(req: dict) -> dict:
         except (TypeError, ValueError):
             horizon = None
         if stage == "development":
-            out = evaluate(F, env, n_trials=n_trials, pool_std=pool_std,
-                           horizon=horizon, bar_sigma=bar_sigma)
+            # C1（修正案 A 2026-08-28）：development 是纯读——走磁盘缓存。
+            # F 仍先算（perf 遥测要诚实的 fn(env) 计时），缓存只免
+            # evaluate() 本体的分钟级成本。source_hash/env_fp 由 bridge
+            # 注入 params（与桥侧预检同一键空间）；selection/test 是
+            # 消耗品语义，一概不缓存。
+            out = cached_evaluate(
+                F, env, state_root=state_root,
+                source_hash=(params.get("source_hash")
+                             or source_fingerprint(req["source"])),
+                env_fp=params.get("env_fp"),
+                horizon=horizon, n_trials=n_trials,
+                pool_std=pool_std, bar_sigma=bar_sigma)
         elif stage == "selection":
             out = evaluate_selection(F, env)
         elif stage == "test":
@@ -177,13 +377,41 @@ def run_request(req: dict) -> dict:
         else:
             raise ValueError(f"worker 不支持的 stage: {stage}")
         if isinstance(out, dict):
+            _perf.update(_engine_telemetry(params))
             out["perf"] = _perf
         return out
     if method == "factor.evaluate_composite":
+        parts_srcs = params.get("ingredients") or {}
         parts = {}
-        for name, src in (params.get("ingredients") or {}).items():
+        for name, src in parts_srcs.items():
             parts[name] = _compile(src)(env)
-        return evaluate_composite(fn(env), parts, env)
+        # C1：合成本体与成分都过缓存——成分是 trail 里已评估过的源，
+        # 命中后 (K+1)×evaluate 降到 1×（个股面板的关键修正）。口径
+        # 参数与 factor.evaluate 分支同型归一，键才能对上。
+        eval_fn = None
+        if state_root:
+            horizon = params.get("horizon")
+            try:
+                horizon = int(horizon) if horizon not in (None, "") else None
+            except (TypeError, ValueError):
+                horizon = None
+
+            def _num(v):
+                return float(v) if isinstance(v, (int, float)) else None
+
+            hashes = {"__composite__": (params.get("source_hash")
+                                        or source_fingerprint(req["source"]))}
+            for name, src in parts_srcs.items():
+                hashes[name] = source_fingerprint(src)
+
+            def eval_fn(tag, G, env_, train_end=None):
+                return cached_evaluate(
+                    G, env_, state_root=state_root, source_hash=hashes[tag],
+                    env_fp=params.get("env_fp"), train_end=train_end,
+                    horizon=horizon, n_trials=_num(params.get("n_trials")) or 1.0,
+                    pool_std=_num(params.get("pool_std")),
+                    bar_sigma=_num(params.get("bar_sigma")))
+        return evaluate_composite(fn(env), parts, env, eval_fn=eval_fn)
     if method == "factor.evaluate_batch":
         sources = params.get("sources") or {}
         horizon = params.get("horizon")
@@ -201,7 +429,8 @@ def run_request(req: dict) -> dict:
         jobs = resolve_jobs()
         if len(sources) >= 2 and jobs >= 2:
             return _batch_parallel(sources, req["npzPath"], env,
-                                   horizon=horizon, pool_std=pool_std)
+                                   horizon=horizon, pool_std=pool_std,
+                                   pbin_path=req.get("pbinPath"))
         # 顺序路径（P3 起同样做部分失败隔离：坏成员标 error 不烧整批）
         F_dict, factors = {}, {}
         for name, src in sources.items():
@@ -224,13 +453,12 @@ def run_request(req: dict) -> dict:
         stat = None
         if params.get("statistic") == "spread":
             from .factor.tail import spread_ir_statistic
-            stat = spread_ir_statistic
-            # net 基（2026-08-28 换手率定价 WS-T2）：合成世界的组差同样
-            # 按 2·cost·turn 净掉——G2 与 G3 判定口径一致，一个成本模型
-            if params.get("net_cost") is not None:
-                import functools as _ft
-                stat = _ft.partial(spread_ir_statistic,
-                                   cost=float(params["net_cost"]))
+            # R30（2026-08-31 隔离复审）：G2 统计量绑环境口径 tail_k（与
+            # bridge in_process 分发同款——此前两处都漏绑恒用默认 0.2）；
+            # G2 恒毛口径（dc6a42a），net 定价由 G1/G3 承载
+            import functools as _ft
+            stat = _ft.partial(spread_ir_statistic,
+                               k_frac=float(env.calibration.tail_k))
         return noise_test(fn, env, m, base_seed, statistic=stat)
     if method == "factor.tail_placebo":
         # G1 权威 placebo（WS2 2026-08-25）：submit 侧重跑——样本加厚
@@ -269,7 +497,32 @@ def run_request(req: dict) -> dict:
                              budget_secs=float(params.get("budget_secs", 90.0)
                                                or 90.0))
     if method == "factor.audit":
-        return audit(fn, env)
+        # W2 延伸（2026-08-29 生产事故）：audit 超时时 agent 无法分清
+        # 「因子实现慢」还是「审计机器重」（audit = fn×(1+因果探针) +
+        # IC/top-N + 200 次列置换 + 内嵌一次全量 evaluate——当日实测
+        # 同面板 evaluate 6.5s 而 audit 315s CPU，agent 被旧超时消息
+        # 误导重写了两遍因子源码）。计时闭包只测不重算：fn 每次被调
+        # （含因果探针的多次调用）都累计 CPU。
+        _tm = {"calls": 0, "cpu": 0.0}
+
+        def _timed(env_):
+            _p = time.process_time()
+            out = fn(env_)
+            _tm["cpu"] += time.process_time() - _p
+            _tm["calls"] += 1
+            return out
+
+        out = audit(_timed, env)
+        if isinstance(out, dict):
+            out["perf"] = {
+                "factor_calls": _tm["calls"],
+                "factor_cpu_s": round(_tm["cpu"], 1),
+                "machinery_note": ("audit 机器成本 = 因果探针 + IC/top-N + "
+                                   "200 次列置换 + 内嵌全量 evaluate；"
+                                   "factor_cpu_s 只是其中因子本体——超时对照"
+                                   "它判定该向量化因子还是拆小审计"),
+            }
+        return out
     raise ValueError(f"worker 不支持的方法: {method}")
 
 

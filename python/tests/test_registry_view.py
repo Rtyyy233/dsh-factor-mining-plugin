@@ -198,8 +198,10 @@ def test_registry_submit_stamps_ts(tmp_path):
 # ---- 2. trail_summary：last_engine_trail 投影 + 前移 ----
 
 def test_trail_summary_compact_projection(tmp_path):
-    """last_engine_trail 条目白名单：无 ic_series_sketch/suspects/
-    construction_fp/dsr_stats；tail 只留 spread_ir/placebo_z。"""
+    """last_engine_trail 条目白名单：名词化投影（身份+红旗名）——
+    ic_ir/verdict/tail 等评估数字不进历史滚动视图（2026-10-14 任务书
+    A3 注入面分数审计修复）；无 ic_series_sketch/suspects/
+    construction_fp/dsr_stats。"""
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     entries = [{
@@ -221,12 +223,11 @@ def test_trail_summary_compact_projection(tmp_path):
     last = s["last_engine_trail"]
     assert len(last) == 1
     e = last[0]
-    allowed = {"ts", "source_hash", "horizon", "stage", "ic_ir", "verdict",
-               "red_flags", "tail"}
+    allowed = {"ts", "source_hash", "horizon", "stage", "origin",
+               "red_flags"}
     assert set(e.keys()) == allowed, e
     assert e["source_hash"] == "a" * 12  # 前缀
     assert e["red_flags"] == ["f1", "f2"]  # 截 2
-    assert e["tail"] == {"spread_ir": 0.44, "placebo_z": 2.1}
     ser = json.dumps(e, ensure_ascii=False)
     assert len(ser) < 300, len(ser)
 

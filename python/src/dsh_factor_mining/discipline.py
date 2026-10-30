@@ -53,6 +53,10 @@ def calibration_fingerprint(calibration) -> str:
             d = dict(vars(calibration)) if not isinstance(calibration, dict) else dict(calibration)
     if isinstance(d, dict) and d.get("horizons") is None:
         d = {k: v for k, v in d.items() if k != "horizons"}
+    # k_frac 同款（2026-08-30 可配化）：未配置不参与指纹——既有部署指纹
+    # 逐字节不变；配置后指纹变化 → null 校准/tail 账本按新口径分账。
+    if isinstance(d, dict) and d.get("k_frac") is None:
+        d = {k: v for k, v in d.items() if k != "k_frac"}
     return dict_fingerprint(d)
 
 

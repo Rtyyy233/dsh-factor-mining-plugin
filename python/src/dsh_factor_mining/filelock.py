@@ -24,7 +24,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-DEFAULT_LOCK_TIMEOUT_S = 10.0
+# 30s（2026-09-09，原 10s）：同 root 多 daemon（2 farm+1 runner）并发写时
+# 10s 窗口下整批 rpc_error 丢弃率实测可达 ~30%（Day6 夜场），持锁者的正常
+# 写是毫秒级，等待变长只是排队；真僵死仍有界（30s 后 fast-fail 可手工清锁）
+DEFAULT_LOCK_TIMEOUT_S = 30.0
 
 # 进程内重入计数（单线程假设：bridge/CLI 均无并发线程写状态）
 _HELD: dict[str, int] = {}

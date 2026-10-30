@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-factor-mining-bundle",
   "description": "Optional dsh bundle mounting the factor-mining Python provider and model-facing tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publishConfig": {
     "access": "public"
   },
