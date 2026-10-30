@@ -7,10 +7,17 @@ factor-drive-state.json、may_stop 退役、连注≤5 上限删除）。定位�
 三种宿主各是什么形态。**
 
 分工边界：因子引擎**内部**机制（评估管线、多重检验墙、停走纪律等）见
-[HARNESS_ARCHITECTURE.md](HARNESS_ARCHITECTURE.md) 总览卷与 docs/arch/ 十二篇
+[HARNESS_ARCHITECTURE.md](HARNESS_ARCHITECTURE.md) 总览卷与 docs/arch/ 十三篇
 分篇，本文不重复；"模型在每种情境下看到的逐字上下文"见
-[docs/model-context/](model-context/OVERVIEW.md) 四文件 29 卡，本文只讲接线，
+[docs/model-context/](model-context/OVERVIEW.md)，本文只讲接线，
 需要逐字文本时引用卡号（如 F-DSH-03）。
+
+> **版本与安装现状（2026-10-30）**：TS 工具层现役 **0.1.26**（矿工门名册/
+> 死线落盘/卡死恢复/压缩恢复注入，双 profile 已装）；Python 引擎随主树
+> pip -e 即时生效。除 profile 打包安装外，另有**公开镜像仓**安装路径：
+> `git clone https://github.com/Rtyyy233/dsh-factor-mining-plugin`（精选
+> 历史快照，与开发主树内容同步、不含用户数据）——适合外部使用者整仓
+> 取用；插件机制安装仍以下述 profile 路径为准。
 
 ---
 

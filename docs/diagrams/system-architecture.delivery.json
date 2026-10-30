@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "eda69206-473a-410a-ab06-796bdbeb80cd",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
+  "output": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
+  "specification": {
+    "sha256": "cbcc3e600fb2b56a8cd44505dc2cca691c079e52be6a17dbf737e48b089789c1",
+    "bytes": 19944
+  },
+  "artifact": {
+    "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
+    "bytes": 893571
+  }
+}

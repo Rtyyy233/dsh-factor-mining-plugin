@@ -142,7 +142,7 @@ interface Strategy {
   directive: string
 }
 
-/** Simple (momentum-preserving) push types subject to the consecutive cap. */
+/** Simple (momentum-preserving) push types counted by the diagnostic consecutive counter (no longer a cap since 0.1.22). */
 const SIMPLE_TYPES = new Set(['continue'])
 
 /** 活跃矿工保活窗口（2026-10-16 矿工门）：持有者超过此时长无任何

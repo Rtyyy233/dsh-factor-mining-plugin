@@ -149,3 +149,16 @@ Your factor is evaluated under the session's `calibration` (regions `dev_end`/`s
 5. `factor_registry_submit` (receipt-verified) + `factor_export_report` for a shareable card
 
 Every evaluation is auto-recorded in the engine trail — failed factors leave a trace too; hiding them is not possible by design.
+
+
+## 7. Expectation pre-registration & the mirror | 预期预注册与镜像（Agent 自主挖掘适用；单独作评估库可跳过）
+
+在**第一次 `factor_evaluate` 之前**，把预期写进推理日志（工具 `factor_journal_append`），
+条目 content 首行必须是 `## <id> registered <标题>`（如 `## H-1 registered 量加权动量`），
+正文写可检验预期（方向/半衰期/换手量级……）并**点名源码用到的算子与字段名**；
+`source` 参数传因子源码原文（引擎据此计算关联 hash）。评估响应自动附
+`journal_mirror`（预期 vs 实测的机械并置）与 `deflated_train.shadow_stratum`
+（机制层影子计价，alpha_layer=0.0253）；用 `factor_journal_update` 结算
+（resolved/stale + 一句结论）。提交入册时提交顺序门会核对预注册时序与
+"代码构造 ⊆ 推导正文"的词法对账（当前 shadow 档只记账；详见
+`docs/arch/derivation-first.md`）。没有注册预期的评估=镜像无物可照。

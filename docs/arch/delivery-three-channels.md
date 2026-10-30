@@ -24,7 +24,7 @@ runner 侧重写，会话被唤醒后第一动作就是读它。三条通道同�
 | 下游 | 评估管线五工具 | 通道一的挂点（每次响应携带 loop 区） |
 | 下游 | drive 注入器 | 通道二的投放执行（静默窗／键去重／真人优先） |
 | 下游 | 直驱 runner | 通道三的写入者（消费 loop 重写指令文件） |
-| 相邻 | [lane-isolation.md](lane-isolation.md) | 指令按线送达，绑定表决定推哪条线 |
+| 相邻 | [lane-isolation.md](lane-isolation.md) | 指令按线送达；账本绑定只管工具路由，**注入目标由矿工名册决定**（每 root 一在任者，见 drive-injector 矿工门节，0.1.26） |
 | 相邻 | [scheduler.md](scheduler.md) | 灰度选点行经通道一挂入（只含事实） |
 
 ---

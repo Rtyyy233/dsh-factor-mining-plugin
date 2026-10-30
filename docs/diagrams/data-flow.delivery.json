@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "d6f2131b-c00d-4d74-b641-803456fa385c",
+  "status": "current",
+  "command": "deliver",
+  "type": "dataflow",
+  "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\dataflow-dsh-fm-20261030-1\\candidate.json",
+  "output": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\data-flow.html",
+  "specification": {
+    "sha256": "6adda806c5296235796daacfe2576010ec290b517d797c3f8968b158d992faaa",
+    "bytes": 11839
+  },
+  "artifact": {
+    "sha256": "c9584dcdc1f7a3f8c6e37e36eeb7c360dc71420ba34b963dbc41e2b096b072ef",
+    "bytes": 863352
+  }
+}

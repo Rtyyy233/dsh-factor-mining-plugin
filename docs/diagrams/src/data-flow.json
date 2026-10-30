@@ -1,0 +1,498 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "DSH 因子挖掘插件 · 数据流",
+    "subtitle": "原始面板到入册消费的全血缘 · 证据基线 662dcfc8c",
+    "locale": "zh-CN",
+    "output": "docs/diagrams/data-flow.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Rtyyy233/dsh-factor-mining-plugin",
+      "provider": "github",
+      "revision": "662dcfc8c3ac7a9e5f4cd45257dfb129e3baaf5c"
+    },
+    "views": [
+      {
+        "id": "main",
+        "label": "主链",
+        "focus": [
+          "panel",
+          "env",
+          "evaluate",
+          "trail",
+          "wall",
+          "gates",
+          "registry",
+          "book"
+        ],
+        "note": "数据面板到强因子库的期望路径"
+      },
+      {
+        "id": "pricing",
+        "label": "双轨定价",
+        "focus": [
+          "fingerprints",
+          "wall",
+          "null-land",
+          "random-null"
+        ],
+        "note": "IC 轨与尾轨的相关结构实测与墙定价"
+      },
+      {
+        "id": "loops",
+        "label": "回流闭环",
+        "focus": [
+          "journal",
+          "navigation",
+          "factor-src",
+          "incubate"
+        ],
+        "note": "镜像对账与导航素材回注生成上下文"
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "源与出身"
+    },
+    {
+      "label": "环境"
+    },
+    {
+      "label": "评估与记账"
+    },
+    {
+      "label": "定价与门链"
+    },
+    {
+      "label": "消费"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "panel",
+      "type": "database",
+      "label": "数据面板",
+      "sublabel": "parquet/csv · long/wide",
+      "stage": 0,
+      "row": 0,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/data/adapters.py",
+          "line": 86
+        }
+      ]
+    },
+    {
+      "id": "minute",
+      "type": "database",
+      "label": "分钟特征库",
+      "sublabel": "~/.a_share_minute",
+      "stage": 0,
+      "row": 2,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/data/adapters.py",
+          "line": 552
+        }
+      ]
+    },
+    {
+      "id": "factor-src",
+      "type": "backend",
+      "label": "因子源码",
+      "sublabel": "手写 / 随机 / 枚举三源",
+      "stage": 0,
+      "row": 4,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6121
+        }
+      ]
+    },
+    {
+      "id": "env",
+      "type": "backend",
+      "label": "FactorEnv",
+      "sublabel": "三区 · 环境指纹绑定算子集",
+      "stage": 1,
+      "row": 0,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/env.py",
+          "line": 82
+        },
+        {
+          "path": "python/src/dsh_factor_mining/discipline.py",
+          "line": 68
+        }
+      ]
+    },
+    {
+      "id": "journal",
+      "type": "database",
+      "label": "journal 预注册",
+      "sublabel": "预期 + 点名算子字段",
+      "stage": 1,
+      "row": 2,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/journal.py",
+          "line": 293
+        }
+      ]
+    },
+    {
+      "id": "random-null",
+      "type": "backend",
+      "label": "null 校准",
+      "sublabel": "n=200 同文法采样",
+      "stage": 2,
+      "row": 0,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/random_gen.py",
+          "line": 264
+        }
+      ]
+    },
+    {
+      "id": "causality",
+      "type": "security",
+      "label": "前视检验",
+      "sublabel": "噪声 / NaN 双置换",
+      "stage": 2,
+      "row": 1,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/causality.py",
+          "line": 18
+        }
+      ]
+    },
+    {
+      "id": "evaluate",
+      "type": "backend",
+      "label": "evaluate",
+      "sublabel": "IC 序列 · 不重叠 · 敏感性 · Top-N",
+      "stage": 2,
+      "row": 2,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/evaluate.py",
+          "line": 796
+        }
+      ]
+    },
+    {
+      "id": "fingerprints",
+      "type": "database",
+      "label": "sketch + MinHash",
+      "sublabel": "双轨相关结构原料",
+      "stage": 2,
+      "row": 3,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/tailgate.py",
+          "line": 9
+        }
+      ]
+    },
+    {
+      "id": "trail",
+      "type": "database",
+      "label": "trail_engine",
+      "sublabel": "首见去重 · fail 入账",
+      "stage": 2,
+      "row": 4,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "null-land",
+      "type": "database",
+      "label": "null landscape",
+      "sublabel": "pool_std · σbar",
+      "stage": 3,
+      "row": 0,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/random_gen.py",
+          "line": 8
+        }
+      ]
+    },
+    {
+      "id": "wall",
+      "type": "backend",
+      "label": "deflation 墙",
+      "sublabel": "CRN E[max|X|] · 双轨 · Šidák",
+      "stage": 3,
+      "row": 2,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/evaluate.py",
+          "line": 668
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/tailwall.py",
+          "line": 108
+        }
+      ]
+    },
+    {
+      "id": "gates",
+      "type": "security",
+      "label": "门链",
+      "sublabel": "placebo · 正交 · B1 顺序 · 新颖",
+      "stage": 3,
+      "row": 3,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6992
+        },
+        {
+          "path": "python/src/dsh_factor_mining/ordergate.py",
+          "line": 154
+        }
+      ]
+    },
+    {
+      "id": "navigation",
+      "type": "backend",
+      "label": "导航素材",
+      "sublabel": "地图 · 采尽档 · 禁忌",
+      "stage": 3,
+      "row": 4,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/navigation.py",
+          "line": 214
+        }
+      ]
+    },
+    {
+      "id": "book",
+      "type": "database",
+      "label": "强因子库",
+      "sublabel": "贪心选族 · 正交缓存",
+      "stage": 4,
+      "row": 0,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/book_ranks.py",
+          "line": 23
+        }
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "registry + ledger",
+      "sublabel": "accepted · 撤销标记",
+      "stage": 4,
+      "row": 2,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "incubate",
+      "type": "backend",
+      "label": "孵化 / 救助",
+      "sublabel": "样本外复活 · 自动轮",
+      "stage": 4,
+      "row": 4,
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 8030
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "panel-env",
+      "from": "panel",
+      "to": "env",
+      "label": "data.load",
+      "variant": "emphasis"
+    },
+    {
+      "id": "minute-env",
+      "from": "minute",
+      "to": "env",
+      "label": "分钟特征",
+      "variant": "default"
+    },
+    {
+      "id": "env-null",
+      "from": "env",
+      "to": "random-null",
+      "label": "同口径采样",
+      "variant": "default"
+    },
+    {
+      "id": "null-land",
+      "from": "random-null",
+      "to": "null-land",
+      "label": "经验 IC 分布",
+      "variant": "emphasis"
+    },
+    {
+      "id": "env-eval",
+      "from": "env",
+      "to": "evaluate",
+      "label": "FactorEnv",
+      "variant": "emphasis"
+    },
+    {
+      "id": "src-causality",
+      "from": "factor-src",
+      "to": "causality",
+      "label": "worker 沙箱执行",
+      "variant": "emphasis"
+    },
+    {
+      "id": "causality-eval",
+      "from": "causality",
+      "to": "evaluate",
+      "label": "通过后评估",
+      "variant": "default"
+    },
+    {
+      "id": "journal-eval",
+      "from": "journal",
+      "to": "evaluate",
+      "label": "预注册 · 时序证据",
+      "variant": "security"
+    },
+    {
+      "id": "eval-trail",
+      "from": "evaluate",
+      "to": "trail",
+      "label": "首见去重记账",
+      "variant": "emphasis",
+      "route": "vertical-channel",
+      "channelX": 660
+    },
+    {
+      "id": "eval-fp",
+      "from": "evaluate",
+      "to": "fingerprints",
+      "label": "sketch + 名单指纹",
+      "variant": "default"
+    },
+    {
+      "id": "trail-wall",
+      "from": "trail",
+      "to": "wall",
+      "label": "实测 R · 计数 M",
+      "variant": "emphasis"
+    },
+    {
+      "id": "null-wall",
+      "from": "null-land",
+      "to": "wall",
+      "label": "pool_std",
+      "variant": "emphasis"
+    },
+    {
+      "id": "wall-gates",
+      "from": "wall",
+      "to": "gates",
+      "label": "deflated p",
+      "variant": "emphasis"
+    },
+    {
+      "id": "trail-gates",
+      "from": "trail",
+      "to": "gates",
+      "label": "G1/G2 重算输入",
+      "variant": "default"
+    },
+    {
+      "id": "gates-registry",
+      "from": "gates",
+      "to": "registry",
+      "label": "过门入册",
+      "variant": "emphasis"
+    },
+    {
+      "id": "registry-book",
+      "from": "registry",
+      "to": "book",
+      "label": "贪心选族",
+      "variant": "default"
+    },
+    {
+      "id": "registry-incubate",
+      "from": "registry",
+      "to": "incubate",
+      "label": "孵化豁免通道",
+      "variant": "dashed"
+    },
+    {
+      "id": "eval-journal",
+      "from": "evaluate",
+      "to": "journal",
+      "label": "镜像 · 逃逸距离",
+      "variant": "dashed"
+    },
+    {
+      "id": "trail-nav",
+      "from": "trail",
+      "to": "navigation",
+      "label": "分箱 + 直方图",
+      "variant": "default"
+    },
+    {
+      "id": "nav-src",
+      "from": "navigation",
+      "to": "factor-src",
+      "label": "素材回流生成",
+      "variant": "dashed",
+      "route": "bottom-channel"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "主链",
+      "items": [
+        "数据面板经 FactorEnv 进入评估，试验按 (hash,horizon) 首见去重记账",
+        "失败试验同样入账——选择偏差发生在评估时刻，不在注册时刻",
+        "过门写入 registry，贪心选族构成强因子库供策略层消费"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "双轨定价",
+      "items": [
+        "null 校准与真实试验共用同一算子集指纹，扩算子强制重校准",
+        "墙的 E[max|X|] 用实测相关矩阵 CRN 直算，IC 轨与尾轨各记一本",
+        "试验去相关自动压低墙——引擎为多样性付费"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "回流闭环",
+      "items": [
+        "评估回传预期 vs 实测镜像与逃逸距离遥测",
+        "trail 分箱聚合为导航素材，回注生成上下文（纯名词零分数）",
+        "孵化通道是样本外复活证据的唯一豁免口"
+      ]
+    }
+  ]
+}

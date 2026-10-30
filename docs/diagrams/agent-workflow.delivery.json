@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "f3347875-84c0-4838-84e2-12827292eada",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\workflow-dsh-fm-20261030-1\\candidate.json",
+  "output": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\agent-workflow.html",
+  "specification": {
+    "sha256": "96753774962ba7743ead3f37f55fdb2cae45f74eddba849100f8289bab4b0d63",
+    "bytes": 13996
+  },
+  "artifact": {
+    "sha256": "45768882e3c07c472e0697e28923027cd073d9e0eb42578be23ecf17f0d1d8ef",
+    "bytes": 874088
+  }
+}

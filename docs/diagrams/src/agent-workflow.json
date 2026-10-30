@@ -1,0 +1,582 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "DSH 因子挖掘插件 · Agent 工作流程",
+    "subtitle": "会话拉起到终态的全部控制流 · 同格门已并注 · 证据基线 662dcfc8c",
+    "locale": "zh-CN",
+    "output": "docs/diagrams/agent-workflow.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Rtyyy233/dsh-factor-mining-plugin",
+      "provider": "github",
+      "revision": "662dcfc8c3ac7a9e5f4cd45257dfb129e3baaf5c"
+    },
+    "views": [
+      {
+        "id": "happy",
+        "label": "期望路径",
+        "focus": [
+          "roster-check",
+          "deliver",
+          "directive",
+          "preregister",
+          "evaluate-n",
+          "ordergate-n",
+          "wall-n",
+          "registry-n"
+        ],
+        "note": "名册放行→预注册→评估→门链→入册"
+      },
+      {
+        "id": "rejects",
+        "label": "拒绝与回退",
+        "focus": [
+          "reject",
+          "ordergate-n",
+          "receipt-n",
+          "ortho-n",
+          "selftest"
+        ],
+        "note": "各道门的拒收分支与修正回路"
+      },
+      {
+        "id": "perpetual",
+        "label": "永续循环",
+        "focus": [
+          "primitives-n",
+          "rotate",
+          "deadline",
+          "terminate"
+        ],
+        "note": "三原语驱动与仅有的两种终态"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "drive",
+      "label": "宿主驱动（TS 0.1.26）"
+    },
+    {
+      "id": "agent",
+      "label": "研究员 Agent"
+    },
+    {
+      "id": "engine",
+      "label": "引擎评估"
+    },
+    {
+      "id": "gate",
+      "label": "提交门链"
+    },
+    {
+      "id": "registry",
+      "label": "注册簿"
+    },
+    {
+      "id": "loop",
+      "label": "循环治理"
+    },
+    {
+      "id": "exception",
+      "label": "异常与终态",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "boot",
+      "label": "拉起",
+      "fromCol": 0,
+      "toCol": 0
+    },
+    {
+      "id": "prompt",
+      "label": "出题",
+      "fromCol": 1,
+      "toCol": 1
+    },
+    {
+      "id": "hypo",
+      "label": "灵感与机制",
+      "fromCol": 2,
+      "toCol": 2
+    },
+    {
+      "id": "prereg",
+      "label": "预注册",
+      "fromCol": 3,
+      "toCol": 3,
+      "variant": "security"
+    },
+    {
+      "id": "run",
+      "label": "构造与评估",
+      "fromCol": 4,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "cycle",
+      "label": "结算 · 门链 · 循环",
+      "fromCol": 5,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "roster-check",
+    "deliver",
+    "directive",
+    "inspiration",
+    "preregister",
+    "construct",
+    "evaluate-n",
+    "ordergate-n",
+    "wall-n",
+    "registry-n",
+    "primitives-n"
+  ],
+  "nodes": [
+    {
+      "id": "roster-check",
+      "lane": "drive",
+      "col": 0,
+      "type": "security",
+      "label": "矿工名册判定",
+      "sublabel": "在任者 / 在场抢占 / 自动入册",
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 35
+        }
+      ]
+    },
+    {
+      "id": "deliver",
+      "lane": "drive",
+      "col": 1,
+      "type": "backend",
+      "label": "三通道送达",
+      "sublabel": "async / directive / file 兜底",
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 9
+        }
+      ]
+    },
+    {
+      "id": "deadline",
+      "lane": "drive",
+      "col": 5,
+      "type": "security",
+      "label": "死线收官",
+      "sublabel": "wrap-up / restart-cancel 落盘",
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 78
+        }
+      ]
+    },
+    {
+      "id": "directive",
+      "lane": "agent",
+      "col": 1,
+      "type": "backend",
+      "label": "loop directive",
+      "sublabel": "引擎策略指令",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 4994
+        }
+      ]
+    },
+    {
+      "id": "inspiration",
+      "lane": "agent",
+      "col": 2,
+      "type": "backend",
+      "label": "灵感源三模式",
+      "sublabel": "literature / random / mechanism",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/collision.py",
+          "line": 35
+        }
+      ]
+    },
+    {
+      "id": "preregister",
+      "lane": "agent",
+      "col": 3,
+      "type": "security",
+      "label": "journal 预注册",
+      "sublabel": "预期 + 点名算子字段",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/journal.py",
+          "line": 293
+        }
+      ]
+    },
+    {
+      "id": "construct",
+      "lane": "agent",
+      "col": 4,
+      "type": "backend",
+      "label": "构造因子",
+      "sublabel": "推导 → def factor(env)",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 5980
+        }
+      ]
+    },
+    {
+      "id": "mirror-settle",
+      "lane": "agent",
+      "col": 5,
+      "type": "backend",
+      "label": "镜像结算",
+      "sublabel": "预期 vs 实测 · resolved/stale",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/journal.py",
+          "line": 482
+        }
+      ]
+    },
+    {
+      "id": "evaluate-n",
+      "lane": "engine",
+      "col": 4,
+      "type": "backend",
+      "label": "factor_evaluate",
+      "sublabel": "前视双置换 · IC/自测族 · 敏感性",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/causality.py",
+          "line": 18
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/evaluate.py",
+          "line": 796
+        }
+      ]
+    },
+    {
+      "id": "trail-n",
+      "lane": "engine",
+      "col": 5,
+      "type": "database",
+      "label": "trail 记账",
+      "sublabel": "首见去重 · fail 也入账",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "ordergate-n",
+      "lane": "gate",
+      "col": 4,
+      "type": "security",
+      "label": "B1 顺序门 + receipt",
+      "sublabel": "预注册对账 · 数字逐位核对",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/ordergate.py",
+          "line": 154
+        },
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6992
+        }
+      ]
+    },
+    {
+      "id": "wall-n",
+      "lane": "gate",
+      "col": 5,
+      "type": "backend",
+      "label": "deflation 墙 + 正交/新颖",
+      "sublabel": "G3 双轨 E[max|X|] · 相关过高拒",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/evaluate.py",
+          "line": 668
+        },
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6992
+        }
+      ]
+    },
+    {
+      "id": "registry-n",
+      "lane": "registry",
+      "col": 5,
+      "type": "database",
+      "label": "入册 / 烧名",
+      "sublabel": "accepted · 程序性拒绝",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "primitives-n",
+      "lane": "loop",
+      "col": 5,
+      "type": "backend",
+      "label": "三原语 + 换向",
+      "sublabel": "continue/expand/rescue · 超时/枯竭/让位",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/primitives.py",
+          "line": 15
+        },
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 4994
+        }
+      ]
+    },
+    {
+      "id": "drift",
+      "lane": "exception",
+      "col": 3,
+      "type": "security",
+      "label": "漂移红字",
+      "sublabel": "绕圈 / 草率收弧 / 家族产出",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/primitives.py",
+          "line": 15
+        }
+      ]
+    },
+    {
+      "id": "reject",
+      "lane": "exception",
+      "col": 4,
+      "type": "security",
+      "label": "程序性拒绝",
+      "sublabel": "事务性 · 烧名/不烧名分型",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6992
+        }
+      ]
+    },
+    {
+      "id": "terminate",
+      "lane": "exception",
+      "col": 5,
+      "type": "external",
+      "label": "终态",
+      "sublabel": "仅死线 + 用户指令",
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/primitives.py",
+          "line": 15
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "roster-deliver",
+      "from": "roster-check",
+      "to": "deliver",
+      "label": "在任者放行",
+      "variant": "emphasis"
+    },
+    {
+      "id": "deliver-directive",
+      "from": "deliver",
+      "to": "directive",
+      "label": "[引擎推进] 注入",
+      "role": "main",
+      "variant": "emphasis"
+    },
+    {
+      "id": "directive-inspiration",
+      "from": "directive",
+      "to": "inspiration",
+      "label": "配额轮转",
+      "role": "branch"
+    },
+    {
+      "id": "inspiration-prereg",
+      "from": "inspiration",
+      "to": "preregister",
+      "label": "机制假设",
+      "role": "main"
+    },
+    {
+      "id": "prereg-construct",
+      "from": "preregister",
+      "to": "construct",
+      "role": "main"
+    },
+    {
+      "id": "construct-evaluate",
+      "from": "construct",
+      "to": "evaluate-n",
+      "label": "首次评估",
+      "role": "main",
+      "variant": "emphasis"
+    },
+    {
+      "id": "evaluate-construct",
+      "from": "evaluate-n",
+      "to": "construct",
+      "label": "verdict fail / 自测不过回退",
+      "role": "error"
+    },
+    {
+      "id": "evaluate-trail",
+      "from": "evaluate-n",
+      "to": "trail-n",
+      "label": "verdict 皆记账",
+      "role": "main"
+    },
+    {
+      "id": "evaluate-mirror",
+      "from": "evaluate-n",
+      "to": "mirror-settle",
+      "label": "镜像回传",
+      "role": "main"
+    },
+    {
+      "id": "mirror-construct",
+      "from": "mirror-settle",
+      "to": "construct",
+      "label": "更新假设下一轮",
+      "role": "return"
+    },
+    {
+      "id": "evaluate-ordergate",
+      "from": "evaluate-n",
+      "to": "ordergate-n",
+      "label": "registry.submit",
+      "role": "main",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ordergate-reject",
+      "from": "ordergate-n",
+      "to": "reject",
+      "label": "违规 / 编造拒收",
+      "role": "error",
+      "variant": "security"
+    },
+    {
+      "id": "ordergate-wall",
+      "from": "ordergate-n",
+      "to": "wall-n",
+      "label": "G1/G2 权威重算",
+      "role": "main"
+    },
+    {
+      "id": "wall-reject",
+      "from": "wall-n",
+      "to": "reject",
+      "label": "过墙失败 / 高相关",
+      "role": "error",
+      "variant": "security"
+    },
+    {
+      "id": "wall-registry",
+      "from": "wall-n",
+      "to": "registry-n",
+      "label": "过门入册",
+      "role": "main",
+      "variant": "emphasis"
+    },
+    {
+      "id": "registry-primitives",
+      "from": "registry-n",
+      "to": "primitives-n",
+      "label": "入册事件",
+      "role": "main"
+    },
+    {
+      "id": "primitives-deliver",
+      "from": "primitives-n",
+      "to": "deliver",
+      "label": "三原语判定 → 下一轮注入",
+      "role": "return"
+    },
+    {
+      "id": "primitives-deadline",
+      "from": "primitives-n",
+      "to": "deadline",
+      "label": "死线到点",
+      "role": "branch",
+      "variant": "security"
+    },
+    {
+      "id": "primitives-terminate",
+      "from": "primitives-n",
+      "to": "terminate",
+      "label": "用户指令接管",
+      "role": "branch"
+    },
+    {
+      "id": "deadline-terminate",
+      "from": "deadline",
+      "to": "terminate",
+      "label": "收官落盘",
+      "role": "main"
+    },
+    {
+      "id": "reject-construct",
+      "from": "reject",
+      "to": "construct",
+      "label": "next_moves 修正",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "永续不变量",
+      "items": [
+        "循环没有自动终点——终态仅死线与用户指令",
+        "同债三推未结算 → 红字升级且继续推进（drift 泳道）",
+        "换向三支（超时/枯竭/让位）并入三原语节点的出边"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "门链顺序",
+      "items": [
+        "B1 顺序门在一切写入之前，影子记账按违规率自动切强制",
+        "receipt 编造 = 拒收；程序性拒绝分烧名/不烧名两型",
+        "G1 placebo 权威重算 m≥60；test 区一次性消费",
+        "各道拒绝经 next_moves 并入镜像结算的下一轮假设更新",
+        "B1 顺序门核对预注册时序与推导链对账（预注册证据由 journal 泳道就绪）"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "送达治理",
+      "items": [
+        "矿工名册每 root 一在任者；旁观会话拒注",
+        "用户一条真实消息 = 取消注入并重新接管",
+        "死线落盘持久化，宿主重启自动续跑"
+      ]
+    }
+  ]
+}

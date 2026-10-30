@@ -1247,3 +1247,74 @@ desktop package.json 依赖四包 pin：dsh-factor-mining 0.1.8、dsh-factor-min
 - 2026-09-29 13:19:30 死线收官注入（同死线，另一会话）：【d9e26716】行 2010/2014。
 - 2026-09-30 19:20:13 continue 注入（60 秒静默窗后 63 秒实发）：【金矿】行 46/50。
 - 2026-09-30 19:52:49 rotate 全幅文本（loop 区实发，注入未及发生——会话仍在同一回合内）：【金矿】行 324。
+
+
+## 附录 J 推导优先层响应取证（2026-10-30 实跑）
+
+取证方法：合成面板（60 标的×260 交易日）临时 stateRoot 全链实跑
+（config.save→data.load→null-calibration n=8→journal.append 预注册→
+factor.evaluate→registry.submit→state.trail_summary→journal.stats），
+响应逐字摘录。基线=主树源码（公开镜像 662dcfc8c 同字节）。
+
+### 卡 J-1 · registry.submit 响应新增字段 submission_order_gate（B1 顺序门，shadow 档）
+
+```json
+{"mode": "shadow", "exempt": false, "violation": null, "n": 1, "recent_rate": null, "switched": false, "diagnostic": false}
+```
+
+- 模型可见语义：mode=shadow 只记账不拒收；exempt=true 表示随机/碰撞出身豁免；
+  violation 非空时 shadow 档下仍放行但带违规明细（enforce 档同字段=事务性拒收）；
+  n/recent_rate 为切档判据计数；switched/diagnostic 为自动切档事件旗。
+- 与响应同级还有既有字段：accepted / admit_basis / tracks / dual_pass /
+  next_moves / receipt_verified（过门链未变）。
+
+### 卡 J-2 · evaluate 响应的 journal_mirror（预注册后自动附）
+
+首次评估（预注册前）响应**无** journal_mirror 键；预注册后同源码再评估，
+响应附镜像（机械并置，引擎不判定对错）：
+
+```json
+{"entries": [{"id": "H-1", "title": "量加权动量",
+  "expectation": "ts:2026-10-31T01:15:45 / 预期：方向+，半衰期约10日，换手中。推导用 ts 动量与量排名加权：cs_rank 作用于 volume，ts 动量取 close。",
+  "actual": {"ic_ir": -0.352025578761652, "verdict": "needs_review", "deflated_p": 0.08327010315212857,
+             "red_flags": ["deflated p=0.0833 > 0.05：1 次已试假设的多重检验校正下不显著（sr0=0.0896… vs |IC_IR|=0.3520…）——选择运气不可排除，不入册"]},
+  "registered_ts": "2026-10-31T01:15:45",
+  "task": "对账预期与实测,用 factor_journal_update 结算(resolved/stale)+写结论 note"}]}
+```
+
+同响应 deflated_train 附机制层影子计价（shadow_stratum）：
+
+```json
+{"p_mechanism": 0.0832…, "bar_sigma_mechanism": 0.7949…, "n_trials_mechanism": 1,
+ "pool_std": 0.1127…, "alpha_layer": 0.0253, "note": "影子口径(批次1):journal 预注册候选的机制层价——…"}
+```
+
+### 卡 J-3 · journal.append 首行约定回执
+
+```json
+{"appended": ["H-1"], "index": {"live_entries": 1, "counts": {"open": 0, "registered": 1,
+ "adjudicated": 0, "resolved": 0, "stale": 0, "active": 0, "retired": 0, "lesson": 0}},
+ "live_chars": 136, "cap_warn": false, "hint": null}
+```
+
+违反首行约定的请求被拒（逐字）："首行约定不符:条目必须以 `## <id> <status> <标题>`
+开头(如 `## H-07 open 被动调仓截面梯度`);id 字母数字开头,status ∈ ['registered',
+'lesson', 'open', 'active', '(迁移态)']。首个 `##` 行不匹配"。
+
+### 卡 J-4 · journal.stats（镜像/注册率遥测）
+
+```json
+{"exists": true, "counts": {"open": 0, "registered": 0, "adjudicated": 1, "resolved": 0,
+ "stale": 0, "active": 0, "retired": 0, "lesson": 0},
+ "stats": {"evals": 1, "mirrored": 1, "appends": 1, "distills": 0},
+ "registration_rate": 1.0, "live_chars": 292, "live_char_cap": 4000}
+```
+
+### 卡 J-5 · state.trail_summary 名词化后形态（A3 修复取证）
+
+响应含 mining/termination 状态块（round、继续/换向理由、门参数、导航开关），
+评估数字（ic_ir/verdict/spread_ir/placebo_z）与 verdict_counts 计数已从投影撤除；
+verdict 明细指路 stateRoot/trail_engine.json 人读。导航素材（覆盖地图/采尽档/
+禁忌表）在 navigation_materials 开关下经 trail_summary 素材段与 loop directive
+尾段进入上下文——本轮合成 stateRoot 试验数过少，素材段为空名单（覆盖图尚无
+分箱），实战形态留首轮挖掘补逐字样本。

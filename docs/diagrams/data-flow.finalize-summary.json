@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "dataflow",
+  "quality": "showcase",
+  "specification": {
+    "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\dataflow-dsh-fm-20261030-1\\candidate.json",
+    "sha256": "6adda806c5296235796daacfe2576010ec290b517d797c3f8968b158d992faaa",
+    "bytes": 11839
+  },
+  "artifact": {
+    "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\data-flow.html",
+    "sha256": "c9584dcdc1f7a3f8c6e37e36eeb7c360dc71420ba34b963dbc41e2b096b072ef",
+    "bytes": 863352
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\data-flow.finalize.json",
+    "summaryReceipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\data-flow.finalize-summary.json",
+    "browserCheckReceipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\data-flow.browser-check.json"
+  },
+  "visualReview": "not-requested",
+  "durationMs": 3873,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  },
+  "visualReviewRecommendation": {
+    "action": "inspect-route-readability",
+    "signals": {
+      "resolvedCrossovers": 1,
+      "routesOverSuggestedBends": 3,
+      "routesOverSuggestedStretch": 2
+    },
+    "reason": "Automated gates passed, but crossings or detours still need perceptual review before claiming visual quality.",
+    "affectedRoutes": {
+      "crossings": [
+        {
+          "left": {
+            "id": "env-eval",
+            "from": "env",
+            "to": "evaluate",
+            "label": "FactorEnv",
+            "collectionIndex": 4,
+            "artifactIndex": 5
+          },
+          "right": {
+            "id": "src-causality",
+            "from": "factor-src",
+            "to": "causality",
+            "label": "worker 沙箱执行",
+            "collectionIndex": 5,
+            "artifactIndex": 6
+          },
+          "point": [
+            414,
+            271
+          ]
+        }
+      ],
+      "detours": [
+        {
+          "relationship": {
+            "id": "journal-eval",
+            "from": "journal",
+            "to": "evaluate",
+            "label": "预注册 · 时序证据",
+            "collectionIndex": 7,
+            "artifactIndex": 8
+          },
+          "bends": 4,
+          "stretch": 1.358
+        },
+        {
+          "relationship": {
+            "id": "eval-trail",
+            "from": "evaluate",
+            "to": "trail",
+            "label": "首见去重记账",
+            "collectionIndex": 8,
+            "artifactIndex": 9
+          },
+          "bends": 2,
+          "stretch": 2.529,
+          "directCorridorBlockers": [
+            {
+              "id": "fingerprints",
+              "label": "sketch + MinHash",
+              "box": [
+                474,
+                470,
+                112,
+                58
+              ]
+            }
+          ]
+        },
+        {
+          "relationship": {
+            "id": "eval-journal",
+            "from": "evaluate",
+            "to": "journal",
+            "label": "镜像 · 逃逸距离",
+            "collectionIndex": 17,
+            "artifactIndex": 18
+          },
+          "bends": 4,
+          "stretch": 1.339
+        },
+        {
+          "relationship": {
+            "id": "trail-nav",
+            "from": "trail",
+            "to": "navigation",
+            "label": "分箱 + 直方图",
+            "collectionIndex": 18,
+            "artifactIndex": 19
+          },
+          "bends": 4,
+          "stretch": 1.276
+        }
+      ],
+      "truncated": false
+    },
+    "repair": "Advisory only: this mode places or routes these relationships itself. Report them; do not remove relationships or meaning to reduce crossings."
+  }
+}

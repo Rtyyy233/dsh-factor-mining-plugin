@@ -1,0 +1,925 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "DSH 因子挖掘插件 · 系统架构",
+    "subtitle": "Python 纪律引擎 + TS 注入层 · v0.1.26 · 证据基线 662dcfc8c",
+    "locale": "zh-CN",
+    "output": "docs/diagrams/system-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Rtyyy233/dsh-factor-mining-plugin",
+      "provider": "github",
+      "revision": "662dcfc8c3ac7a9e5f4cd45257dfb129e3baaf5c"
+    },
+    "views": [
+      {
+        "id": "host",
+        "label": "宿主与插件层",
+        "focus": [
+          "dsh-host",
+          "ts-bundle",
+          "preset",
+          "drive",
+          "ts-tools",
+          "roster"
+        ],
+        "note": "注入器经矿工名册决定向谁注入；TS 工具层经 stdio 调 Python 引擎"
+      },
+      {
+        "id": "engine",
+        "label": "引擎模块域",
+        "focus": [
+          "bridge",
+          "eval",
+          "gen",
+          "wall",
+          "loop",
+          "journal",
+          "nav",
+          "inspire",
+          "state",
+          "adapters",
+          "util",
+          "worker"
+        ],
+        "note": "bridge 分发全部方法；十个域覆盖评估/生成/统计门/循环/日志/治理/灵感/状态"
+      },
+      {
+        "id": "state",
+        "label": "状态与数据面",
+        "focus": [
+          "f-trail",
+          "f-reg",
+          "f-gate",
+          "f-jrn",
+          "f-land",
+          "f-cache",
+          "f-seeds",
+          "f-state",
+          "panel",
+          "minute"
+        ],
+        "note": "stateRoot 全部为用户数据不入仓库；数据面板与分钟库经适配器进入引擎"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户",
+      "sublabel": "拍板启动 · 死线 · 接管",
+      "pos": [
+        30,
+        58
+      ],
+      "size": [
+        110,
+        56
+      ]
+    },
+    {
+      "id": "dsh-host",
+      "type": "frontend",
+      "label": "DSH 宿主",
+      "sublabel": "桌面 / dshweb 双 profile",
+      "pos": [
+        210,
+        42
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 44
+        }
+      ]
+    },
+    {
+      "id": "ts-bundle",
+      "type": "cloud",
+      "label": "bundle",
+      "sublabel": "四包挂载 profile",
+      "pos": [
+        420,
+        42
+      ],
+      "size": [
+        130,
+        56
+      ],
+      "sources": [
+        {
+          "path": "preset/factor-mining/preset.yml",
+          "line": 1
+        }
+      ]
+    },
+    {
+      "id": "preset",
+      "type": "frontend",
+      "label": "preset + SKILL.md",
+      "sublabel": "行为纪律 · 分层自主制",
+      "pos": [
+        600,
+        42
+      ],
+      "size": [
+        175,
+        64
+      ],
+      "sources": [
+        {
+          "path": "preset/factor-mining/skill/factor-mining/SKILL.md",
+          "line": 33
+        }
+      ]
+    },
+    {
+      "id": "drive",
+      "type": "backend",
+      "label": "drive 注入器",
+      "sublabel": "0.1.26 矿工门 · 死线 · 卡死恢复",
+      "pos": [
+        210,
+        160
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 9
+        },
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 35
+        }
+      ]
+    },
+    {
+      "id": "ts-tools",
+      "type": "backend",
+      "label": "TS 工具层",
+      "sublabel": "tool-factor-mining + fm-python",
+      "tag": "factor_* 注册",
+      "pos": [
+        210,
+        236
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/index.ts",
+          "line": 610
+        }
+      ]
+    },
+    {
+      "id": "roster",
+      "type": "database",
+      "label": "矿工名册",
+      "sublabel": "~/.dsh/factor-drive-state.json",
+      "pos": [
+        718,
+        160
+      ],
+      "size": [
+        195,
+        60
+      ],
+      "sources": [
+        {
+          "path": "ts/tool-factor-mining/src/drive.ts",
+          "line": 39
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "bridge.py",
+      "sublabel": "JSON-RPC 分发 · 护栏执行点",
+      "tag": "80+ 方法",
+      "pos": [
+        250,
+        310
+      ],
+      "size": [
+        160,
+        872
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 1787
+        },
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6992
+        }
+      ]
+    },
+    {
+      "id": "eval",
+      "type": "backend",
+      "label": "评估域 factor/",
+      "sublabel": "evaluate · causality · audit · env 三区",
+      "pos": [
+        480,
+        310
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/evaluate.py",
+          "line": 796
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/causality.py",
+          "line": 18
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/env.py",
+          "line": 82
+        }
+      ]
+    },
+    {
+      "id": "gen",
+      "type": "backend",
+      "label": "生成域",
+      "sublabel": "random_gen · ops 61 算子 · 模板/健康门",
+      "pos": [
+        480,
+        388
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/random_gen.py",
+          "line": 264
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/ops.py",
+          "line": 399
+        }
+      ]
+    },
+    {
+      "id": "wall",
+      "type": "backend",
+      "label": "多重检验域",
+      "sublabel": "discipline · tailgate · tailwall v2",
+      "pos": [
+        480,
+        466
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/discipline.py",
+          "line": 68
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/tailwall.py",
+          "line": 108
+        },
+        {
+          "path": "python/src/dsh_factor_mining/factor/tailgate.py",
+          "line": 51
+        }
+      ]
+    },
+    {
+      "id": "loop",
+      "type": "backend",
+      "label": "循环域",
+      "sublabel": "primitives 三原语 · scheduler 边际价值",
+      "pos": [
+        480,
+        544
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/primitives.py",
+          "line": 15
+        },
+        {
+          "path": "python/src/dsh_factor_mining/scheduler.py",
+          "line": 320
+        }
+      ]
+    },
+    {
+      "id": "journal",
+      "type": "backend",
+      "label": "推理日志 journal",
+      "sublabel": "预注册 · 镜像 · 蒸馏 · 继承",
+      "pos": [
+        480,
+        622
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/journal.py",
+          "line": 482
+        },
+        {
+          "path": "python/src/dsh_factor_mining/journal.py",
+          "line": 293
+        }
+      ]
+    },
+    {
+      "id": "inspire",
+      "type": "backend",
+      "label": "灵感域",
+      "sublabel": "collision · incubate · standby · arxiv · library",
+      "pos": [
+        480,
+        778
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 8030
+        },
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 8114
+        },
+        {
+          "path": "python/src/dsh_factor_mining/book_ranks.py",
+          "line": 23
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "type": "backend",
+      "label": "状态域 state.py",
+      "sublabel": "原子写 · 文件锁 · MINING_CONFIG 开关",
+      "pos": [
+        480,
+        850
+      ],
+      "size": [
+        230,
+        88
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 33
+        },
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "adapters",
+      "type": "backend",
+      "label": "数据适配 data/",
+      "sublabel": "四 profile · 分钟特征长表",
+      "pos": [
+        480,
+        960
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/data/adapters.py",
+          "line": 86
+        },
+        {
+          "path": "python/src/dsh_factor_mining/data/adapters.py",
+          "line": 552
+        }
+      ]
+    },
+    {
+      "id": "util",
+      "type": "backend",
+      "label": "支撑库",
+      "sublabel": "filelock · lane · procinfo · smoke · rewrite · derivation",
+      "pos": [
+        480,
+        1040
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/lane.py",
+          "line": 20
+        }
+      ]
+    },
+    {
+      "id": "nav",
+      "type": "security",
+      "label": "治理域",
+      "sublabel": "navigation · ordergate · divergence",
+      "pos": [
+        480,
+        1118
+      ],
+      "size": [
+        230,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/navigation.py",
+          "line": 214
+        },
+        {
+          "path": "python/src/dsh_factor_mining/ordergate.py",
+          "line": 154
+        },
+        {
+          "path": "python/src/dsh_factor_mining/divergence.py",
+          "line": 103
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "worker.py",
+      "sublabel": "子进程隔离执行因子代码",
+      "pos": [
+        250,
+        1240
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/worker.py",
+          "line": 315
+        },
+        {
+          "path": "python/src/dsh_factor_mining/worker.py",
+          "line": 6
+        }
+      ]
+    },
+    {
+      "id": "panel",
+      "type": "database",
+      "label": "数据面板",
+      "sublabel": "parquet/csv · long/wide · dev/sel/test",
+      "pos": [
+        718,
+        310
+      ],
+      "size": [
+        200,
+        64
+      ]
+    },
+    {
+      "id": "minute",
+      "type": "database",
+      "label": "~/.a_share_minute",
+      "sublabel": "分钟线库 · 特征长表",
+      "pos": [
+        718,
+        390
+      ],
+      "size": [
+        200,
+        64
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/data/adapters.py",
+          "line": 552
+        }
+      ]
+    },
+    {
+      "id": "f-trail",
+      "type": "database",
+      "label": "trail_engine.json",
+      "sublabel": "试验台账 · 首见去重",
+      "pos": [
+        480,
+        1306
+      ],
+      "size": [
+        205,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "f-reg",
+      "type": "database",
+      "label": "registry + ledger",
+      "sublabel": "在册因子 + 注册台账",
+      "pos": [
+        700,
+        1240
+      ],
+      "size": [
+        200,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "f-gate",
+      "type": "database",
+      "label": "gate_audit.jsonl",
+      "sublabel": "切档 · 启停审计",
+      "pos": [
+        700,
+        1306
+      ],
+      "size": [
+        200,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/ordergate.py",
+          "line": 14
+        }
+      ]
+    },
+    {
+      "id": "f-jrn",
+      "type": "database",
+      "label": "journal/",
+      "sublabel": "live/arcs/raw 三层",
+      "pos": [
+        480,
+        1372
+      ],
+      "size": [
+        205,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/journal.py",
+          "line": 482
+        }
+      ]
+    },
+    {
+      "id": "f-land",
+      "type": "database",
+      "label": "null landscape",
+      "sublabel": "σbar 地形 · 算子集指纹",
+      "pos": [
+        700,
+        1372
+      ],
+      "size": [
+        200,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/random_gen.py",
+          "line": 8
+        }
+      ]
+    },
+    {
+      "id": "f-cache",
+      "type": "database",
+      "label": "评估缓存",
+      "sublabel": "键 = source+指纹",
+      "pos": [
+        700,
+        1438
+      ],
+      "size": [
+        200,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/factor/causality.py",
+          "line": 18
+        }
+      ]
+    },
+    {
+      "id": "f-seeds",
+      "type": "database",
+      "label": "explore_seeds.json",
+      "sublabel": "novelty 选种史",
+      "pos": [
+        480,
+        1438
+      ],
+      "size": [
+        205,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/bridge.py",
+          "line": 6121
+        }
+      ]
+    },
+    {
+      "id": "f-state",
+      "type": "database",
+      "label": "mining_state.json",
+      "sublabel": "开关 · 遥测 · 切档",
+      "pos": [
+        480,
+        1240
+      ],
+      "size": [
+        205,
+        56
+      ],
+      "sources": [
+        {
+          "path": "python/src/dsh_factor_mining/state.py",
+          "line": 33
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "DSH 宿主（桌面 / dshweb 双 profile）",
+      "wraps": [
+        "dsh-host",
+        "ts-bundle",
+        "preset",
+        "drive",
+        "ts-tools"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Python 引擎子进程（stdio JSON-RPC）",
+      "wraps": [
+        "bridge",
+        "eval",
+        "gen",
+        "wall",
+        "loop",
+        "journal",
+        "inspire",
+        "state",
+        "adapters",
+        "util",
+        "nav"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "因子执行沙箱（孙进程）",
+      "wraps": [
+        "worker"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "数据面",
+      "wraps": [
+        "panel",
+        "minute"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "stateRoot 状态层（用户数据 · 不入仓库）",
+      "wraps": [
+        "f-trail",
+        "f-reg",
+        "f-gate",
+        "f-jrn",
+        "f-land",
+        "f-cache",
+        "f-seeds",
+        "f-state"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "user-host",
+      "from": "user",
+      "to": "dsh-host",
+      "label": "对话 / 指令"
+    },
+    {
+      "id": "bundle-host",
+      "from": "ts-bundle",
+      "to": "dsh-host",
+      "label": "挂载四包",
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "host-drive",
+      "from": "dsh-host",
+      "to": "drive",
+      "label": "轮末事件",
+      "labelAt": [
+        230,
+        133
+      ]
+    },
+    {
+      "id": "drive-host",
+      "from": "drive",
+      "to": "dsh-host",
+      "label": "注入 [引擎推进] 指令",
+      "variant": "dashed"
+    },
+    {
+      "id": "drive-roster",
+      "from": "drive",
+      "to": "roster",
+      "label": "在任者读写 / 12h 续活 / 在场抢占"
+    },
+    {
+      "id": "ts-bridge",
+      "from": "ts-tools",
+      "to": "bridge",
+      "label": "JSON-RPC over stdio",
+      "variant": "emphasis",
+      "labelAt": [
+        140,
+        330
+      ]
+    },
+    {
+      "id": "bridge-eval",
+      "from": "bridge",
+      "to": "eval"
+    },
+    {
+      "id": "bridge-gen",
+      "from": "bridge",
+      "to": "gen"
+    },
+    {
+      "id": "bridge-wall",
+      "from": "bridge",
+      "to": "wall"
+    },
+    {
+      "id": "bridge-loop",
+      "from": "bridge",
+      "to": "loop"
+    },
+    {
+      "id": "bridge-journal",
+      "from": "bridge",
+      "to": "journal"
+    },
+    {
+      "id": "bridge-inspire",
+      "from": "bridge",
+      "to": "inspire"
+    },
+    {
+      "id": "bridge-state",
+      "from": "bridge",
+      "to": "state"
+    },
+    {
+      "id": "bridge-adapters",
+      "from": "bridge",
+      "to": "adapters"
+    },
+    {
+      "id": "bridge-util",
+      "from": "bridge",
+      "to": "util"
+    },
+    {
+      "id": "bridge-nav",
+      "from": "bridge",
+      "to": "nav"
+    },
+    {
+      "id": "bridge-worker",
+      "from": "bridge",
+      "to": "worker",
+      "label": "spawn 子进程执行因子"
+    },
+    {
+      "id": "state-file",
+      "from": "state",
+      "to": "f-state",
+      "label": "write_json 原子写（trail/registry/seeds 同通道）",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          735,
+          894
+        ],
+        [
+          735,
+          1200
+        ],
+        [
+          582.5,
+          1200
+        ],
+        [
+          582.5,
+          1240
+        ]
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "评估与统计门",
+      "items": [
+        "deflation 墙随试验数抬升；试验相关矩阵逐对实测（sketch 尾对齐）",
+        "正交门 |ρ̄|≥0.80 拒收 / 0.60-0.80 强制标注",
+        "G1 placebo 权威重算 m≥60；test 区一次性消费后锁死"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "循环与送达",
+      "items": [
+        "永续循环：终态只有死线与用户指令",
+        "三原语 continue / expand / rescue（影子态）+ 漂移红字告警",
+        "drive 注入器三通道送达；矿工名册每 root 一在任者",
+        "preset + SKILL.md 随 bundle 装配宿主，定行为纪律与分层自主制"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "状态与数据",
+      "items": [
+        "stateRoot 全部为用户数据不入仓库；write_json 原子写 + 写锁",
+        "trail/registry/seeds 由 state.py 写；journal/ 由 journal.py 写；gate_audit 由 ordergate 写；null landscape 由 null 校准写",
+        "算子集指纹绑定 null 地形——扩算子强制重校准",
+        "data.load 环境指纹 = 数据内容+口径+算子集 hash；四 profile cn_{stock,etf}_{daily,minute} 经 adapters 进引擎（panel/minute 见数据面）"
+      ]
+    }
+  ]
+}
