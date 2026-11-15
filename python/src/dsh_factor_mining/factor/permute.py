@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .env import FactorEnv
+from .env import FactorEnv, TsEnv
 
 
 def ic_ir_statistic(F: np.ndarray, fwd: np.ndarray, pit: np.ndarray,
@@ -53,6 +53,59 @@ def ic_ir_statistic(F: np.ndarray, fwd: np.ndarray, pit: np.ndarray,
         return None
     std = ic.std(ddof=1)
     return float(ic.mean() / std) if std > 0 else None
+
+
+def ts_ir_statistic_from_fwd(env: TsEnv):
+    """ts 线（factor-mining-futures）day-perm 缺省统计量工厂。
+
+    返回闭包 (F, fwd_p, pit, step) -> float | None——签名与面板
+    ic_ir_statistic 一致（同一台置换机器复用），统计量与
+    evaluate_ts.ts_product_series 同口径：[0, dev_end) 窗内按 step 采样，
+    行 = finite(F) & finite(fwd_p) & 可交易 & 非停板前向窗
+    （limit_hit_bars 的 cumsum 判 (t, t+h]），z(F) 窗内标准化，
+    IR = z×fwd_p 序列 mean/std；<2 观测 / 零离散 → None。"""
+    import pandas as pd
+
+    from .evaluate_ts import limit_hit_bars
+    h = int(env.calibration.horizon)
+    end = env.calibration.dev_end
+    hit_any = np.cumsum(limit_hit_bars(env), dtype=np.int64)
+    if end is None:
+        hi = int(env.T)
+    else:
+        hi = int(np.searchsorted(pd.DatetimeIndex(env.dates),
+                                 pd.Timestamp(end), side="right"))
+
+    def _stat(F, fwd_p, pit, step) -> float | None:
+        F = np.asarray(F, dtype=np.float64)
+        st = max(int(step), 1)
+        fs: list[float] = []
+        vs: list[float] = []
+        for t in range(0, hi, st):
+            t = int(t)
+            if t + h >= env.T:
+                break
+            if not (bool(pit[t]) and np.isfinite(F[t])
+                    and np.isfinite(fwd_p[t])):
+                continue
+            if int(hit_any[t + h] - hit_any[t]) > 0:   # G-limit 剔除
+                continue
+            fs.append(float(F[t]))
+            vs.append(float(fwd_p[t]))
+        if len(fs) < 2:
+            return None
+        fa = np.asarray(fs)
+        sd = float(np.std(fa))
+        if not (sd > 0):
+            return None
+        z = (fa - float(np.mean(fa))) / sd
+        prod = z * np.asarray(vs)
+        s = float(np.std(prod, ddof=1))
+        if not (s > 0):
+            return None
+        return float(np.mean(prod) / s)
+
+    return _stat
 
 
 def day_permutation_test(fn, env: FactorEnv, m: int = 200, base_seed: int = 0,
@@ -73,7 +126,15 @@ def day_permutation_test(fn, env: FactorEnv, m: int = 200, base_seed: int = 0,
 
     from .evaluate import _forward_returns, _pit_mask
 
-    stat = statistic or ic_ir_statistic
+    if isinstance(env, TsEnv):
+        # ts 线分支（factor-mining-futures）：fwd/pit 换 (T,) 版，缺省统计量
+        # 换 ts 版 IR——置换机制/预算自适应/输出 schema 原样复用
+        # （fwd[perm] 对 (T,) 同样成立）。显式 statistic 仍优先。
+        from .evaluate_ts import ts_forward_returns, ts_pit_mask
+        _forward_returns, _pit_mask = ts_forward_returns, ts_pit_mask
+        stat = statistic or ts_ir_statistic_from_fwd(env)
+    else:
+        stat = statistic or ic_ir_statistic
     F = fn(env)
     if not isinstance(F, np.ndarray):
         F = np.asarray(F, dtype=np.float64)

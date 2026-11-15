@@ -1,4 +1,4 @@
-# 因子挖掘 Harness 架构全量文档 · 总览卷（2026-09-30；2026-10-03 修订：永续化＋三原语＋死线；2026-10-30 修订：推导优先＋导航层＋矿工门）
+# 因子挖掘 Harness 架构全量文档 · 总览卷（2026-09-30；2026-10-03 修订：永续化＋三原语＋死线；2026-10-30 修订：推导优先＋导航层＋矿工门；2026-11-05 修订：多段隔离验证管线·物理隔离版）
 
 > 规格=HARNESS_ARCH_SAMPLE v5（判定细节到"查哪些数据、怎么算、哪些边界"，
 > 语言全白话、不引代码位置）。**分篇制**：每个模块一篇（docs\arch\，每篇
@@ -8,6 +8,35 @@
 > 检验 4＋调度与台账 2＋治理与送达 7），其余篇目规划中待补（目录内标注）。
 
 ## 〇、修订摘要
+
+### 2026-11-05 修订（多段隔离验证管线·物理隔离版上线）
+
+- **selection/test 两 stage 工具面整体下线**：模型调用一律固定文案拒收（"样本外评估已内部化，提交后由引擎验证，无可提供数字"）；OOS 凭据前置退役（凭据账本语义随工具面消亡）；test_lock 一次性锁失去消费通道（test 烧毁告警一并退役）。walk_forward 钳制同步收紧：t1≤sel_end 改为 t1≤dev_end（dev 内滚动）。
+- **样本外评估内部化为段验证（SPRT）**：提交先过快检（强度墙固定 z：ETF 2.65/STK 1.60＋M8 算子超标给一次简化重写机会＋M3 最短回测长度）与既有四门（噪声世界/day-perm/平坦性/spread+placebo），引擎随后在冻结样本外分段数据上做证据累积验证：T_acc=2.6（A4 回放校准冻结）、边界随机化带 ±0.3（Thresholdout 配方，确定性种子）、灾难熔断（对齐 IR<−0.5×|dev_IR| 立即拒）、早通过省段；模型只收二值判定（通过/未通过），零数字零段数零原因。tail 轨提交本版不做段验证（挂账二期）。
+- **雕刻门与 M13 双轨一致门整体退役**：不拦截、不路由、不产生判定/门事件；底层统计（逐年一致性、双轨读数）留诊断对象作描述字段。
+- **段定义先验冻结**：segments.json＋content_sha 完整性校验（篡改即停用 fail-closed）；ETF 两段（2022-01-01→2024-08-31／2024-09-01→2026-09-21，变点检测 K=1 多特征联合高斯似然扫描产出切点 2024-09，烧毁基线段1=103）；STK 单段（2023-01-01→2026-09-21，前向≥2 年自动重切升级条款）。
+- **族级判定预算**：每线每自然周每构造族（AST 调用名多重集哈希）60 次判定额度，超额事务性拒收（固定文案零数字）；账本 stateRoot/verify_budget.json，全数字判定记录 stateRoot/verify_ledger.jsonl（人读）。
+- **入册分层**：registry 条目新增 tier 字段（core/observation——observation=通过但存在对齐 IR<0.25×|dev| 弱段，或存量册重判未过新标准者入观察名单）；McLean-Pontiff 衰减带（26-58%）写入条目做册内跟踪判据；册内跟踪/季度复审沿用 factor_book_audit（模型面响应收敛为完成状态＋报表文件名）。
+- **dispatch 出口 OOS 红action**：一切模型面响应剥除样本外语义键（verify/tier/decay_band/seg_evals/cumulative_t 等）。
+- **AST IO 黑名单**：因子源码出现文件/网络/动态执行符号（open/read_*/write_*/Path/socket/urllib/requests/subprocess/os.system/pickle/__import__ 等）→评估拒收（固定文案）；worker 子进程剥离网络环境变量；完整沙箱挂账二期。
+- **文件系统隔离（九通道之 B6）**：宿主 dsh-fs-sandbox 只限写不限读→preset-mining 移除 shell/fs 工具通道（tool-bash/tool-pwsh/tool-fs/tool-fs-search disabled，重启激活）＋法证非 dev 数据迁出工作区至 C:\Users\RTyyyy\dsh-forensics-vault。
+- **回滚开关**：mining_state.verify_mode = internal_sprt（默认）| off（跳过段验证按快检结果，紧急止血；不得回滚到旧 selection 工具面）。
+
+### 2026-11-01 修订（固定墙切换＋防过拟合硬门上线）
+
+- **固定墙时代（PLAN-fixed-wall-rollout-2026-11-01 全量交付）**：增长墙退役——入册强度线改为
+  固定主值（ETF z2.65 定稿/个股 z1.60 暂定季度重推导，成本模型 C_leak:C_kill=2:1+bootstrap 带
+  +预声明取点推导，法证目录 WALL_DERIVATION_V2.md）＋雕刻警报辅助门（2026-11-05 退役；原逐年符号一致性二项精确
+  检验）；配置位=null_landscape.json（wall_mode/fixed_bar_ic/fixed_bar_tail），回滚=改配置+新桥
+  进程零代码。deflated p 降级为警告（计算与落盘不变，拒收语义退役）。
+- **入册硬前置两件（2026-11-05 均退役）**：OOS 凭据账本（oos_receipts.jsonl——入口=selection 评估自动开票）＋
+  selection α 预算（每数据带 60 次硬顶封区，Bonferroni 0.05/60）——凭据随
+  selection 工具面下线退役，α 预算由族级判定预算接任。
+- **TOP3 硬门入编（法证回放记分卡）**：M13 双轨一致门（2026-11-05 退役；原过度一致拒，阈 0.2502）/M8 构造复杂度门
+  （AST≥12；2026-11-05 起超标给一次简化重写机会）/M3 最短回测长度门（Bailey 比值>1 拒，仅 IC 轨；现为段验证快检一环）。
+- **新审计与运维面**：gate_events.jsonl 统一门事件审计（每决策一行）；factor_book_audit 册子
+  滚动审计（前向带复算产降级建议，不自动除名）；TS 0.1.27（factor_book_audit 工具+墙语义
+  描述）＋factor-mining-python 0.1.6。
 
 ### 2026-10-30 修订（推导优先＋导航层＋矿工门＋镜像同步）
 
@@ -31,7 +60,7 @@
 - **永续不变量**：除死线与用户指令外**无任何终态**。loop.state 值域钉死
   {running, must_rotate}（may_stop 退役）；finalize/fail_streak 停点删除；
   test 一次性锁保留为工具级硬锁，烧毁后走状态页告警（建议数据集轮换）
-  而非停推进；注入器「连续简单注入达上限让位真人」分支删除（连注不限，
+  而非停推进（锁与烧毁告警已于 2026-11-05 随 selection/test 工具面退役）；注入器「连续简单注入达上限让位真人」分支删除（连注不限，
   防复读护栏移交引擎侧）。
 - **loop 三原语（影子态）**：指令选择新增判定层——continue（四类欠账
   任一存在即推：结算/派发/轮询/记录，最旧者优先）、expand（派生图前沿×
@@ -83,11 +112,12 @@
 | 篇 | 一句话 | 状态 |
 |---|---|---|
 | [evaluation-pipeline](arch/evaluation-pipeline.md) | 评估管线：异步槽位／在途去重／双端超时／烟测门／评估缓存 | 已成文 |
-| [multiplicity-wall](arch/multiplicity-wall.md) | 多重检验墙与 deflation：现价重算／null 地形／单调包络／测试区一次性锁 | 已成文 |
+| [multiplicity-wall](arch/multiplicity-wall.md) | 多重检验墙与 deflation：现价重算／null 地形／单调包络／固定墙／内部段验证记账（SPRT 二值判定＋族级判定预算；selection 工具面与 test 一次性锁已于 2026-11-05 退役） | 已成文（2026-11-05 修订已同步） |
 | [orthogonality-gate](arch/orthogonality-gate.md) | 正交门：与在册账本的逐日秩相关（0.80/0.60 软门）＋探索期双池对表 | 已成文 |
 | [novelty-defense](arch/novelty-defense.md) | novelty 双防线：选种去相关＋构造查重＋同构拦截＋宣言对账 | 已成文 |
 | 烟测门（独立深化篇） | 小面板实测外推／缩放指数三档判定／自动重写等价换用 | 规划中待补（现行机制在评估管线篇第五节） |
 | 随机空间与算子集 | 随机生成器的算子集／模板占比／指纹与 null 校准同源 | 规划中待补 |
+| 多段隔离验证管线 | 段验证 SPRT（快检→四门→冻结段证据累积→二值判定）／族级判定预算／AST IO 黑名单／dispatch OOS 红action／registry tier 分层／段定义先验冻结 | 规划中待补（2026-11-05 上线；机制叙述暂见总览 §三门禁总表与 multiplicity-wall 第九节） |
 
 ### 组二 · 深化与分叉
 
@@ -132,7 +162,7 @@
 |---|---|---|
 | 数据管线（两库语义） | 两套数据面板的语义差异与口径管理 | 规划中待补 |
 | 策略层 harness | 消费已入册因子做组合策略的姊妹 harness | 规划中待补 |
-| test 锁与方案 B | 测试区一次性锁的深层机制与分层计价影子模式 | 规划中待补 |
+| test 锁与方案 B | 测试区一次性锁的深层机制与分层计价影子模式（锁已于 2026-11-05 失去消费通道） | 规划中待补（机制已退役，转历史档） |
 | 效率编译层与 mmap 缓存 | 自动编译加速、强模型重写、内存映射数据缓存 | 规划中待补 |
 | 桥与 worker 进程模型 | 单线程桥／子进程隔离／进程纪律（严禁杀进程） | 规划中待补 |
 
@@ -171,10 +201,12 @@
     （[derivation-first](arch/derivation-first.md)）。
 11. **提交门链**——噪声世界（|z|≥3 拒）、展平检验（cliff 签名拒）、
     价差噪声门（尾部轨，不可判定即中止）、日排列零（报告）、回执
-    校验（编造数字拒）、铁律（同源换名/同名重投拒）
+    校验（编造数字拒）、铁律（同源换名/同名重投拒）；通过后进入
+    引擎内部段验证（SPRT，二值判定，见第 16 步）
     （[multiplicity-wall](arch/multiplicity-wall.md)）。
 12. **正交门对表**——与在册账本的开发区逐日秩相关：软门标注＋提示，
-    冗余争议由测试区终裁（[orthogonality-gate](arch/orthogonality-gate.md)）。
+    冗余争议由测试区终裁（test 终裁通道已于 2026-11-05 随工具面退役）
+    （[orthogonality-gate](arch/orthogonality-gate.md)）。
 13. **入册**——registry 落账、正交基线追加；入册数跨三的倍数触发
     一次即消费的里程碑审计（[orthogonality-gate]
     (arch/orthogonality-gate.md)＋[mining-never-stops]
@@ -184,10 +216,12 @@
     （[scheduler](arch/scheduler.md)）。
 15. **候补与孵化**——开发段优异未过线的存量进候补视图；复活通道
     （分层重定价/规则化组合/前向孵化）由引擎机械触发，无申诉权。
-16. **终局 test 消费（永续语义）**——声明制消费 test 区（一次性锁，
-    护栏兜底）；幸存者入册终裁。test 烧毁**不是停机点**：状态页告警
-    「建议数据集轮换」，开发/选择区照常推进——永续不变量：除死线与
-    用户指令外无任何终态（[multiplicity-wall](arch/multiplicity-wall.md)＋
+16. **终局验证（2026-11-05 起内部化）**——selection/test 工具面下线：
+    模型调用固定文案拒收（"样本外评估已内部化，提交后由引擎验证，无可
+    提供数字"），test 一次性锁与烧毁告警随之退役；提交通过快检与四门后，
+    由引擎在冻结样本外分段上做段验证（SPRT），模型只收二值判定（通过/
+    未通过），零数字零段数零原因——永续不变量不变：除死线与用户指令外
+    无任何终态（[multiplicity-wall](arch/multiplicity-wall.md)＋
     [mining-never-stops](arch/mining-never-stops.md)）。
 17. **全程被驾驶**——停走指令随五个工具响应必达、回合边界主动注入、
     直驱会话读指令文件；增长双轴计时、卡住超时换向、死线到点收官
@@ -203,16 +237,30 @@
 | 烟测门 | 两块小面板实测耗时→拟合缩放指数→外推全量×方法遍数 | 投影超方法预算；α>1.4=超线性 | 零试验拒绝；自动编译/重写后原样重交 | [evaluation-pipeline](arch/evaluation-pipeline.md) |
 | 双端超时 | 客户端 900 秒；worker 墙钟基数 600 秒按核份额伸缩 | 超时 | 零入账可重试；同参重提自动并入在途作业 | [evaluation-pipeline](arch/evaluation-pipeline.md) |
 | null 地形指纹门 | 地形绑定数据+口径+引擎版本+生效算子集指纹 | 任一变更=失配 | 拒绝给出 p，先重校准（不给不可信数字） | [multiplicity-wall](arch/multiplicity-wall.md) |
-| deflated p 硬门 | 四充分统计量+门参数重算 p，扣选择运气线 | p≤0.05；p 不可算=拒 | 拒收；单发豁免不设（符号选择也是选择） | [multiplicity-wall](arch/multiplicity-wall.md) |
+| deflated p 警告（原硬门，2026-11-01 降级） | 四充分统计量+门参数重算 p，扣选择运气线——计算与落盘不变 | p>0.05=警告（人审轮复核）；p 不可算仍拒 | 拒收语义退役；强度拦截由入册固定线承担 | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 批内族口径/跨轨 Šidák | 批内相关矩阵→选择运气计价；双轨分账 | 轨门槛 α≈0.0253 | 族内选择未过轨门槛拒 | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 单调包络 | 写盘时刻对全量试验算有效数并盖章 | 只升不降 | 灌水只能遇到封顶墙 | [multiplicity-wall](arch/multiplicity-wall.md) |
-| 测试区一次性锁 | 预约→计算→落锤三步原子 | 已消费/他人在途=拒 | 数据性失败不算消费；崩溃预约按进程存活回收 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 测试区一次性锁（2026-11-05 退役） | 原预约→计算→落锤三步原子 | — | selection/test 工具面下线后锁失去消费通道，机制停用留档（原语义：数据性失败不算消费、崩溃预约按进程存活回收） | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 噪声世界门 | M 个波动率匹配随机世界重跑因子 | 跨世界 \|z\|≥3 | 无条件拒收（拟合评价管道 artifact），先查因果构造 | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 日排列零 | 真实边际+随机重配时间线，p_two | 方向待校准 | 报告不拦（report-only） | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 展平检验 | 申报参数最小步长邻域逐一评估 | cliff 签名（符号翻转/塌缩/退化） | 事务中止；申报值不在源码=中止 | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 价差噪声门 | 尾部轨的合成世界检验 | \|z\|≥3 拒；不可判定=fail-closed | 尾部轨事务中止，不做静默放行 | [multiplicity-wall](arch/multiplicity-wall.md) |
 | 尾部安慰剂 | top-N 净超额 vs 随机选股零假设 | placebo_z≥3（单侧） | 未过拒（尾部轨准入链首门） | [multiplicity-wall](arch/multiplicity-wall.md) |
-| 正交门 | 候选与在册因子的开发区逐日秩相关（公共截面≥300） | ≥0.80/0.60 | 软门：标注+提示不拦，测试区终裁（可切硬拒） | [orthogonality-gate](arch/orthogonality-gate.md) |
+| 入册固定线（固定墙主门，2026-11-01；2026-11-05 起为段验证快检首关，墙值不变） | \|IC_IR\| 对照墙参数×池内 IC_IR 标准差（墙值由成本模型从真实池分布推导：C_leak:C_kill=2:1+bootstrap 带+预声明取点） | ETF z≥2.65（定稿）/个股 z≥1.60（暂定，季度重推导） | 红牌拒收（措辞"强度低于入册固定线"）；回滚=配置改 growing+新桥进程零代码 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 雕刻警报门（2026-11-05 退役） | 原逐年符号一致性对二项精确 null（逐年符号独立等可能） | — | 整体退役：不拦截、不路由、不产生判定/门事件；逐年一致性留诊断对象作描述字段 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| OOS 凭据前置（B3，2026-11-05 退役） | 原 oos_receipts.jsonl 对 source_hash 的预登记凭据 | — | 随 selection 工具面下线退役——样本外评估内部化后无需模型侧凭据 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| selection α 预算（B4，2026-11-05 退役） | 原 selection_spend_ledger.jsonl 逐次记账（Bonferroni 0.05/60） | — | 随 selection 工具面下线退役；多重检验计费由族级判定预算接任（见下） | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 构造复杂度门（M8） | 源码 AST 算子调用计数（与 construction_fp 同源）；2026-11-05 起为段验证快检一环 | ≥12 超标（固定；法证回放墙放行者带 max-J） | 超标给一次简化重写机会（原红牌拒收语义退役）——复杂度是运气载体 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 双轨一致门（M13，2026-11-05 退役） | 原 \|\|尾轨 spread_ir\|−\|IC_IR\|\|（双轨强度差） | — | 整体退役：不拦截、不路由、不产生判定/门事件；双轨读数留诊断对象作描述字段 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 最短回测长度门（M3） | Bailey minBTL：撑起该强度所需样本/实有；2026-11-05 起为段验证快检一环 | 比值>1（固定；仅 IC 轨提交） | 红牌拒收——样本太短撑不起该强度声明 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 内部段验证（SPRT，2026-11-05 新增） | 提交过快检（强度墙固定 z：ETF 2.65/STK 1.60＋M8＋M3）与既有四门（噪声世界/day-perm/平坦性/spread+placebo）后，引擎在冻结样本外分段数据上做证据累积（段定义 segments.json＋content_sha 先验冻结，篡改即停用 fail-closed） | T_acc=2.6（A4 回放校准冻结）；边界随机化带 ±0.3（Thresholdout 配方，确定性种子）；灾难熔断=对齐 IR<−0.5×\|dev_IR\| 立即拒 | 二值判定（通过/未通过）回模型，零数字零段数零原因；早通过省段；tail 轨本版不做段验证（挂账二期）；回滚 mining_state.verify_mode=internal_sprt（默认）\|off | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 族级判定预算（2026-11-05 新增） | 每线每自然周每构造族（AST 调用名多重集哈希）60 次判定额度；账本 stateRoot/verify_budget.json；全数字判定记录 stateRoot/verify_ledger.jsonl（人读） | 60 次/周/族 | 超额事务性拒收（固定文案零数字） | [multiplicity-wall](arch/multiplicity-wall.md) |
+| AST IO 黑名单（2026-11-05 新增） | 因子源码静态扫描文件/网络/动态执行符号（open/read_*/write_*/Path/socket/urllib/requests/subprocess/os.system/pickle/__import__ 等） | 出现任一符号 | 评估拒收（固定文案）；worker 子进程剥离网络环境变量；完整沙箱挂账二期 | 多段隔离验证管线（分篇待补） |
+| dispatch OOS 红action（2026-11-05 新增） | 一切模型面响应剥除样本外语义键（verify/tier/decay_band/seg_evals/cumulative_t 等） | 样本外语义键清单 | 剥除为红线——样本外数字不进提示词（防激励适配侵蚀校准）；factor_book_audit 模型面响应收敛为完成状态＋报表文件名 | 多段隔离验证管线（分篇待补） |
+| registry tier 分层（2026-11-05 新增） | registry 条目新增 tier 字段：core/observation（observation=通过但存在对齐 IR<0.25×\|dev\| 弱段，或存量册重判未过新标准者入观察名单）；McLean-Pontiff 衰减带（26-58%）写入条目做册内跟踪判据 | core／observation | 观察名单不自动除名——册内跟踪/季度复审沿用 factor_book_audit | 多段隔离验证管线（分篇待补） |
+| 门事件审计（B6） | gate_events.jsonl：各存活门每决策一行（2026-11-05 起雕刻/M13/OOS 凭据/selection 预算退役不再产生门事件；现行枚举=墙/M8/M3/deflated 警告；族级预算与段验证判定记录见 verify_budget.json/verify_ledger.jsonl） | 原子追加、重启不清零 | 审计流（不阻断门本身）；人读+引擎内部，数字不进提示词 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 册子滚动审计（B5） | registry accepted 逐只用延长后的前向带复算（A4 判据）；2026-11-05 起兼册内跟踪/季度复审通道（tier 观察名单＋衰减带 26-58% 判据） | ratio<0.35 或翻号=降级建议 | 只产观察名单不自动除名——降级动作留人审轮（三权分离）；手动触发；模型面响应收敛为完成状态＋报表文件名 | [multiplicity-wall](arch/multiplicity-wall.md) |
+| 正交门 | 候选与在册因子的开发区逐日秩相关（公共截面≥300） | ≥0.80/0.60 | 软门：标注+提示不拦（原测试区终裁通道已于 2026-11-05 随 test 工具面退役；可切硬拒） | [orthogonality-gate](arch/orthogonality-gate.md) |
 | 提交顺序门（B1） | journal 预注册在场＋引擎盖章时序先于首评＋代码构造块在推导正文词法对账 | shadow→enforce 自动切档：≥200 次或 4 周且近 50 次违规率≤10%；500 次/8 周仍>10% 维持影子 | 影子=记账不拒；enforce=事务性拒收（不落盘不烧名），文案教学式自足 | [derivation-first](arch/derivation-first.md) |
 | 探索期双池对表 | 活跃池/证伪池的指纹比对 | 数值≥0.90、结构≥0.70 | 提醒不否决（先查相似检索、论证差异） | [orthogonality-gate](arch/orthogonality-gate.md) |
 | 同构重交拦截 | 对全部先例的最大构造指纹相似 | ≥0.80 且先例已过 | 评估之前零试验拒绝；常量变/先例未过/源码缺失三放行 | [novelty-defense](arch/novelty-defense.md) |
@@ -221,7 +269,7 @@
 | 首调门 | 会话身份+绑定表 | 未绑定账本 | 工具层 Proxy 拒绝，二选一声明后放行（重启持久） | [lane-isolation](arch/lane-isolation.md) |
 | lane 双层契约 | 工具清单声明×处理器转发对拍 | 缺一=静默丢参 | 全量对拍审计；引擎拒收"空源码无作业号"请求 | [lane-isolation](arch/lane-isolation.md) |
 | 穷尽宣告拒收 | 下一步假设的词族扫描 | 穷尽/天花板类措辞 | 拒收并要求重写（实测 12/12 全假） | [mining-never-stops](arch/mining-never-stops.md) |
-| 停走判定 | loop.state（running/must_rotate 两值；值域外=版本错配保险丝） | 永续：无静默终态 | 停笔违规；test 烧毁=告警建议数据集轮换，不停推进 | [mining-never-stops](arch/mining-never-stops.md) |
+| 停走判定 | loop.state（running/must_rotate 两值；值域外=版本错配保险丝） | 永续：无静默终态 | 停笔违规；test 烧毁告警已随 test 一次性锁退役（2026-11-05，锁失去消费通道） | [mining-never-stops](arch/mining-never-stops.md) |
 | 超时换向 | 增长双轴（本线试验数/未命中评估派发）零增长超窗 | 判窗 10 分钟（评估在途豁免限时 45 分钟） | 换向指令每窗恰一注、无上限直到有评估落账 | [rotate-and-growth](arch/rotate-and-growth.md) |
 | 供数限发 | 三个机械库存同时为空 | 3 发/间隔 10 分钟 | 预算耗尽落入超时换向循环（无终态） | [rotate-and-growth](arch/rotate-and-growth.md) |
 | 死线收官 | 会话级死线墙钟（跨重启持久） | 到点一次收官 | 收官注入后该会话解除推进；重启过期=自动取消静默交还（不补收官）；用户真实消息重新接管；迟到 30 分钟节流必告警 | [deadline-mechanism](arch/deadline-mechanism.md) |
@@ -253,7 +301,7 @@
 | 算力投放 | — | — | 影子打分＋灰度选点＋ε 硬底 | 开关与权重（禁在线调权） |
 | 三区划分 | 校验并落盘 | 建议分界 | — | **拍板**（研究诚信的分界线） |
 | 数据集/池/频率轮换 | 接收上报 | 随里程碑上报，继续挖 | — | **操作**（不是停笔理由） |
-| test 区消费 | 一次性锁兜底 | 声明制执行 | — | — |
+| test 区消费（2026-11-05 起内部化） | 段验证执行且说了算（快检＋冻结段 SPRT，二值判定） | 无通道：selection/test 工具面固定文案拒收（无可提供数字） | — | — |
 | 死线时刻 | 接管停止条件 | 按口述设置/清除/查询 | — | **口述**（唯一合法来源） |
 | 账本选边 | 首调门＋绑定表 | 显式声明 | — | 部署几个账本 |
 | 重复与否 | 只报事实（查重不查新） | 论证本质差异或如实记变体 | — | — |

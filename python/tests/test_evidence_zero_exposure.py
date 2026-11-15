@@ -20,6 +20,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 
 #: 证据侧关键词（值/键名/提示语一律不得出现在任何模型可见响应里）。
@@ -84,6 +85,7 @@ def test_zero_exposure_all_surfaces(tmp_path):
                   "factor.evaluate_batch")
 
     # submit（弱因子走拒绝路径也测——拒绝文案同属模型面）
+    grant_oos(b.state_root, SRC)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "envId": "etf", "name": "probe_zero_exposure", "source": SRC,
         "signal": "s", "diagnosis": d})

@@ -667,7 +667,8 @@ class _LuckSampler:
 
 def _deflated_sharpe_p(ic_series, bar_sigma: float | None = None,
                        pool_std: float | None = None,
-                       n_trials: float = 1) -> dict:
+                       n_trials: float = 1,
+                       wall_mode: str | None = None) -> dict:
     """Deflated Sharpe Ratio 单因子 p（v3 2026-08-21：bar_sigma 口径）。
 
     对 IC 序列做偏度/峰度校正的 t 统计，并按「选择运气 bar」折减——
@@ -700,6 +701,7 @@ def _deflated_sharpe_p(ic_series, bar_sigma: float | None = None,
             "n_obs": n, "bar_sigma": float(bar_sigma) if bar_sigma else 0.0,
             "sr_hat": sr, "sr0": sr0, "skew": g3, "kurt": g4,
             "pool_std": float(pool_std) if pool_std else None,
+            "wall_mode": wall_mode,
             "scale_note": scale_note}
 
 
@@ -795,7 +797,8 @@ def _date_shift_placebo(F, fwd, pit, env, shifts=(5, 10, 21)):
 
 def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
              pool_std: float | None = None, horizon=None,
-             bar_sigma: float | None = None):
+             bar_sigma: float | None = None,
+             wall_mode: str | None = None):
     env = _env_horizon_view(env, horizon)
     F = np.asarray(F, dtype=np.float64)
     if F.shape != (env.T, env.N):
@@ -851,7 +854,16 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
     from ..discipline import red_flags_and_verdict
     result["deflated_train"] = _deflated_sharpe_p(train_sig, bar_sigma=bar_sigma,
                                                   pool_std=pool_std,
-                                                  n_trials=n_trials)
+                                                  n_trials=n_trials,
+                                                  wall_mode=wall_mode)
+    # 雕刻警报门（B1 固定墙组合件）：逐年符号一致性对二项 null 的精确
+    # 检验——纯数据性质（不依赖试验计数），evaluate 时算一次即为权威。
+    try:
+        from .hardening import carving_from_series
+        result["carving"] = carving_from_series(train_sig)
+    except Exception as _ce:
+        result["carving"] = {"tripped": False,
+                             "note": f"计算失败（不判定）: {type(_ce).__name__}"}
     # A2（2026-08-19 trail 级 N_eff）：train 区 IC 序列挂到结果——bridge 摘出
     # 存 trail_engine 的 ic_series_sketch（同族参数变体的 IC 序列高度相关，
     # 是簇聚类的好代理），不进 agent 可见返回 / registry。
@@ -860,6 +872,8 @@ def evaluate(F, env, train_end=None, verbose=False, n_trials: float = 1,
     gv = red_flags_and_verdict(result, region="train")
     result["verdict"] = gv["verdict"]
     result["red_flags"] = gv["red_flags"]
+    if gv.get("warnings"):
+        result["warnings"] = gv["warnings"]
 
     if verbose:
         _print_result(result)
@@ -1256,22 +1270,24 @@ def passes_acceptance(result, z_threshold=3.0, beta_threshold=0.3, min_n=20, alp
         return False, "column-perm z 非有限"
     if abs(z) < z_threshold:
         return False, f"column-perm |z|={abs(z):.2f} < {z_threshold}（截面结构不显著）"
-    if np.isfinite(beta) and abs(beta) >= beta_threshold:
+    # beta=None（ts 线不适用/经 _lossless 归一的 NaN）→ 跳过检查（discipline 同款守护）
+    if isinstance(beta, (int, float)) and np.isfinite(beta) \
+            and abs(beta) >= beta_threshold:
         return False, f"beta 暴露 |{beta:.2f}| >= {beta_threshold}（beta 伪装嫌疑）"
     if ic_n < min_n:
         return False, f"样本不足 n={ic_n} < {min_n}"
-    # 多重检验门控（2026-08-18 复核补全）：deflated p 是入册硬门——
-    # 不显著 = 选择运气不可排除。此前 z≥3 的不显著因子照样 accepted=True。
-    # v3（2026-08-21）：bar_sigma>0（含 M=1 的 E|Z| 底价）都需 pool_std——
-    # p=None 一律拒绝，N=1 豁免取消（符号选择也是选择，trail 实证）。
+    # deflated p（B2 2026-11-01 固定墙时代）：降级为警告——p>0.05 不再拒，
+    # 硬拒由入册强度线（discipline 红牌：|IC_IR| < 墙×pool_std）+ 雕刻门 +
+    # 提交链各门承担；警告随诊断落盘供人审轮消费。p=None（不可算）维持
+    # 拒绝：缺池分布基线时入册强度线同样无法计算，null 校准是硬前提。
     dp = result.get("deflated_train") or {}
-    p, n_trials = dp.get("p"), dp.get("n_trials") or 1
+    p = dp.get("p")
     if p is None:
         return False, ("deflated p 不可算（缺池分布基线或样本不足）——"
                        "先跑 null-calibration 建 pool_std 基线")
     if isinstance(p, (int, float)) and p > alpha:
-        return False, (f"deflated p={p:.4f} > {alpha}（{n_trials:.0f} 次已试假设的"
-                       "多重检验校正下不显著——选择运气不可排除）")
+        return True, (f"pass（附警告：deflated p={p:.4f} > {alpha}——多次试验"
+                      "口径下不显著，已降级为警告；入册强度线与提交链各门为准）")
     return True, "pass"
 
 

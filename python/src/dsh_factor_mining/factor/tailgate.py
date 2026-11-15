@@ -162,7 +162,8 @@ def tail_deflation_bar(n_eff: int, n_days: int,
                        s0_emp: float | None = None,
                        spread_ir: float | None = None,
                        moments: dict | None = None,
-                       emax_override: float | None = None) -> dict:
+                       emax_override: float | None = None,
+                       fixed_bar: float | None = None) -> dict:
     """尾部线 deflation 门参数（WS4 2026-08-25：高阶矩修正版）。
 
     s0 = null 下 spread_ir 的标准差——s0_emp（本面板随机因子 spread_ir
@@ -208,19 +209,30 @@ def tail_deflation_bar(n_eff: int, n_days: int,
     # E[max] 项来源（2026-10-07 尾部墙 v2）：emax_override（名单重叠相关
     # 矩阵上的单侧 CRN，tailwall.tail_wall_v2_bar）在场且有效时取代
     # B-LP(n_eff) 计数式；out["wall"] 随 bar 落盘 = v1/v2 双报遥测判据。
-    if (isinstance(emax_override, (int, float))
+    # 固定墙（B1 2026-11-01）：fixed_bar 在场（wall_mode=fixed，值来自
+    # null_landscape fixed_bar_tail）时 sr0 恒为该值——一切随 N_eff 增长
+    # 的路径短路，优先级高于 v2 override。
+    _fixed_ok = (isinstance(fixed_bar, (int, float))
+                 and np.isfinite(float(fixed_bar)) and float(fixed_bar) > 0)
+    if _fixed_ok:
+        sr0_val = float(fixed_bar)
+        wall = "fixed"
+    elif (isinstance(emax_override, (int, float))
             and np.isfinite(float(emax_override))
             and float(emax_override) >= 0.0):
         emax = float(emax_override)
         wall = "v2"
+        sr0_val = emax * s0
     else:
         emax = _blp_sigma(float(n_eff))
         wall = "v1"
+        sr0_val = emax * s0
     out = {"ok": True, "s0": round(s0, 6), "s0_source": s0_source,
            "n_eff": n_eff, "wall": wall,
            "alpha_track": alpha_track,
-           "emax_sigma": round(emax, 4),
-           "bar": round(emax * s0, 4)}
+           "emax_sigma": (round(sr0_val / s0, 4) if s0 else None),
+           "bar": round(sr0_val, 4),
+           **({"fixed_bar_tail": round(sr0_val, 4)} if _fixed_ok else {})}
     mom_ok = (isinstance(moments, dict)
               and isinstance(moments.get("g3"), (int, float))
               and isinstance(moments.get("g4"), (int, float))
@@ -233,13 +245,13 @@ def tail_deflation_bar(n_eff: int, n_days: int,
         # 判定不因缺矩而翻转（统一校准对照后再定稿新旧差异）
         out.update({"gate_kind": "legacy", "moments": "legacy",
                     "denom": 1.0, "g3": None, "g4": None,
-                    "required_spread_ir": round(emax * s0 + z_req * s0, 4),
+                    "required_spread_ir": round(sr0_val + z_req * s0, 4),
                     "z_req": round(z_req, 4)})
         if isinstance(spread_ir, (int, float)) and np.isfinite(spread_ir):
-            out["t_adj"] = round((float(spread_ir) - emax * s0)
+            out["t_adj"] = round((float(spread_ir) - sr0_val)
                                  * _math.sqrt(max(int(n_days) - 1, 1)), 4)
             out["pass_g3"] = bool(float(spread_ir)
-                                  >= emax * s0 + z_req * s0)
+                                  >= sr0_val + z_req * s0)
         return out
     g3, g4 = float(moments["g3"]), float(moments["g4"])
     n_m = int(moments["n"])
@@ -248,7 +260,7 @@ def tail_deflation_bar(n_eff: int, n_days: int,
 
     def _t_adj(sr_):
         denom = max(1.0 - g3 * sr_ + (g4 - 1.0) / 4.0 * sr_ * sr_, 1e-8)
-        return (sr_ - emax * s0) * _math.sqrt(n_m - 1) / _math.sqrt(denom), denom
+        return (sr_ - sr0_val) * _math.sqrt(n_m - 1) / _math.sqrt(denom), denom
 
     t_val, denom = _t_adj(sr)
     out.update({"gate_kind": "corrected", "moments": "corrected",
@@ -256,7 +268,7 @@ def tail_deflation_bar(n_eff: int, n_days: int,
                 "t_adj": round(t_val, 4), "z_req": round(z_req, 4),
                 "pass_g3": bool(t_val >= z_req)})
     # required 反解（二分，展示用；判定以 t_adj 为准）
-    hi = max(10.0, sr * 2 + emax * s0 * 2 + 5.0)
+    hi = max(10.0, sr * 2 + sr0_val * 2 + 5.0)
     if _t_adj(hi)[0] < z_req:
         out["required_spread_ir"] = None   # 门在扫描范围外——t_adj 数字为准
     elif _t_adj(0.0)[0] >= z_req:
@@ -279,7 +291,8 @@ def tail_admission(tail_block: dict, ledger: list[dict],
                    placebo_z_gate: float | None = None,
                    placebo_m: int | None = None,
                    net_basis: bool = False,
-                   v2_wall: dict | None = None) -> dict:
+                   v2_wall: dict | None = None,
+                   fixed_bar: float | None = None) -> dict:
     """尾部轨准入判定（纯函数；IC 轨照旧走 _passes_acceptance）。
 
     v2_wall（2026-10-07 尾部墙 v2）：tailwall.tail_wall_v2_bar 的返回
@@ -334,10 +347,12 @@ def tail_admission(tail_block: dict, ledger: list[dict],
     # t 分母偏度/峰度修正，缺矩 legacy = 现行公式；net 基下矩用
     # net_spread_moments——被净掉的序列形状不同，矩必须同口径）
     # 尾部墙 v2（2026-10-07）：v2_wall ok 时 emax_override 生效。
+    # 固定墙（B1）：fixed_bar 在场时优先（G3 用固定 sr0，wall="fixed"）。
     _v2_ok = (isinstance(v2_wall, dict) and v2_wall.get("ok"))
     bar = tail_deflation_bar(max(n_eff, 1), int(n_days or 0), s0_emp=s0_emp,
                              spread_ir=spread_ir,
                              moments=_moments,
+                             fixed_bar=fixed_bar,
                              emax_override=(v2_wall.get("emax_sigma")
                                             if _v2_ok else None))
     diag = {"n_eff": n_eff, "n_trials_tail": n_total, "bar": bar,

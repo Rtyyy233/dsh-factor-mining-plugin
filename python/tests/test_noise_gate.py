@@ -26,6 +26,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 from dsh_factor_mining.factor.env import Calibration  # noqa: E402
 from dsh_factor_mining.factor.noise import generate_noise_world  # noqa: E402
@@ -155,6 +156,7 @@ def test_submit_noise_gate_rejects_lookahead(tmp_path):
                        "stage": "development"})
     diag = {k: v for k, v in diag.items() if k not in ("_meta", "_receipt",
                                                        "_construction_fp")}
+    grant_oos(b.state_root, LOOKAHEAD)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "lookahead_evil", "signal": "test",
         "source": LOOKAHEAD,
@@ -187,6 +189,7 @@ def test_infra_failure_aborts_without_write(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bridge_mod.Bridge, "_factor_noise_test", boom)
     with pytest.raises(bridge_mod.BridgeError, match="事务中止"):
+        grant_oos(b.state_root, CLEAN_MOMENTUM)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "infra_victim", "signal": "t",
             "source": CLEAN_MOMENTUM, "diagnosis": diag})
@@ -197,6 +200,7 @@ def test_infra_failure_aborts_without_write(tmp_path, monkeypatch):
         "基础设施失败不得写 registry（烧名事故根因）"
     # 修复后重试（恢复噪声门）同名字应畅通走到实质判定
     monkeypatch.undo()
+    grant_oos(b.state_root, CLEAN_MOMENTUM)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "infra_victim", "signal": "t",
         "source": CLEAN_MOMENTUM, "diagnosis": diag})
@@ -221,6 +225,7 @@ def test_infra_failed_entry_healed_on_resubmit(tmp_path):
     diag = b.dispatch("factor.evaluate",
                       {"envId": "primary", "source": CLEAN_MOMENTUM,
                        "stage": "development"})
+    grant_oos(b.state_root, CLEAN_MOMENTUM)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "pw15_compD_5050", "signal": "healed",
         "source": CLEAN_MOMENTUM, "diagnosis": diag})

@@ -24,6 +24,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 from dsh_factor_mining.factor.tailgate import (  # noqa: E402
     selection_minhash, selection_similarity, tail_admission, tail_deflation_bar,
@@ -172,6 +173,7 @@ def test_submit_tail_track(tmp_path):
     diag = b.dispatch("factor.evaluate", {"envId": "primary",
                                           "source": TILT_SOURCE,
                                           "stage": "development"})
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "tilt_tail", "signal": "tilt on drift",
         "source": TILT_SOURCE,
@@ -205,6 +207,7 @@ def test_dual_pass_annotation(tmp_path):
                                           "stage": "development"})
     # 真实 evaluate 的 IC_IR=51 会触发 red_flag（杀 ic 轨）——双入选
     # 测试用手构合理强 diagnosis；evaluate 只为给 trail 喂权威尾块
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "tilt_dual", "signal": "tilt",
         "source": TILT_SOURCE,
@@ -245,6 +248,7 @@ def test_dual_pass_false_when_ic_rejected(tmp_path):
                                           "source": TILT_SOURCE,
                                           "stage": "development"})
     assert diag.get("red_flags"), "TILT 真实 IC_IR 应触发红牌"
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "tilt_icweak", "signal": "x",
         "source": TILT_SOURCE,
@@ -261,6 +265,7 @@ def test_submit_default_ic_unchanged(tmp_path):
     b = _make_drift_bridge(tmp_path)
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "weak_ic", "signal": "weak",
         "source": TILT_SOURCE,
@@ -276,6 +281,7 @@ def test_submit_default_ic_unchanged(tmp_path):
     assert sub.get("tail_track") is None
     # 非法 basis 拒
     try:
+        grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "bad_basis", "signal": "x", "source": TILT_SOURCE,
             "diagnosis": {"ic_ir_train": 0.05, "ic_n_train": 50,
@@ -314,6 +320,7 @@ def test_g2_undeterminable_fail_closed(tmp_path, monkeypatch):
                                           "stage": "development"})
     # tail 轨准入 → 事务中止，registry 不落盘
     try:
+        grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "g2_abort", "signal": "x", "source": TILT_SOURCE,
             "diagnosis": diag, "admit_basis": "tail"})
@@ -324,6 +331,7 @@ def test_g2_undeterminable_fail_closed(tmp_path, monkeypatch):
     assert raised
     assert not (tmp_path / "state" / "registry.json").exists()
     # ic 轨提交 → 主判定走 ic，尾轨标注保守（G2 无法判定 → 不判过）
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "g2_ic", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": diag})
@@ -366,6 +374,7 @@ def test_tail_block_horizon_matched(tmp_path):
                                           "mode": "null-calibration", "n": 5})
     _write_two_horizon_trail(tmp_path / "state",
                              source_fingerprint(TILT_SOURCE))
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "hm5", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": {**_WEAK_DIAG, "horizon": 5}})
@@ -384,6 +393,7 @@ def test_tail_block_horizon_mismatch_uses_own(tmp_path):
                                           "mode": "null-calibration", "n": 5})
     _write_two_horizon_trail(tmp_path / "state",
                              source_fingerprint(TILT_SOURCE))
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "hm20", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": {**_WEAK_DIAG, "horizon": 20}})

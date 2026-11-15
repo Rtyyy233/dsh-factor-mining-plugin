@@ -19,6 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import (  # noqa: E402
     Bridge,
     BridgeError,
@@ -313,11 +314,14 @@ def test_origin_in_trail_summary_projection(tmp_path):
 
 
 def test_registry_entry_carries_origin(tmp_path):
+    from conftest import set_verify_mode
     b = _make_bridge(tmp_path)
+    set_verify_mode(b.state_root, "off")
     # null 校准先行（接受门需要 pool_std；与 test_accepted_is_not_a_stop 同构）
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
     _write_trail_entry(b, "迁移论文思路", papers=["2108.05721"])
+    grant_oos(b.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "lit_factor_a", "signal": "momentum",
         "source": BASELINE_SOURCE,

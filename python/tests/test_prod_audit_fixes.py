@@ -21,6 +21,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 
 GOOD = """
@@ -80,19 +81,23 @@ def _setup(root: Path):
 # ---- FIX-1: walk_forward 不得暴露 test 区 ----
 
 def test_walk_forward_limited_to_selection_region(tmp_path):
-    b, sel_end = _setup(tmp_path)
+    """2026-11-05 段隔离改写：滚动验证限制收紧到 dev_end（原 sel_end 边界
+    随 selection 工具面退役作废）——fold 不越 dev_end，显式越界拒绝。"""
+    b, _sel = _setup(tmp_path)
+    env = b.envs.get(b._resolve_env_id("primary"))
+    dev_end = str(env.calibration.dev_end)
     wf = b.dispatch("factor.walk_forward", {"envId": "primary", "source": GOOD})
-    assert "region_note" in wf and "selection" in wf["region_note"]
+    assert "region_note" in wf and "dev_end" in wf["region_note"], wf
     for fold in wf.get("per_fold", []):
-        assert str(fold["t1"]) <= str(sel_end), (
-            f"fold t1={fold['t1']} 越过 sel_end={sel_end}——test 区泄漏")
+        assert str(fold["t1"]) <= dev_end, (
+            f"fold t1={fold['t1']} 越过 dev_end={dev_end}——样本外泄漏")
     # 显式越界 → 拒绝
     try:
         b.dispatch("factor.walk_forward", {"envId": "primary", "source": GOOD,
                                            "t1_date": "2099-01-01"})
-        raise AssertionError("t1 越过 sel_end 应被拒绝")
+        raise AssertionError("t1 越过 dev_end 应被拒绝")
     except BridgeError as e:
-        assert "sel_end" in str(e) or "test" in str(e)
+        assert "dev_end" in str(e), str(e)
 
 
 # ---- FIX-2: explore seed 冲突拒绝 + 自动派生 ----
@@ -165,6 +170,7 @@ def test_registry_update_descriptive_only(tmp_path):
     b, _ = _setup(tmp_path)
     diag = b.dispatch("factor.evaluate", {"envId": "primary", "source": GOOD,
                                           "stage": "development"})
+    grant_oos(b.state_root, GOOD)  # B3 OOS 凭据前置（E1 适配）
     b.dispatch("registry.submit", {"name": "f1", "source": GOOD,
                                    "signal": "旧描述", "diagnosis": diag})
     # 改 signal 成功

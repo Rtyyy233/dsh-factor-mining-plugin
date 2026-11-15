@@ -222,6 +222,23 @@ export interface RegistrySubmitResult extends JsonRecord {
   entry?: JsonRecord
 }
 
+/** Request shape for the rolling registry audit (forward-band re-evaluation
+ *  of accepted factors; produces downgrade suggestions, never auto-removal). */
+export interface BookAuditRequest extends JsonRecord {
+  envId?: string
+}
+
+/** Result of the rolling registry audit: summary counts plus the downgrade
+ *  candidate list (human adjudication decides any actual demotion). */
+export interface BookAuditResult extends JsonRecord {
+  n_audited?: number
+  n_downgrade_suggest?: number
+  n_watch?: number
+  n_keep?: number
+  downgrade_candidates?: string[]
+  report?: string
+}
+
 /** Arxiv methodology-search result. */
 export interface ArxivSearchResult extends JsonRecord {
   entries?: JsonValue[]

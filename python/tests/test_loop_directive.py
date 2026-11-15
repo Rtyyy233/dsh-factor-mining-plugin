@@ -31,6 +31,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 
 BASELINE_SOURCE = """
@@ -154,11 +155,14 @@ def test_family_marginal_escalation(tmp_path):
 # ---- 4. accepted 入册不是停点（v3：反转 v2 行为） ----
 
 def test_accepted_is_not_a_stop(tmp_path):
+    from conftest import set_verify_mode
     """v2 事故根因：has_value=accepted>0 让 may_stop 永久打开（导入的
     stateRoot 自带 8 入册因子）。v3：accepted 只是里程碑，继续挖。"""
     b = _make_bridge(tmp_path)
+    set_verify_mode(b.state_root, "off")
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "strong_a", "signal": "momentum",
         "source": BASELINE_SOURCE,
@@ -627,6 +631,7 @@ def test_submit_rejection_menu(tmp_path):
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
     # 弱因子：deflated p 必然拒绝
+    grant_oos(b.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "weak_probe", "signal": "weak",
         "source": BASELINE_SOURCE,

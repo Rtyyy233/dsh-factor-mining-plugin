@@ -105,8 +105,8 @@ def test_factor_select_snapshot_with_battery(tmp_path):
     snap = json.loads((sroot / "factor_select.json").read_text(encoding="utf-8"))
     e = snap["entries"][0]
     assert e["name"] == "mr_feature" and e["track"] == "ic"
-    assert isinstance(e["sel_ic_ir"], (int, float))
-    assert e["sel_net_annual"] is not None
+    assert isinstance(e["dev_ic_ir"], (int, float))
+    assert e["dev_net_annual"] is not None
     bat = e["battery"]
     assert set(bat["decay_ic"].keys()) == {"1", "5", "10", "20", "60"}
     for k in ("yearly_consistency", "rolling_pos_frac", "boot_z"):

@@ -22,6 +22,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 
 
@@ -70,33 +71,17 @@ def test_full_bypass_chain_blocked(tmp_path):
     b.dispatch("data.load", {"envId": "etf"})
     _register_factor(state)
 
-    r1 = b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-    assert "error" not in r1, r1  # 首次消费成功
-    assert (state / "test_lock.json").exists()
-
-    b.dispatch("state.reset", {"scope": "all", "confirm": True,
-                                "reason": "test: 绕过链/锁次序验证"})
-    assert (state / "test_lock.json").exists()  # 锁存活
-
-    # 重配 + load 后再消费 → 必须 -32003（审计者未走完的半条链）
-    b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
-    b.dispatch("data.load", {"envId": "etf"})
-    try:
-        b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-        raise AssertionError("重配后 test 消费未被拒——绕过成立")
-    except BridgeError as e:
-        assert e.code == -32003, e.code
-
-    # 换口径（审计指控的核心场景）再消费 → 同样必须拒
-    env2 = _env(data)
-    env2["calibration"] = {"dev_end": "2019-12-01", "sel_end": "2020-12-01"}
-    b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": env2}}})
-    b.dispatch("data.load", {"envId": "etf"})
-    try:
-        b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-        raise AssertionError("换口径后 test 消费未被拒——绕过成立")
-    except BridgeError as e:
-        assert e.code == -32003, e.code
+    # 2026-11-05 段隔离（P0）：selection/test 已整体内部化——首次调用即
+    # 固定文案拒收（无消费、无锁写入），绕过链前提消失。
+    for stage in ("test", "selection"):
+        try:
+            b.dispatch("factor.evaluate", {"envId": "etf", "source": F,
+                                           "stage": stage})
+            raise AssertionError(f"stage={stage} 应被固定文案拒收")
+        except BridgeError as e:
+            assert e.code == -32003, e.code
+            assert "样本外评估已内部化" in e.message, e.message
+    assert not (state / "test_lock.json").exists()  # 无锁消费通道
 
 
 def test_lock_error_precedes_missing_config(tmp_path):
@@ -109,14 +94,16 @@ def test_lock_error_precedes_missing_config(tmp_path):
     b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
     b.dispatch("data.load", {"envId": "etf"})
     _register_factor(state)
-    b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
+    # 2026-11-05 段隔离：无 config 无 env 状态下 stage=test 同样最先被
+    # 固定文案拒收（-32003），不会误报数据缺失。
     b.dispatch("state.reset", {"scope": "all", "confirm": True,
                                 "reason": "test: 绕过链/锁次序验证"})
     try:
         b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-        raise AssertionError("应被纪律锁拒")
+        raise AssertionError("应被固定文案拒")
     except BridgeError as e:
-        assert e.code == -32003, f"应报纪律锁(-32003)而非数据缺失: {e.code}"
+        assert e.code == -32003, f"应报 -32003 而非数据缺失: {e.code}"
+        assert "样本外评估已内部化" in e.message, e.message
 
 
 def test_receipt_verified_is_bool(tmp_path):
@@ -134,6 +121,7 @@ def test_receipt_verified_is_bool(tmp_path):
             "deflated_train": {"p": 0.001, "n_trials": 1,
                                "sr_hat": 0.9, "skew": 0.0, "kurt": 3.0,
                                "n_obs": 100}}
+    grant_oos(b.state_root, F)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {"envId": "etf", "name": "fake",
                                          "source": F, "signal": "x", "diagnosis": fake})
     assert sub["receipt_verified"] is False, sub["receipt_verified"]
@@ -159,6 +147,7 @@ def test_submit_incomplete_stats_rejected_with_clear_error(tmp_path):
                   "deflated_train": {"p": 0.041, "n_trials": 89,
                                      "sr_hat": 0.406, "n_obs": 58}}
     try:
+        grant_oos(b.state_root, F)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {"envId": "etf", "name": "tsi_ad_incident",
                                        "source": F, "signal": "x",
                                        "diagnosis": hand_built})
@@ -173,6 +162,7 @@ def test_submit_incomplete_stats_rejected_with_clear_error(tmp_path):
     complete = {**hand_built,
                 "deflated_train": {**hand_built["deflated_train"],
                                    "skew": 0.1, "kurt": 3.2}}
+    grant_oos(b.state_root, F)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {"envId": "etf", "name": "tsi_ad_complete",
                                          "source": F, "signal": "x",
                                          "diagnosis": complete})
@@ -199,6 +189,7 @@ def test_receipt_mismatch_rejected(tmp_path):
                 "deflated_train": {**diag["deflated_train"],
                                    "sr_hat": float(diag["deflated_train"]["sr_hat"]) + 1.0}}
     try:
+        grant_oos(b.state_root, F)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {"envId": "etf", "name": "tamp",
                                        "source": F, "signal": "x",
                                        "diagnosis": tampered})
@@ -228,13 +219,18 @@ def test_stats_from_trail_authoritative(tmp_path):
                    "deflated_train": {"p": 0.001, "n_trials": 1,
                                       "sr_hat": 5.0, "skew": 0.0,
                                       "kurt": 3.0, "n_obs": 100}}
+    grant_oos(b.state_root, F)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {"envId": "etf", "name": "fake_strong",
                                          "source": F, "signal": "x",
                                          "diagnosis": fake_strong})
     dp = sub["entry"]["diagnosis"]["deflated_train"]
     assert dp.get("stats_from_trail") is True, dp
-    # 重算用的是引擎侧真实（弱）统计量 → p 不显著 → ic 轨拒
-    assert sub["tracks"]["ic"]["accepted"] is False, sub["tracks"]["ic"]
+    # B2（2026-11-01）：重算用引擎侧真实（弱）统计量——谎报的 p=0.001 被
+    # 权威重算击穿（p 回到不显著区间并挂 deflated 警告），入册判定以
+    # 真实 sr 对照强度线；防编造意图不变，断言随语义更新。
+    assert dp.get("p") != 0.001 and dp.get("p") > 0.05, dp
+    _warns = sub["entry"]["diagnosis"].get("warnings") or []
+    assert any("deflated p" in w for w in _warns), _warns
 
 
 def test_test_stage_requires_registered_factor(tmp_path):
@@ -248,17 +244,18 @@ def test_test_stage_requires_registered_factor(tmp_path):
     b.dispatch("config.save", {"config": {"version": 1, "environments": {"etf": _env(data)}}})
     b.dispatch("data.load", {"envId": "etf"})
 
-    # 未入册 → 拒，且不消费锁
+    # 2026-11-05 段隔离：test 面整体下线——未入册/已入册同文案拒收，
+    # 锁文件永不出现（无消费通道）。
     try:
         b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-        raise AssertionError("未入册的因子测 test 应被拒")
+        raise AssertionError("stage=test 应被拒")
     except BridgeError as e:
         assert e.code == -32003, e.code
-        assert "已入册候选" in e.message, e.message
-    assert not (state / "test_lock.json").exists()   # 锁未被浪费消费
-
-    # 入册（accepted）→ 照常一次性消费
+        assert "样本外评估已内部化" in e.message, e.message
     _register_factor(state)
-    r = b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
-    assert "error" not in r, r
-    assert (state / "test_lock.json").exists()
+    try:
+        b.dispatch("factor.evaluate", {"envId": "etf", "source": F, "stage": "test"})
+        raise AssertionError("已入册 stage=test 也应被拒（通道已下线）")
+    except BridgeError as e:
+        assert e.code == -32003, e.code
+    assert not (state / "test_lock.json").exists()

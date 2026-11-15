@@ -32,6 +32,7 @@ from .data.adapters import (
     DataError,
     EnvironmentSpec,
     build_factor_env,
+    build_ts_env,
     normalize_environment,
     probe_file,
     validate_env_lightweight,
@@ -53,10 +54,11 @@ from .factor.evaluate import (
     evaluate,
     evaluate_batch,
     evaluate_composite,
-    evaluate_selection,
-    evaluate_test,
     evaluate_walk_forward,
 )
+from .factor.env import TsEnv
+from .factor.verify import verify_mode, decay_band
+from .factor.hardening import IO_BLACKLIST_MSG
 from .library.contract import LibraryError, UserLibrary, query_entries
 from .filelock import pid_alive, state_write_lock
 from .lane import (
@@ -80,6 +82,7 @@ from .procinfo import (
     resolve_jobs,
     starvation_verdict,
     worker_mem_bytes,
+    worker_python_exe,
 )
 from .state import (
     MINING_CONFIG,
@@ -156,6 +159,18 @@ def _error(code, message, data=None):
     return {"code": code, "message": message, "data": data}
 
 
+# B3/B4（2026-11-05 段隔离任务书）：dispatch 出口 OOS 红action——模型面
+# 一切响应剥除样本外语义键（含 entry 回显里的 verify/tier/decay_band 内部
+# 块）。判定词保留（accepted/reason/verification.verdict 是二值面）；这些
+# 键只存在于引擎内部与人读面（registry.json 文件 / verify_ledger.jsonl），
+# 永不经 dispatch 出现在模型面前。
+_OOS_REDACT_KEYS = frozenset({
+    "verify", "tier", "decay_band", "seg_evals", "cumulative_t",
+    "weak_segments", "disaster", "n_segments_evaluated", "n_segments_total",
+    "verify_budget", "oos_receipt", "selection_budget", "segments_sha",
+})
+
+
 def _lossless(value):
     """dispatch 出口消毒（2026-08-25 factor_trail_summary 事故产品化）：
 
@@ -185,7 +200,8 @@ def _lossless(value):
     except Exception:
         pass
     if isinstance(value, dict):
-        return {str(k): _lossless(v) for k, v in value.items()}
+        return {str(k): _lossless(v) for k, v in value.items()
+                if str(k) not in _OOS_REDACT_KEYS}
     if isinstance(value, (list, tuple)):
         return [_lossless(v) for v in value]
     return value
@@ -1286,11 +1302,17 @@ class Bridge:
                                                      cross_h_prior=prior,
                                                      main_horizon=main_h,
                                                      sampler=self._luck)
+                    # 固定墙（B1）：章=固定主值，遥测语义不变（值恒定）
+                    from .factor.hardening import read_wall_config
+                    _wc_stamp = read_wall_config(self.state_root)
+                    _bar_stamp = (float(_wc_stamp["fixed_bar_ic"])
+                                  if _wc_stamp["wall_mode"] == "fixed"
+                                  else float(stats["bar_sigma"]))
                     for e in new_entries:
                         # ceil: stamp >= raw envelope -> gate recomputed from disk is
                         # strictly monotonic (round truncates down 5e-5)
                         e["bar_sigma_at_write"] = math.ceil(
-                            float(stats["bar_sigma"]) * 1e4) / 1e4
+                            float(_bar_stamp) * 1e4) / 1e4
                         e["n_eff_at_write"] = round(float(stats["n_eff"]), 4)
                 except Exception:
                     pass
@@ -1553,7 +1575,9 @@ class Bridge:
         suspects = None
         try:
             env = self.envs.get(env_id)
-            if env is not None:
+            if env is not None and not isinstance(env, TsEnv):
+                # 双池对表是截面构造池（(T,N) 矩阵采样）——ts 线跳过
+                # （诊断/trail/receipt 照常；_fp_cache 亦为截面消费面）
                 import numpy as _np
                 fn = self._compile_factor(source)
                 F = _np.asarray(fn(env), dtype=_np.float64)
@@ -1589,6 +1613,37 @@ class Bridge:
         # 并发评估（多会话/batch 池化）下无锁会互相覆盖丢试验条目
         with state_write_lock(self.state_root):
             self._append_engine_trail(env_id, source_hash, stage, result, suspects)
+        # B6 门事件（2026-11-01 固定墙时代）：development 评估的 provisional
+        # 门决策逐条落账（墙判定/雕刻门/deflated-p 警告）。事件是审计流，
+        # 任何失败不阻断评估。
+        if stage == "development":
+            try:
+                from .factor.hardening import gate_event
+                _dp_ev = result.get("deflated_train") or {}
+                _wall_rej = any("强度低于" in str(f)
+                                for f in (result.get("red_flags") or []))
+                gate_event(self.state_root, "wall_ic", source_hash,
+                           verdict=("reject" if _wall_rej else "pass"),
+                           sr_hat=(round(float(_dp_ev["sr_hat"]), 4)
+                                   if isinstance(_dp_ev.get("sr_hat"), (int, float))
+                                   else None),
+                           sr0=(round(float(_dp_ev["sr0"]), 4)
+                                if isinstance(_dp_ev.get("sr0"), (int, float))
+                                else None),
+                           wall_mode=_dp_ev.get("wall_mode"),
+                           bar_sigma=_dp_ev.get("bar_sigma"), at="evaluate")
+                # 雕刻门事件退役（2026-11-05 段隔离任务书 §〇）：不拦截、
+                # 不路由、不产生判定事件；统计留 diagnosis.carving。
+                _p_ev = _dp_ev.get("p")
+                if isinstance(_p_ev, (int, float)) and _p_ev > 0.05:
+                    gate_event(self.state_root, "deflated_p_warning",
+                               source_hash, verdict="warn",
+                               p=round(float(_p_ev), 4),
+                               bar_sigma=_dp_ev.get("bar_sigma"),
+                               wall_mode=_dp_ev.get("wall_mode"),
+                               at="evaluate")
+            except Exception:
+                pass
         # A2：sketch 已由 _append_engine_trail 摘出存 trail；agent 可见
         # schema 保持不变（ic_series_train 不外泄，registry 不膨胀）
         result.pop("ic_series_train", None)
@@ -1819,6 +1874,7 @@ class Bridge:
             "registry.update": self._registry_update,
             "report.export": self._report_export,
             "book.backfill": self._book_backfill,
+            "factor.book_audit": self._factor_book_audit,
             "journal.read": self._journal_read,
             "journal.append": self._journal_append,
             "journal.update": self._journal_update,
@@ -2064,6 +2120,15 @@ class Bridge:
                 mats = normalize_environment(spec)
                 self.minute_features[env_id] = mats
             return None, spec, self.minute_features[env_id]
+        # ts_single（factor-mining-futures 线）：单品种时序环境，与面板
+        # 平行的第二类评估环境——构建走 build_ts_env，字段 (T,)
+        if spec.kind == "ts_single":
+            if env_id not in self.envs:
+                mats = normalize_environment(spec)
+                self.env_quality[env_id] = None
+                self.envs[env_id] = build_ts_env(
+                    mats, calibration=spec.calibration, instrument=env_id)
+            return self.envs[env_id], spec, None
         if env_id not in self.envs:
             mats = normalize_environment(spec)
             self.env_quality[env_id] = mats.get("dataQuality")
@@ -2075,6 +2140,24 @@ class Bridge:
         if spec.kind != "panel" or env is None:
             raise BridgeError(-32002, f"环境 {env_id} 是 {spec.kind}，不能直接做截面因子评估")
         return env
+
+    def _require_eval_env(self, env_id: str):
+        """评估面环境（panel | ts_single）。截面专属工具（composite/batch/
+        audit/incubate 等列置换族）仍走 _require_panel_env——ts 线拒收。"""
+        env, spec, _ = self._require_env(env_id)
+        if spec.kind not in ("panel", "ts_single") or env is None:
+            raise BridgeError(-32002,
+                              f"环境 {env_id} 是 {spec.kind}，不能做因子评估"
+                              "（支持 panel / ts_single）")
+        return env
+
+    def _enforce_no_cs_ops(self, source: str) -> None:
+        """ts 线 cs_* 截面算子禁用（任务书 §七.3：无截面，引擎校验拒评估）。"""
+        if not source:
+            return
+        from .factor.hardening import CS_OPERATOR_MSG, cs_operator_check
+        if cs_operator_check(source).get("rejected"):
+            raise BridgeError(-32003, CS_OPERATOR_MSG)
 
     def _worker_health(self) -> dict[str, Any]:
         """worker 启动冒烟：--ping 走完整 import 链。结果缓存。
@@ -2092,7 +2175,8 @@ class Bridge:
             if "site-packages" not in src_dir:
                 env_os["PYTHONPATH"] = src_dir + os.pathsep + env_os.get("PYTHONPATH", "")
             proc = subprocess.run(
-                [sys.executable, "-m", "dsh_factor_mining.worker", "--ping"],
+                [worker_python_exe(), "-m", "dsh_factor_mining.worker",
+                 "--ping"],
                 capture_output=True, text=True, timeout=60, env=env_os,
                 cwd=str(Path(self.state_root)))
             if proc.returncode == 0:
@@ -2122,6 +2206,36 @@ class Bridge:
                 "kind": "minute_features",
                 "rows": int(len(frame)),
                 "columns": list(frame.columns),
+            }
+        if spec.kind == "ts_single":
+            _feats = getattr(env, "features", {}) or {}
+            return {
+                "ok": True,
+                "envId": env_id,
+                "kind": "ts_single",
+                "instrument": env.instrument,
+                "T": env.T,
+                "dates": [str(env.dates[0]), str(env.dates[-1])],
+                "fields": ["o", "h", "l", "c", "v", "oi"]
+                          + (["close2"] if env.close2 is not None else []),
+                "features": sorted(_feats),
+                "featureNaN": (env.feature_nan_counts() if _feats else None),
+                "limit_pct": env.limit_pct,
+                "hasClose2": env.close2 is not None,
+                "calibration": {
+                    "frequency": env.calibration.frequency,
+                    "horizon": env.calibration.horizon,
+                    "cost_bps": env.calibration.cost_bps,
+                    "execution": env.calibration.execution,
+                    "dev_end": env.calibration.dev_end,
+                    "sel_end": env.calibration.sel_end,
+                    "regions_mode": ("auto-60/20/20（保底切分，未经用户确认——建议在 config "
+                                     "calibration 里显式写 dev_end/sel_end 并向用户确认）"
+                                     if env.calibration.regions_auto else "manual"),
+                },
+                "note": ("单品种时序环境：因子契约 factor(env) -> (T,)；"
+                         "cs_* 截面算子被禁用（引擎校验拒评估）"),
+                "workerHealth": self._worker_health() if self.execution_mode == "worker" else "n/a(in_process)",
             }
         return {
             "ok": True,
@@ -2159,6 +2273,12 @@ class Bridge:
                 "source 必须是定义 `def factor(env)` 的 Python 源码（函数名必须是 "
                 "factor——random_generate 返回的 source 已符合此格式，原样使用即可；"
                 "手写因子请把函数命名为 factor）")
+        # B7（2026-11-05 段隔离任务书）：AST IO 黑名单——编译前静态扫描，
+        # 文件/网络/动态执行符号 → 拒收（固定文案；防样本外数字经因子值外泄）
+        from .factor.hardening import io_blacklist_check
+        _io_bl = io_blacklist_check(source)
+        if _io_bl.get("rejected"):
+            raise BridgeError(-32003, IO_BLACKLIST_MSG)
         ns: dict[str, Any] = {"__name__": "dsh_factor_mining_user_factor"}
         try:
             code = compile(source, "<factor_source>", "exec")
@@ -2368,7 +2488,7 @@ class Bridge:
             # 墙钟上限不放大（并行本就是为了在墙钟内装更多计算）
             cpu_budget = (timeout_s * resolve_jobs()
                           if method == "factor.evaluate_batch" else timeout_s)
-            cmd = [sys.executable, "-m", "dsh_factor_mining.worker",
+            cmd = [worker_python_exe(), "-m", "dsh_factor_mining.worker",
                    "--request", str(req_path), "--result", str(out_path)]
             # P1/D1：Popen 化——超时时刻先读子进程 CPU 秒再做二维归因
             # （进程退出后句柄失效，必须杀之前读）；cwd 隔离：worker 是纯计算
@@ -3538,6 +3658,14 @@ class Bridge:
             return check_causality(fn, env)
         if method == "factor.evaluate":
             stage = params.get("stage", "development")
+            # P0（2026-11-05 段隔离任务书 §二）：selection/test 一律拒收
+            # （in_process 调试路径与主路径同文案同语义，防旁路）。
+            if stage in ("selection", "test"):
+                raise BridgeError(
+                    -32003,
+                    "样本外评估已内部化，提交后由引擎验证，无可提供数字。"
+                    "开发期评估不传 stage（默认 development 区）；入册走 "
+                    "factor_registry_submit，判定结果随提交响应返回")
             # W2（2026-08-26 规划书）：单次 factor(env) 计时 + submit 噪声门
             # 可行性预警——与 worker.factor.evaluate 同口径（见 noise.factor_perf）；
             # P1：CPU 秒并记（并行下墙钟失真）
@@ -3563,17 +3691,19 @@ class Bridge:
                 _h = int(_h) if _h not in (None, "") else None
             except (TypeError, ValueError):
                 _h = None
+            _wm = params.get("wall_mode")
+            _wm = _wm if _wm in ("fixed", "growing") else None
             if stage == "development":
-                out = evaluate(F, env, n_trials=_nt, pool_std=_ps, horizon=_h,
-                               bar_sigma=_bs)
-            elif stage == "selection":
-                out = evaluate_selection(F, env)
-            elif stage == "test":
-                try:
-                    out = evaluate_test(F, env, state_root=self.state_root)
-                except RuntimeError as e:
-                    raise BridgeError(-32003, str(e)) from None
+                if isinstance(env, TsEnv):
+                    from .factor.evaluate_ts import evaluate_ts as _eval_ts
+                    out = _eval_ts(F, env, n_trials=_nt, pool_std=_ps,
+                                   horizon=_h, bar_sigma=_bs, wall_mode=_wm)
+                else:
+                    out = evaluate(F, env, n_trials=_nt, pool_std=_ps,
+                                   horizon=_h, bar_sigma=_bs, wall_mode=_wm)
             else:
+                # selection/test 已在方法入口拒收（P0 2026-11-05）；
+                # 到达这里 = 未知 stage。
                 raise BridgeError(-32602, f"未知 stage: {stage}")
             if isinstance(out, dict):
                 out["perf"] = _perf
@@ -3596,6 +3726,11 @@ class Bridge:
             _psb = float(_psb) if isinstance(_psb, (int, float)) else None
             return evaluate_batch(F_dict, env, horizon=_h, pool_std=_psb)
         if method == "factor.walk_forward":
+            if isinstance(env, TsEnv):
+                from .factor.evaluate_ts import evaluate_walk_forward_ts as _wf_ts
+                return _wf_ts(
+                    fn(env), env, n_folds=int(params.get("n_folds", 5)),
+                    t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
             return evaluate_walk_forward(
                 fn(env), env, n_folds=int(params.get("n_folds", 5)),
                 t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
@@ -3944,8 +4079,10 @@ class Bridge:
 
     def _factor_check_causality(self, params):
         env_id = params.get("envId", "primary")
-        env = self._require_panel_env(env_id)
+        env = self._require_eval_env(env_id)
         source = params.get("source", "")
+        if isinstance(env, TsEnv):
+            self._enforce_no_cs_ops(source)
         # 低效模式扫描（效率防御层1）：A 类硬拒（与 _enforce_causality 同判，
         # agent 显式 check 时即看到拒绝与替换模板）；B 类 warning 附结果
         ineff = scan_inefficiency(source)
@@ -4186,7 +4323,12 @@ class Bridge:
                 s0_emp = self._landscape_tail_s0(env_id)
             except Exception:
                 s0_emp = None
-        bar = tail_deflation_bar(max(n_eff, 1), n_days, s0_emp=s0_emp)
+        from .factor.hardening import read_wall_config
+        _wc_t = read_wall_config(self.state_root)
+        bar = tail_deflation_bar(max(n_eff, 1), n_days, s0_emp=s0_emp,
+                                 fixed_bar=(_wc_t["fixed_bar_tail"]
+                                            if _wc_t["wall_mode"] == "fixed"
+                                            else None))
         if isinstance(bar, dict) and bar.get("ok"):
             out["bar"] = {"value": bar.get("bar"),
                           "s0_source": bar.get("s0_source")}
@@ -4237,6 +4379,11 @@ class Bridge:
             stats = self._n_eff_from_entries(
                 engine_trail, None, main_horizon=main_h, sampler=self._luck)
             bar = float(stats.get("bar_sigma") or 0.0)
+            # 固定墙（B1）：近失"现价"重算用同一墙值（固定模式下恒定）
+            from .factor.hardening import read_wall_config
+            _wc_d = read_wall_config(self.state_root)
+            if _wc_d["wall_mode"] == "fixed":
+                bar = float(_wc_d["fixed_bar_ic"])
         except Exception:
             return {"queue": [], "note": "选择运气采样失败——近失现价不可算"}
         if bar <= 0:
@@ -4704,6 +4851,15 @@ class Bridge:
         stats = self._n_eff_from_entries(entries, source_hash, horizon,
                                          cross_h_prior=prior, main_horizon=main_h,
                                          sampler=_smp)
+        # 固定墙短路（B1 2026-11-01）：wall_mode=fixed 时 bar_sigma 恒等于
+        # 固定主值——一切读试验计数计价的路径在此短路（含 mechanism 层
+        # 影子口径）；n_trials/n_eff 保留原值继续作遥测。回滚=配置改回
+        # growing + 新桥进程，代码零改动。
+        from .factor.hardening import read_wall_config
+        _wc = read_wall_config(self.state_root)
+        if _wc["wall_mode"] == "fixed":
+            stats = {**stats, "bar_sigma": float(_wc["fixed_bar_ic"]),
+                     "wall_mode": "fixed"}
         # per-horizon trail IC_IR std（旧条目无 horizon → 归主 horizon）
         def _h_match(e) -> bool:
             if not isinstance(e, dict) or not isinstance(e.get("ic_ir"), (int, float)):
@@ -5055,24 +5211,8 @@ class Bridge:
             stop_kind = "direction_budget"
             stop_reason = fam_conv[1] + "——必须换向（断链后判定自动重置）"
         state = "running" if stop_kind is None else "must_rotate"
-        # test 已烧告警（A.3.1：test 一次性锁保留为工具级硬锁——test 区
-        # 评估拒绝、任何 reset 不可重置；状态页如实告警，不再作 loop 停点）。
-        # 只认 consumed=True：test 的 claim→finalize 窗口内锁文件已在但
-        # 尚未消费，不算已烧（review 修复——防窗口期误亮）
-        test_burned = None
-        _tl_path = Path(self.state_root) / "test_lock.json"
-        _tl_burned = False
-        if _tl_path.exists():
-            try:
-                _tl_burned = bool(json.loads(
-                    _tl_path.read_text(encoding="utf-8")).get("consumed"))
-            except Exception:
-                _tl_burned = True  # 锁文件不可读按已烧保守处理
-        if _tl_burned or mining.get("finalized"):
-            test_burned = ("test 已烧（一次性锁仍在工具级生效）——本数据"
-                           "环境的信息增量已基本挖尽，建议数据集轮换（用户"
-                           "操作）。在此之前 development/selection 区照常"
-                           "可用，引擎照常推进")
+        # test_burned 告警退役（2026-11-05 段隔离任务书）：selection/test
+        # 工具面已整体下线，一次性锁不再有消费通道——告警失去对象。
         # 上一轮自己声明的下一步（引擎原样回显——执行或证伪，不得静默放弃）；
         # 停笔宣言不接受回显，降级为 pending_rejected 并点名拒收。
         # 灵感重置声明（2026-09-01 WS-B/D1）判定序最先：合法声明走配额
@@ -5557,10 +5697,16 @@ class Bridge:
         # 写入脑补成自己超时调用的完成。归属说清，观测不再污染归因
         foreign = n_trials - n_trials_lane
         if foreign > 0:
+            from .factor.hardening import read_wall_config
+            _wc_ln = read_wall_config(self.state_root)
+            _wall_note_ln = (
+                "入册强度线恒定（固定墙模式，不随试验数增长）"
+                if _wc_ln["wall_mode"] == "fixed"
+                else "其它线的试验照常抬高本线门槛（多重检验全量计数）")
             loop["lane_note"] = (
                 f"并行线模式：本线 {n_trials_lane} / 全局 {n_trials} 条试验"
-                f"（其它线 {foreign} 条）。n_trials 与 tail bar 按全局计价"
-                "——其它线的试验照常抬高本线门槛（多重检验全量计数）；"
+                f"（其它线 {foreign} 条）。n_trials 与 tail bar 按全局计价——"
+                f"{_wall_note_ln}；"
                 "pending/族链/方向预算只统计本线")
         # 调度器遥测与选点（2026-09-29 任务书 3a/4a）：scheduler 块 = 影子
         # 打分遥测（不执行）；scheduler_picks = 执行灰度的点名行——只含
@@ -5576,10 +5722,6 @@ class Bridge:
         # primitives_shadow.jsonl）
         if prim_tel is not None:
             loop["primitives"] = prim_tel
-        # test 已烧告警（永续验收 A.3.1：工具级硬锁保留，状态页如实告警
-        # 「建议数据集轮换」，不再是 loop 停点）
-        if test_burned is not None:
-            loop["test_burned"] = test_burned
         # W3（2026-08-26 规划书）：最近 30 分钟 infra 失败（-32005）≥1 → 附加
         # 纠偏引导——超时后 agent 的下一个成功调用（status/evaluate/
         # trail_summary）即收到。纯附加遥测：不影响上面任何停走判定，
@@ -5622,68 +5764,32 @@ class Bridge:
                 "收到两者皆空）。轮询方法：{\"job_id\": \"job-...\"}——"
                 "evaluate/composite/batch/audit 的作业均可这样取回。")
         env_id = params.get("envId", "primary")
-        # test 纪律锁前置检查（2026-08-18 独立审计 F-TP-01 澄清后的 UX 修正）：
-        # 绕过链本身不成立（reset scope=all 后重配+load，evaluate_test 内部
-        # 仍会拒——lock 读 stateRoot 文件与 env 无关）；但 reset 后 env 丢失
-        # 会让错误先以 -32001（数据缺失）报出，制造「锁被绕过」的误读。
-        # 前置检查让纪律锁的错误永远最先、最准确。
-        if params.get("stage", "development") == "test":
-            lock_path = Path(self.state_root) / "test_lock.json"
-            if lock_path.exists():
-                try:
-                    _tl = json.loads(lock_path.read_text(encoding="utf-8"))
-                    if _tl.get("consumed", False):
-                        raise BridgeError(
-                            -32003,
-                            "test 已被消费（test_lock.json）。test 是最终消耗品，禁止反复评估调参。"
-                            "锁不在任何 reset scope——只能手动删除（意味着声明放弃本 stateRoot 的 test 纪律）。")
-                    # 并行 P0 claim 态：另一进程正在评估 test（claim-then-compute）
-                    _cl = _tl.get("claim") or {}
-                    _cpid = _cl.get("pid")
-                    if _cpid and pid_alive(int(_cpid)) and int(_cpid) != os.getpid():
-                        raise BridgeError(
-                            -32003,
-                            f"test 正在被另一进程评估（PID={_cpid}，始于 {_cl.get('ts', '?')}）——"
-                            "等它完成后再试；确认其已崩溃可手动删除 test_lock.json 的 claim 后重试。")
-                except BridgeError:
-                    raise
-                except Exception:
-                    pass  # 锁文件损坏：放行到 evaluate_test 内部路径统一处理
-        env = self._require_panel_env(env_id)
+        # P0（2026-11-05 段隔离任务书 §二）：selection/test 两 stage 对模型
+        # 调用一律拒收——样本外评估已内部化（提交后由引擎在冻结多段数据上
+        # 验证，模型只收二值判定）。固定文案：零数字、零段数、零原因
+        # （隔离红线：模型面不得出现任何样本外信息，包括拒绝理由）。
+        # test 纪律锁前置检查与 stage!=development 分支随 selection/test
+        # 拒收一并退役（上游已拒，分支不可达）。
+        if params.get("stage", "development") in ("selection", "test"):
+            raise BridgeError(
+                -32003,
+                "样本外评估已内部化，提交后由引擎验证，无可提供数字。"
+                "开发期评估不传 stage（默认 development 区）；入册走 "
+                "factor_registry_submit，判定结果随提交响应返回")
+        env = self._require_eval_env(env_id)
         source = params.get("source", "")
+        if isinstance(env, TsEnv):
+            # ts 线契约（任务书 §七.3）：cs_* 截面算子禁用——引擎校验拒评估
+            self._enforce_no_cs_ops(source)
         stage = params.get("stage", "development")
         # 因果门：同步路径就地执行；异步路径（层 0c）随作业线程执行
         # （causality_gate 元数据标记）——提交侧零 worker 调用
         if not self._async_evaluate_enabled(params):
             self._enforce_causality(source, env, env_id)
         source_hash = source_fingerprint(source)
-        if stage != "development":
-            params = {**params, "source_hash": source_hash}
-            if stage == "test":
-                # test 准入前置（2026-08-28 加固）：test 是 stateRoot 级一次性
-                # 资源（全局锁挡**重复**消费），还须挡**浪费**消费——2026-08-24
-                # 生产取证：唯一一发 test 烧给了从未提交的候选（registry 查无
-                # 此 hash），已准入因子从此无 test 测量。test 只测已入册候选。
-                if not any(isinstance(r, dict)
-                           and r.get("source_hash") == source_hash
-                           and bool(r.get("accepted"))
-                           for r in read_registry(self.state_root)):
-                    raise BridgeError(
-                        -32003,
-                        f"test 只测已入册候选：source hash {source_hash[:12]} "
-                        "不在 registry 或未 accepted——先 factor_registry_submit"
-                        "通过准入再测。test 是 stateRoot 级一次性资源"
-                        "（2026-08-24 教训：唯一一发烧给了从未提交的候选），"
-                        "未入册的候选不得消耗它")
-            # 层 0c：selection/test 计算异步化（默认；async:false 逃生阀）——
-            # 纪律检查（锁/准入）全部在提交侧同步完成（R4），claim-then-compute
-            # 的 claim 在计算路径内（evaluate_test），语义不变
-            if self._async_evaluate_enabled(params):
-                return self._async_submit(
-                    "factor.evaluate", source, params, env, env_id,
-                    extra_meta={"stage": stage, "causality_gate": True})
-            result = self._run_factor("factor.evaluate", source, params, env)
-            return self._wrap_diagnosis(env_id, source, stage, result)
+        # stage != development 分支退役（2026-11-05 P0）：selection/test 已
+        # 在方法入口拒收，此处仅剩 development 路径（保留 stage 变量供
+        # trail/遥测字段使用）。
 
         # S1 拒绝即信息门（2026-09-04 探索相似性防线）：仅 development
         # 新提案路径；提交侧同步执行、零 trial；scan/profile 只判一次。
@@ -5742,15 +5848,19 @@ class Bridge:
         # v3：门参数 bar_sigma = E[max|X|]（σ 单位）；n_trials 降级为遥测。
         stats, trail_std = self._trial_stats(source_hash, h, env_id)
         pool_std, _detector = self._resolve_pool_std(env_id, trail_std, h)
+        from .factor.hardening import read_wall_config
+        _wc_ev = read_wall_config(self.state_root)
         params = {**params, "bar_sigma": stats["bar_sigma"],
                   "n_trials": stats["n_trials"], "pool_std": pool_std,
+                  "wall_mode": _wc_ev["wall_mode"],
                   "source_hash": source_hash}
         # C1 缓存预检（修正案 A）：development 纯读——命中直接回，零子
         # 进程/零 env.npz 序列化（个股面板每次省几十秒）；_wrap_diagnosis
         # 照跑（池/trail/指纹语义不变）。写回由 worker 侧完成（同一键：
         # env_fp 注入 params，两层共用 eval_key_from_parts 归一）。
         env_fp = self._env_full_fingerprint(env_id)
-        if env_fp:
+        # ts 线不缓存：(T,) 评估毫秒级，缓存键复杂度不值（面板路径照旧）
+        if env_fp and not isinstance(env, TsEnv):
             params = {**params, "env_fp": env_fp}
             ck = eval_key_from_parts(source_hash, env_fp, env, horizon=h,
                                      n_trials=stats["n_trials"],
@@ -5974,7 +6084,7 @@ class Bridge:
         种子默认从环境指纹派生（同环境可复现），显式 seed 覆盖。"""
         import hashlib
 
-        env = self._require_panel_env(params.get("envId", "primary"))
+        env = self._require_eval_env(params.get("envId", "primary"))
         source = params.get("source")
         if not source:
             raise BridgeError(-32602, "source 必填（def factor(env) 源码）")
@@ -6052,7 +6162,7 @@ class Bridge:
         种子默认从环境指纹派生（同环境可复现），显式 seed 覆盖。"""
         import hashlib
 
-        env = self._require_panel_env(params.get("envId", "primary"))
+        env = self._require_eval_env(params.get("envId", "primary"))
         source = params.get("source")
         if not source:
             raise BridgeError(-32602, "source 必填（def factor(env) 源码）")
@@ -6075,34 +6185,32 @@ class Bridge:
         return result
 
     def _factor_walk_forward(self, params):
-        env = self._require_panel_env(params.get("envId", "primary"))
-        # 2026-08-18 生产审计修正（test 泄漏）：walk_forward 曾默认跑到数据尾，
-        # fold4/fold5 直接把 test 区间的 IC 表现暴露给入册决策——test_lock 只
-        # 护 evaluate_test，这条路绕过了它。现强制 region 感知：
-        #   - 无 t1 → 默认 sel_end（selection 区，诊断用）
-        #   - 显式 t1 > sel_end → 拒绝（test 只经 factor_evaluate(stage='test')
-        #     的 finalize 流程一次性消费）
-        sel_end = env.calibration.sel_end
+        env = self._require_eval_env(params.get("envId", "primary"))
+        # P0（2026-11-05 段隔离任务书 §二）：dev_end 之后的一切数据都不再
+        # 对模型开放（原 sel_end 边界随之作废）——滚动验证限制在 dev 区：
+        #   - 无 t1 → 默认 dev_end（dev 内滚动）
+        #   - 显式 t1 > dev_end → 拒绝
+        dev_end = env.calibration.dev_end
         t1 = params.get("t1_date")
         if t1 is None:
-            t1 = sel_end
-        elif sel_end:
+            t1 = dev_end
+        elif dev_end:
             import pandas as _pd
             try:
-                t1_over = _pd.Timestamp(str(t1)) > _pd.Timestamp(str(sel_end))
+                t1_over = _pd.Timestamp(str(t1)) > _pd.Timestamp(str(dev_end))
             except Exception:
                 t1_over = True  # 解析不了的日期越界处理（保守拒绝）
             if t1_over:
                 raise BridgeError(
                     -32003,
-                    f"walk_forward 的 t1_date={t1} 越过 sel_end={sel_end}——test 区只经 "
-                    "factor_evaluate(stage='test') 的 finalize 流程一次性消费，"
-                    "不得经 walk_forward 窥视。省略 t1_date 即默认限制在 selection 区。")
+                    f"walk_forward 的 t1_date={t1} 越过 dev_end={dev_end}——"
+                    "开发期工具只在开发数据上工作；样本外数据不提供任何"
+                    "数值。省略 t1_date 即默认限制在 dev 区内")
         params = {**params, "t1_date": t1}
         result = self._run_factor("factor.walk_forward", params.get("source", ""), params, env)
         if isinstance(result, dict):
-            result["region_note"] = (f"t1 已限制在 sel_end={sel_end}（selection 区）——"
-                                     "test 区不经 walk_forward 暴露")
+            result["region_note"] = (f"t1 已限制在 dev_end={dev_end}（开发区）——"
+                                     "样本外数据不经 walk_forward 暴露")
         return result
 
     def _factor_audit(self, params):
@@ -6118,6 +6226,93 @@ class Bridge:
         return self._run_factor("factor.audit", params.get("source", ""), params, env)
 
     # ---- 随机种子生成器（用户决策 2026-08-17：随机校准替代固定面板）----
+    def _random_explore_ts(self, env, params, n: int) -> dict:
+        """ts 线 explore（单列表简版）：随机树 → ts 轻量 IR 排序 → top_k 源码。
+
+        与面板版差异：无 spread/成本平局列表（无截面尾轨，任务书 §五）；
+        ts 轻量诊断=light_ic_scan_ts（乘积序列 IR）。seed 冲突纪律与面板
+        版同款（与 null 校准 seed 相同 = 零信息重放，拒绝）。"""
+        from .factor import random_gen
+
+        top_k = int(params.get("top_k", 5))
+        landscape = random_gen.read_null_landscape(self.state_root)
+        null_seed = (landscape or {}).get("seed") \
+            if (landscape or {}).get("calibrated", True) else None
+        if "seed" in params and params["seed"] is not None:
+            seed = int(params["seed"])
+            if null_seed is not None and seed == int(null_seed):
+                raise BridgeError(
+                    -32602,
+                    f"explore seed={seed} 与 null 校准的 seed 相同——生成的前 {n} 棵树"
+                    f"将与 null 校准（n={landscape.get('n_generated')}）的前缀完全重放，"
+                    "信息量为零。换一个 seed，或省略 seed 参数走运行时自动派生。")
+            seed_note = f"seed={seed}（显式指定）"
+        else:
+            import secrets as _secrets
+            seed = _secrets.randbelow(10 ** 9)
+            seed_note = (f"seed_used={seed}（运行时自动派生，与 null 校准 seed={null_seed} "
+                         "不冲突；复现本批结果时用该 seed）")
+        rng = np.random.default_rng(seed)
+        opset = random_gen.ts_opset(self.state_root)
+        leaves = random_gen.env_leaves(env)
+        results = []
+        for i in range(n):
+            tree, tpl = random_gen.generate_one(rng, opset, leaves=leaves,
+                                                require_cs=False)
+            try:
+                F = random_gen._eval_tree(tree, env)
+                ph = random_gen.matrix_health(F)
+                if ph is not None:
+                    diag = {"ic_ir": None, "n": 0,
+                            "error": f"random-pathology:{ph.get('pathology')}"}
+                else:
+                    diag = random_gen.light_ic_scan_ts(F, env)
+            except Exception as e:  # noqa: BLE001 — 坏树隔离（面板版同款）
+                diag = {"ic_ir": None, "n": 0, "error": str(e)[:120]}
+            results.append({"index": i, "expression": tree.to_expression(),
+                            "template": tpl, "light_ic": diag, "tree": tree})
+
+        def _abs_ic(r):
+            v = r["light_ic"].get("ic_ir")
+            return abs(float(v)) if isinstance(v, (int, float)) else None
+
+        ranked = sorted((r for r in results if _abs_ic(r) is not None),
+                        key=lambda r: -_abs_ic(r))
+        top = []
+        for r in ranked[:top_k]:
+            src, _imports = random_gen.render_factor_source(
+                r["tree"], f"random_factor_{r['index']}",
+                template=r.get("template"), series_mode=True)
+            top.append({
+                "index": r["index"], "expression": r["expression"],
+                "template": r.get("template"), "light_ic": r["light_ic"],
+                "source": src,
+                "note": ("随机幸存=选择非结论：拿 source 走标准管线 "
+                         "factor_check_causality→factor_evaluate→"
+                         "factor_registry_submit"),
+            })
+        dist = [abs(r["light_ic"].get("ic_ir") or 0.0) for r in results]
+        # WS-C 同款：幸存者哈希入本线台账（origin=random 判据照常工作）
+        try:
+            lane_explore_hashes_extend(
+                self.state_root, current_lane(),
+                sorted({source_fingerprint(x["source"]) for x in top}))
+        except Exception:
+            pass
+        return {
+            "mode": "explore", "line": "ts_single", "n": n, "seed": seed,
+            "seed_note": seed_note, "top_k": top_k, "top": top,
+            "abs_ic_ir_distribution": {
+                "median": float(np.median(dist)) if dist else None,
+                "p95": float(np.percentile(dist, 95)) if dist else None,
+                "max": float(np.max(dist)) if dist else None,
+            },
+            "null_hint": ("top 因子的 |IC_IR| 若未超 null p95，大概率是噪声"
+                          "（见 factor.null_landscape）；ts 线 IR=乘积序列"
+                          "（z(信号)×前向收益）的均值/标准差"),
+            "note": "ts 线单列表（无截面尾轨/成本平局列表）；选择不是结论",
+        }
+
     def _factor_random_generate(self, params):
         """随机因子生成。mode: explore（生成+轻量IC+top_k 源码）| null-calibration（null 地形）| collision-card（概念刺激卡，2026-09-22 灵感源二代）。
 
@@ -6130,7 +6325,19 @@ class Bridge:
         from .factor import random_gen
 
         mode = params.get("mode", "explore")
-        n = int(params.get("n", 50))
+        # ts 线缺省加倍（2026-11-07 lh 生产实证）：n=50 下病态树过滤后仅
+        # ~29 棵有效，(p90-p10) 分位数欠采样 → pool_std 估计噪声大
+        # （h=20 实测 0.34 vs n=200 的 0.18 量级差）；cross_horizon_corr
+        # 的 ≥30 共同样本门在同批树两两配对上也necessarily全灭。面板缺省
+        # 50 维持不变（行为零变更）。
+        _ts_default_n = 200
+        try:
+            _is_ts = isinstance(
+                self._require_eval_env(params.get("envId", "primary")), TsEnv)
+        except Exception:
+            _is_ts = False
+        n = int(params.get("n", _ts_default_n if _is_ts and mode in
+                           ("null-calibration", "explore") else 50))
         opset = random_gen.effective_operator_set(self.state_root)
 
         if mode == "collision-card":
@@ -6147,7 +6354,7 @@ class Bridge:
 
         if mode == "null-calibration":
             env_id = params.get("envId", "primary")
-            env = self._require_panel_env(env_id)
+            env = self._require_eval_env(env_id)
             seed = int(params.get("seed", 42))
             # 指纹硬门（2026-08-19）：写盘时绑定环境三元组指纹，evaluate 读时校验
             # v2（2026-08-20）：菜单内全部 horizon 各建一份分位基线 + 实测跨
@@ -6158,6 +6365,15 @@ class Bridge:
                 fp_env = env_id
             menu = list(getattr(env.calibration, "horizon_menu", None)
                         or [env.calibration.horizon])
+            if isinstance(env, TsEnv):
+                # ts 线 null 校准（任务书 §六.1 Day 1）：随机树 ts 评估 →
+                # null 地形 → pool_std。算子集剔除 cs_*（无截面）——指纹
+                # 自然区分面板/ts 地形，互不误用。
+                return random_gen.run_null_calibration_ts(
+                    env, self.state_root, n=n, seed=seed,
+                    opset=random_gen.ts_opset(self.state_root),
+                    env_fingerprint=self._landscape_env_fingerprint(fp_env),
+                    horizons=menu)
             return random_gen.run_null_calibration(
                 env, self.state_root, n=n, seed=seed, opset=opset,
                 # 2026-09-18 缝1正修：地形绑定含算子集指纹（写入/校验同合成）
@@ -6171,7 +6387,9 @@ class Bridge:
                     "null-calibration", done, total))
 
         # explore：生成 n → 轻量 IC 排序 → top_k 源码 + 表达式
-        env = self._require_panel_env(params.get("envId", "primary"))
+        env = self._require_eval_env(params.get("envId", "primary"))
+        if isinstance(env, TsEnv):
+            return self._random_explore_ts(env, params, n)
         top_k = int(params.get("top_k", 5))
         landscape = random_gen.read_null_landscape(self.state_root)
         null_seed = (landscape or {}).get("seed") if (landscape or {}).get("calibrated", True) else None
@@ -6765,6 +6983,9 @@ class Bridge:
             "explored_count": len(explored),
             "red_flagged": red_flagged[-10:],
             "pool": self._pool().stats(),
+            # 固定墙+预算遥测（B1/B4 2026-11-01）：人读+引擎内部审计面
+            # （factor_status 消费）——数字不进提示词，仅判定与指引进。
+            "fixed_wall": self._wall_telemetry_block(),
             "note": ("引擎层 trail 为 evaluate 自动记录（硬事实，不可瞒报）；"
                      "last_engine_trail 为名词化投影（身份+红旗名，评估数字"
                      "不进历史滚动视图——当次评估的完整数字在 evaluate 响应）"
@@ -6775,6 +6996,42 @@ class Bridge:
 
     def _state_mining_get(self, params):
         return read_mining_state(self.state_root)
+
+    def _wall_telemetry_block(self) -> dict:
+        """固定墙遥测块（trail_summary 消费；失败 → 空块）。
+
+        B9（2026-11-05 段隔离任务书）：selection 预算块随 selection 工具
+        面退役；验证额度只给档位不给数字。
+        """
+        try:
+            from .factor.hardening import read_wall_config
+            wc = read_wall_config(self.state_root)
+            out = {"wall_mode": wc["wall_mode"],
+                   "fixed_bar_ic": wc["fixed_bar_ic"],
+                   "fixed_bar_tail": wc["fixed_bar_tail"],
+                   "note": wc.get("fixed_wall_note"),
+                   "degraded": wc.get("_degraded")}
+            # 验证额度档位（零数字：充裕/紧张/用尽——按当前周消耗对账）
+            try:
+                from .factor.verify import WEEKLY_FAMILY_CAP, budget_ledger_path
+                p = budget_ledger_path(self.state_root)
+                wk_used = 0
+                if p.exists():
+                    import json as _json
+                    from .factor.verify import _week_key
+                    data = _json.loads(p.read_text(encoding="utf-8"))
+                    wk = _week_key()
+                    for fam in (data.get("buckets") or {}).values():
+                        wk_used = max(wk_used, int(
+                            (fam.get("weeks") or {}).get(wk, 0)))
+                out["verify_budget_band"] = (
+                    "用尽" if wk_used >= WEEKLY_FAMILY_CAP
+                    else ("紧张" if wk_used >= WEEKLY_FAMILY_CAP * 0.8 else "充裕"))
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"[:120]}
 
     def _state_mining_record(self, params):
         return record_round(_as_dict(params.get("entry") or {}, "entry"), self.state_root)
@@ -6882,8 +7139,7 @@ class Bridge:
         result = {
             "ok": not skipped, "scope": scope, "removed": removed,
             "backup": str(backup_dir) if backup_dir is not None else None,
-            "note": ("test_lock 不在任何 scope（纪律锁只能手动删）；备份在 stateRoot/backups/ 下"
-                     "可随时还原"),
+            "note": ("备份在 stateRoot/backups/ 下可随时还原"),
         }
         if skipped:
             result["skipped"] = skipped
@@ -7014,7 +7270,7 @@ class Bridge:
         # 地形绑定的加载后口径必然 mismatch → pool_std=None → "不可算"
         # 拒绝（2026-09-04/05 五连实证；同进程 data.load 后即恢复）。前置
         # _require_panel_env 一次性修复整条重算链。
-        _entry_env = self._require_panel_env(params.get("envId", "primary"))
+        _entry_env = self._require_eval_env(params.get("envId", "primary"))
         verified = self._verify_receipt(diagnosis)
         if verified is False:
             # receipt 在场但不匹配 = 关键数字（IC/充分统计量）被改动——
@@ -7142,6 +7398,27 @@ class Bridge:
         # - 带 p 但缺 sr_hat 充分统计量 = 拒（伪造 p 无法重算验证）
         # - 无 source/_meta 的诊断也重算（N_eff 按当前 trail，本因子不计入）：
         #   伪造诊断不得因缺 hash 而逃脱 trail 口径
+        # ---- A2（2026-11-05 段隔离任务书）：族级验证预算前置检查 ----
+        # 每线每自然周每构造族 60 次判定额度（桶键=AST 算子多重集哈希）。
+        # 超额 → 事务性拒收（不烧名、不落盘），固定文案零数字。ic/tail
+        # 两轨都消耗（尾轨段验证 2026-11-05 收尾任务书 §四 1 接线后同桶
+        # ——判定即额度，防两轨绕倍）。
+        _verify_mode = verify_mode(self.state_root)
+        if source and _verify_mode == "internal_sprt" \
+                and str(params.get("admit_basis") or "ic") in ("ic", "tail"):
+            from .factor.verify import (budget_status as _vb_status,
+                                        family_fingerprint as _vfam)
+            _fam = _vfam(str(source))
+            _vb = _vb_status(self.state_root, _fam)
+            if _vb["exhausted"]:
+                from .factor.verify import TEXT_BUDGET as _T_BUDGET
+                try:
+                    gate_event(self.state_root, "verify_budget", source_hash,
+                               verdict="reject", family=_fam,
+                               week=_vb["week"])
+                except Exception:
+                    pass
+                raise BridgeError(-32003, _T_BUDGET)
         dp = diagnosis.get("deflated_train")
         if not isinstance(dp, dict) or not dp:
             raise BridgeError(-32602,
@@ -7189,18 +7466,31 @@ class Bridge:
                                          dp.get("kurt"), dp.get("n_obs"))
             p_new = _dsr_p_from_stats(sr_u, g3_u, g4_u, n_u,
                                       stats["bar_sigma"], pool_std)
+            from .factor.hardening import read_wall_config
+            _wc_sub2 = read_wall_config(self.state_root)
+            # 权威快照（2026-11-01 固定墙时代补全）：入册强度线/雕刻外的
+            # 纪律重判消费 diagnosis.deflated_train 的 (sr_hat, sr0)——陈旧
+            # 诊断（缓存命中/跨墙模式翻转）携带旧墙 sr0 会误挂红牌。重算
+            # 块把门实际消费的四个充分统计量与 sr0 一并写回（auth 在场时
+            # 即引擎侧数字，防编造语义不变）。
+            _sr0_u = (float(stats["bar_sigma"]) * float(pool_std)
+                      if isinstance(pool_std, (int, float)) and pool_std else None)
             diagnosis["deflated_train"] = {**dp, "p": p_new,
                                            "n_trials": float(stats["n_trials"]),
                                            "n_eff": float(stats["n_eff"]),
                                            "bar_sigma": float(stats["bar_sigma"]),
                                            "pool_std": pool_std,
+                                           "sr0": _sr0_u,
+                                           "sr_hat": sr_u, "skew": g3_u,
+                                           "kurt": g4_u, "n_obs": n_u,
+                                           "wall_mode": _wc_sub2["wall_mode"],
                                            "nu": stats.get("nu"),
                                            "stats_from_trail": auth is not None,
                                            "recomputed_at_submit": True}
-        # 通道⑤ 豁免(批次4,2026-09-13):孵化幸存者豁免 dev deflated p——
-        # 复活证据=新鲜窗口 OOS t>z(cohort 校正),选择影子不跨样本,dev 的
-        # 选择运气价不再重复征收。仅豁免多重检验红旗这一项;噪声/正交/
-        # 同构/其他 red flag 照旧。验证口=incubation/survivors.jsonl(引擎写)
+        # 通道⑤ 标注(批次4,2026-09-13；B2 后简化)：孵化幸存者=新鲜窗口 OOS
+        # 复活证据在 incubation/survivors.jsonl（验证口引擎写）。deflated p
+        # 已全量降级为警告（B2 2026-11-01），此前的 p 豁免改写不再需要——
+        # 存活证据转为下方 OOS 凭据前置的等价票据自动补开。
         incubated_marker = None
         if params.get("incubated_cohort"):
             from .incubate import is_survivor
@@ -7208,26 +7498,104 @@ class Bridge:
             if sv is not None:
                 incubated_marker = {"cohort_id": sv.get("cohort_id"),
                                     "t": sv.get("t")}
-                _rf = [f for f in (diagnosis.get("red_flags") or [])
-                       if not ("deflated p" in str(f) or "池分布基线" in str(f))]
-                if len(_rf) != len(diagnosis.get("red_flags") or []):
-                    diagnosis["red_flags"] = _rf
-                    if not _rf:
-                        diagnosis["verdict"] = "pass"
-                # passes_acceptance 同样门控 p(evaluate.py 单检验函数)——
-                # 豁免口径:原 p 存档审计,判定走复活证据
-                _dp2 = diagnosis.get("deflated_train")
-                if isinstance(_dp2, dict) and _dp2.get("p") is not None:
-                    _dp2["p_dev_original"] = _dp2.get("p")
-                    _dp2["p"] = 0.001
-                    _dp2["p_incubation_waived"] = True
+        # ---- 固定墙时代提交链（B2/B3/C，2026-11-01）----
+        from .discipline import red_flags_and_verdict as _rfv_sub
+        from .factor.hardening import (gate_event, m3_check, m8_check,
+                                       open_oos_receipt, oos_receipt_for,
+                                       read_wall_config)
+        _wc_fx = read_wall_config(self.state_root)
+        _dp_fx = diagnosis.get("deflated_train") or {}
+        # B2+B1 权威重判：在重算后的 deflated_train（含 wall_mode 标注）上
+        # 重跑纪律层——红牌集合（入册强度线/雕刻/荒谬值）与警告集合
+        # （deflated p>0.05 降级）以提交时刻为准；evaluate 侧是 provisional
+        # 口径（pending 计数）。growing 模式下墙只升不降，evaluate 过/提交
+        # 拒可能（反之不可能）；fixed 模式两时点同值。配置翻转（评估在
+        # growing、提交在 fixed）也由重判自然吸收。
+        _gv_fx = _rfv_sub(diagnosis, region="train")
+        diagnosis["red_flags"] = _gv_fx["red_flags"]
+        diagnosis["verdict"] = _gv_fx["verdict"]
+        if _gv_fx.get("warnings"):
+            _wl_fx = diagnosis.get("warnings")
+            if not isinstance(_wl_fx, list):
+                _wl_fx = []
+            _wl_fx.extend(w for w in _gv_fx["warnings"] if w not in _wl_fx)
+            diagnosis["warnings"] = _wl_fx
+        _sr_fx = _dp_fx.get("sr_hat")
+        _sr0_fx = _dp_fx.get("sr0")
+        _wall_fail = any("强度低于" in str(f) for f in _gv_fx["red_flags"])
+        if isinstance(_dp_fx.get("p"), (int, float)) and _dp_fx["p"] > 0.05:
+            gate_event(self.state_root, "deflated_p_warning", source_hash,
+                       verdict="warn", p=round(float(_dp_fx["p"]), 4),
+                       bar_sigma=_dp_fx.get("bar_sigma"),
+                       wall_mode=_wc_fx["wall_mode"])
+        gate_event(self.state_root, "wall_ic", source_hash,
+                   verdict=("reject" if _wall_fail else "pass"),
+                   sr_hat=(round(float(_sr_fx), 4)
+                           if isinstance(_sr_fx, (int, float)) else None),
+                   sr0=(round(float(_sr0_fx), 4)
+                        if isinstance(_sr0_fx, (int, float)) else None),
+                   wall_mode=_wc_fx["wall_mode"],
+                   bar_sigma=_dp_fx.get("bar_sigma"))
+        # 雕刻门事件退役（2026-11-05 段隔离任务书 §〇）：不再产生判定事件；
+        # 逐年一致性统计保留在 diagnosis.carving（描述字段）。
+        # OOS 凭据硬前置退役（2026-11-05 段隔离任务书 §〇/A2）：selection
+        # 区评估已下线（P0），凭据不再是入册前置——样本外验证整体内部化，
+        # 由引擎在提交终段自主执行（见下方 internal_sprt 块）。孵化幸存者
+        # 票据保留为证据标注（补记审计轨迹，非门）。
+        if (incubated_marker is not None and source_hash
+                and oos_receipt_for(self.state_root, source_hash) is None):
+            open_oos_receipt(self.state_root, source_hash,
+                             "incubation_survivor",
+                             {"cohort_id": incubated_marker.get("cohort_id"),
+                              "t": incubated_marker.get("t"),
+                              "note": "孵化幸存=新鲜窗口 OOS 复活证据；提交时自动补票"})
+        _rcpt = oos_receipt_for(self.state_root, source_hash) \
+            if source_hash else None
+        # C：M8 构造复杂度门（AST 算子调用数；阈值固定 12）
+        if source and _wc_fx.get("gate_m8_enabled", True):
+            try:
+                _m8 = m8_check(str(source), int(_wc_fx.get("gate_m8_max_ops", 12)))
+                gate_event(self.state_root, "m8_complexity", source_hash,
+                           verdict=("reject" if _m8.get("rejected") else
+                                    ("pass" if _m8.get("decided") else "skip")),
+                           ops=_m8.get("ops"), threshold=_m8.get("threshold"))
+                if _m8.get("rejected"):
+                    diagnosis["red_flags"].append(
+                        f"[构造复杂度] 拒收：AST 算子调用数 {_m8['ops']} ≥ "
+                        f"{_m8['threshold']}（固定上限）——复杂度是运气载体："
+                        "可调结构越多，挑出贴合噪声的构造越容易。精简构造后"
+                        "重新评估提交")
+            except Exception as _m8e:
+                import sys as _s8
+                _s8.stderr.write(f"[m8] 门失败（不阻塞其余门）: {_m8e!r}\n")
+        # C：M3 最短回测长度门（Bailey：实有观测数撑不起该强度声明即拒；
+        # 仅 IC 轨提交——尾轨不声明 IC 强度）。阈值固定 ratio≤1。
+        if _wc_fx.get("gate_m3_enabled", True) \
+                and str(params.get("admit_basis") or "ic") == "ic":
+            try:
+                _m3 = m3_check(_dp_fx.get("sr_hat"), _dp_fx.get("skew"),
+                               _dp_fx.get("kurt"), _dp_fx.get("n_obs"),
+                               float(_wc_fx.get("gate_m3_ratio_max", 1.0)))
+                gate_event(self.state_root, "m3_minbtl", source_hash,
+                           verdict=("reject" if _m3.get("rejected") else
+                                    ("pass" if _m3.get("decided") else "skip")),
+                           ratio=_m3.get("ratio"), threshold=_m3.get("threshold"))
+                if _m3.get("rejected"):
+                    diagnosis["red_flags"].append(
+                        f"[最短回测长度] 拒收：撑起 |IC_IR|="
+                        f"{abs(float(_dp_fx.get('sr_hat'))):.3f} 所需的最短样本"
+                        f"长度约为实有的 {_m3['ratio']:.1f} 倍（固定阈 1.0）——"
+                        "样本太短撑不起该强度声明")
+            except Exception as _m3e:
+                import sys as _s3
+                _s3.stderr.write(f"[m3] 门失败（不阻塞其余门）: {_m3e!r}\n")
         accepted, reason = _passes_acceptance(diagnosis)
         if diagnosis.get("red_flags"):
             accepted = False
             reason = f"red_flags 未清：{diagnosis['red_flags'][:2]}"
         if incubated_marker is not None and accepted:
-            reason = (f"{reason} | incubated: dev deflated p 已豁免"
-                      "(OOS 复活证据在 incubation/survivors.jsonl)")
+            reason = (f"{reason} | incubated: 孵化幸存者（前向窗存活证据"
+                      "在 incubation/survivors.jsonl，引擎已入账标注）")
         # 噪声硬门（2026-08-24 用户设计决策）：因子在随机噪声世界上的
         # 直接表现。真 alpha 按构造不可预测噪声；噪声上仍显著 = 因子
         # 公式在拟合评价 artifact（管道偏差/重叠窗口构造），无条件拒收。
@@ -7245,7 +7613,7 @@ class Bridge:
         # 与顺序版逐字一致（任一门基础设施失败 = 中止不落盘可重试）。
         _ms = read_mining_state(self.state_root)
         _sub_env_id = params.get("envId", "primary")
-        _sub_env = self._require_panel_env(_sub_env_id)
+        _sub_env = self._require_eval_env(_sub_env_id)
         import hashlib as _hl
         _fp_ns = self._env_full_fingerprint(_sub_env_id) or "nofp"
         _seed_ns = int(_hl.sha256(
@@ -7263,6 +7631,13 @@ class Bridge:
         if admit_basis not in ("ic", "tail"):
             raise BridgeError(-32602,
                               f"admit_basis 必须是 ic | tail（收到 {admit_basis!r}）")
+        # ts 线（futures，任务书 §五）：单轨 IC——尾轨三件套（spread 噪声/
+        # G1 placebo/tail 准入）不适用（无 top-N 篮子）
+        _ts_line = isinstance(_sub_env, TsEnv)
+        if _ts_line and admit_basis != "ic":
+            raise BridgeError(
+                -32002, "ts_single 线为单轨 IC 线——admit_basis 不适用 tail"
+                "（单品种无截面尾轨；v1 单轨，position_sim 二期立轨前挂账）")
         fp_decl = params.get("flatness_params")
         if fp_decl is not None:
             # 申报校验前置：失败快拒，不起 worker
@@ -7299,12 +7674,13 @@ class Bridge:
                  "base_seed": _seed_ns, "statistic": "spread"},
                 _sub_env)
 
-        _gates["spread"] = _gate_spread_noise
+        if not _ts_line:
+            _gates["spread"] = _gate_spread_noise
         # G1 placebo：缓存读前置（命中零成本），未命中才进池
         _placebo_gate_z: float | None = None
         _placebo_gate_m: int | None = None
         _tpm = int(_ms.get("tail_placebo_m", 120) or 0)
-        if _tpm > 0 and source and source_hash:
+        if not _ts_line and _tpm > 0 and source and source_hash:
             _KF = _sub_env.calibration.tail_k  # 2026-08-30 可配化：随环境口径
             _tp_budget = float(_ms.get("tail_placebo_budget_secs", 180) or 180)
             _tp_draws = max(60, _tpm)
@@ -7427,13 +7803,19 @@ class Bridge:
                 if hor_tb is None or eh is None or int(eh) == int(hor_tb):
                     tail_block = e["tail"]
                     break
-        try:
-            spread_noise = _futs["spread"].result()
-        except Exception as e:
-            raise BridgeError(
-                -32003,
-                f"spread 噪声门执行失败（事务中止，可直接重试）："
-                f"{type(e).__name__}: {e}")
+        # M13 双轨一致门退役（2026-11-05 段隔离任务书 §〇）：不拦截、不
+        # 路由、不产生判定——终审权归内部段验证（SPRT）；双轨读数保留在
+        # tracks/diagnosis 的既有描述字段里（dev 侧统计，非判定输入）。
+        # ts 线：spread 门未注册（_ts_line）——无截面尾轨，零成本直通。
+        spread_noise = None
+        if not _ts_line:
+            try:
+                spread_noise = _futs["spread"].result()
+            except Exception as e:
+                raise BridgeError(
+                    -32003,
+                    f"spread 噪声门执行失败（事务中止，可直接重试）："
+                    f"{type(e).__name__}: {e}")
         # G2 fail-closed（2026-08-25 修正）：无法判定（artifact=None——
         # 有效世界不足/零离散）此前被 tailgate 静默放行，与 IC 轨噪声门
         # 「无法判定 = 事务中止」相反。tail 轨准入不得经无法判定的门 →
@@ -7454,8 +7836,8 @@ class Bridge:
             _z_spread = None  # NaN → 交给 tailgate 的 G2 无法判定分支
         # WS1（2026-08-25）：G3 的 s0 从 landscape spread 段取经验值
         # （指纹门内），无/不匹配 → None → bar 降级解析式（s0_source 标注）
-        _s0_emp = self._landscape_tail_s0(
-            params.get("envId", "primary"), hor_tb)
+        _s0_emp = (None if _ts_line else self._landscape_tail_s0(
+            params.get("envId", "primary"), hor_tb))
         # WS2（2026-08-25）：G1 权威 placebo 重算——evaluate 轻量 null
         # （生产面板 ≈10 draws，σ 相对误差 ~24%）不可作硬判据，门的
         # 重判定在 submit 用足样本：R = max(60, tail_placebo_m 默认 120)，
@@ -7505,7 +7887,8 @@ class Bridge:
         # |Δbar|>0.05 出运维漂移警告（估计器回归监测，P5 防复发③）。
         _v2_wall = None
         try:
-            if bool(read_mining_state(self.state_root).get("tail_wall_v2")):
+            if not _ts_line and bool(
+                    read_mining_state(self.state_root).get("tail_wall_v2")):
                 from .factor.tailwall import tail_wall_v2_bar
                 _led_v2 = tail_ledger(engine_trail)
                 _sigs_v2 = [r.get("selection_mh") for r in _led_v2]
@@ -7527,10 +7910,21 @@ class Bridge:
             _sys.stderr.write(f"[tail_wall_v2] 计算失败（回退 v1）: "
                               f"{type(e).__name__}: {e}\n")
             _v2_wall = None
-        tail_decision = tail_admission(
-            tail_block, tail_ledger(engine_trail), _z_spread, s0_emp=_s0_emp,
-            placebo_z_gate=_placebo_gate_z, placebo_m=_placebo_gate_m,
-            net_basis=_net_basis, v2_wall=_v2_wall)
+        from .factor.hardening import read_wall_config
+        _wc_sub = read_wall_config(self.state_root)
+        if _ts_line:
+            # ts 线（任务书 §五）：尾轨不适用——合成固定标注（accepted=False
+            # 只描述轨道缺席；dual_pass 恒 False 如实反映，不拦 ic 轨）
+            tail_decision = {"accepted": False,
+                             "reason": "不适用：单品种时序线无截面尾轨（单轨 IC 线）",
+                             "diag": None}
+        else:
+            tail_decision = tail_admission(
+                tail_block, tail_ledger(engine_trail), _z_spread, s0_emp=_s0_emp,
+                placebo_z_gate=_placebo_gate_z, placebo_m=_placebo_gate_m,
+                net_basis=_net_basis, v2_wall=_v2_wall,
+                fixed_bar=(_wc_sub["fixed_bar_tail"]
+                           if _wc_sub["wall_mode"] == "fixed" else None))
         try:
             if (_v2_wall is not None and _v2_wall.get("ok")
                     and isinstance(tail_decision.get("diag"), dict)):
@@ -7538,9 +7932,12 @@ class Bridge:
                 _warn = _tw_chk(self.state_root, _v2_wall)
                 _bar_d = tail_decision["diag"].get("bar") or {}
                 _b_act, _b2 = _bar_d.get("bar"), _v2_wall.get("bar")
-                if (not (isinstance(_b_act, (int, float))
-                         and isinstance(_b2, (int, float))
-                         and abs(_b_act - _b2) <= 0.05)):
+                # 固定墙（B1）：生效门=fixed_bar_tail 恒值，v2 增长口径的
+                # 差值是模式差异不是接线事故——哨兵只对 v1/v2 间漂移负责
+                if _bar_d.get("wall") != "fixed" and (
+                        not (isinstance(_b_act, (int, float))
+                             and isinstance(_b2, (int, float))
+                             and abs(_b_act - _b2) <= 0.05)):
                     _warn.append(f"接线哨兵：生效门值 {_b_act} ≠ v2 计算 {_b2}")
                 if _warn:
                     import sys as _sys
@@ -7552,7 +7949,7 @@ class Bridge:
         # agent 提交的 source 与评估时字节不一致 → hash 漂移 → trail 查无
         # 此 hash → 「tail 块缺失」烧名。原始 reason 不含 hash 与修法指引，
         # agent 只能瞎猜（实测连续两次掉同一坑））
-        if tail_block is None and source_hash:
+        if tail_block is None and source_hash and not _ts_line:
             tail_decision["reason"] = (
                 f"tail 块缺失：提交 source 的 hash {source_hash[:12]} 在 "
                 "trail_engine 无评估记录——提交的 source 与 factor_evaluate "
@@ -7589,17 +7986,16 @@ class Bridge:
             need_ir = None
             if isinstance(bar_now, (int, float)) and isinstance(
                     pool_now, (int, float)) and pool_now > 0:
-                # p=0.05 门槛反解所需 |IC_IR|（t≈1.645 处，偏度峰度修正略计）
-                n_now = dp_now.get("n_obs") or 58
-                need_ir = round(1.645 / max(n_now - 1, 1) ** 0.5
-                                + bar_now * pool_now, 3)
+                # 入册线值（B2 后 deflated p 不再门控——所需强度=墙×池std
+                # 本身；fixed 模式恒定，growing 回滚时随试验数增长）
+                need_ir = round(bar_now * pool_now, 3)
             next_moves = {
                 "options": [
-                    "结构性新假设：换信息源/算子族（当前门下需 "
-                    f"|IC_IR| ≳ {need_ir if need_ir is not None else 'bar×pool_std+1.645/√n'}）",
+                    "结构性新假设：换信息源/算子族（当前入册线需 "
+                    f"|IC_IR| ≳ {need_ir if need_ir is not None else '墙σ×池内IC_IR标准差'}）",
                     "正交组合构造：与 registry/library 已入册维度交互"
                     "（目标截面相关 < 0.7 的新组合）",
-                    "继续探索其他维度（接受 bar 继续抬升的成本）",
+                    "继续探索其他维度（固定墙模式下入册线恒定，强度达标即可入册）",
                 ],
                 "forbidden": [
                     "state.reset 洗 trail 后重注册同一因子（假门——搜索史不可撤销）",
@@ -7635,24 +8031,45 @@ class Bridge:
         ortho_report = None
         cand_u16 = None
         cand_dates = None
+        cand_ts_values = None
+        cand_ts_dates = None
         if accepted and source_hash and MINING_CONFIG.get("orthogonality_gate", True):
             try:
-                from .book_ranks import dev_rank_u16, load_book_cache, check_candidate
-                _ortho_env = self._require_panel_env(params.get("envId", "primary"))
+                _ortho_env = self._require_eval_env(params.get("envId", "primary"))
                 ns = {"env": _ortho_env}
                 exec(source, ns)
                 F_cand = np.asarray(ns["factor"](_ortho_env), dtype=np.float64)
-                cand_u16, cand_dates = dev_rank_u16(
-                    _ortho_env, F_cand, _ortho_env.calibration.dev_end)
-                cache = load_book_cache(self.state_root)
-                if not cache or not cache.get("names"):
-                    ortho_report = {"status": "skipped",
-                                    "why": "book cache empty——先运行 book.backfill 建立在册秩基线"}
+                if isinstance(_ortho_env, TsEnv):
+                    # ts 线（任务书 §五）：候选与在册信号序列 dev 窗
+                    # Spearman（0.80 软拒/0.60 标注——软门语义与面板一致）
+                    from .book_ranks import (check_candidate_ts,
+                                             dev_series_block,
+                                             load_ts_cache)
+                    cand_ts_values, cand_ts_dates = dev_series_block(
+                        _ortho_env, F_cand, _ortho_env.calibration.dev_end)
+                    cache = load_ts_cache(self.state_root)
+                    if not cache or not cache.get("names"):
+                        ortho_report = {"status": "skipped",
+                                        "why": "book cache empty——先运行 book.backfill 建立在册序列基线"}
+                    else:
+                        ortho_report = check_candidate_ts(
+                            cache, cand_ts_values,
+                            reject_th=float(MINING_CONFIG.get("ortho_reject_th", 0.80)),
+                            annotate_th=float(MINING_CONFIG.get("ortho_annotate_th", 0.60)))
                 else:
-                    ortho_report = check_candidate(
-                        cache, cand_u16,
-                        reject_th=float(MINING_CONFIG.get("ortho_reject_th", 0.80)),
-                        annotate_th=float(MINING_CONFIG.get("ortho_annotate_th", 0.60)))
+                    from .book_ranks import (check_candidate, dev_rank_u16,
+                                             load_book_cache)
+                    cand_u16, cand_dates = dev_rank_u16(
+                        _ortho_env, F_cand, _ortho_env.calibration.dev_end)
+                    cache = load_book_cache(self.state_root)
+                    if not cache or not cache.get("names"):
+                        ortho_report = {"status": "skipped",
+                                        "why": "book cache empty——先运行 book.backfill 建立在册秩基线"}
+                    else:
+                        ortho_report = check_candidate(
+                            cache, cand_u16,
+                            reject_th=float(MINING_CONFIG.get("ortho_reject_th", 0.80)),
+                            annotate_th=float(MINING_CONFIG.get("ortho_annotate_th", 0.60)))
                     # 正交门降级为提示（2026-09-10 用户决策）：冗余度不再否决
                     # 入册——深挖式重组（绑已知强腿过 deflation 墙）与正交硬拒
                     # 结构性冲突，前者恰是新域唯一现实入口。缺省 soft；置
@@ -7681,6 +8098,118 @@ class Bridge:
                 ortho_report = {"status": "skipped",
                                 "why": ("ortho check infra failure（不拒绝不烧名）："
                                         f"{type(e).__name__}: {e}")[:220]}
+        # ---- A2：内部段验证（SPRT，2026-11-05 段隔离任务书 §三）----
+        # 仅对已过全部 dev 侧门（快检+四门+正交）的候选执行——被拒候选
+        # 不触碰样本外数据。判定二值返回（零数字零段数零原因，隔离红线）；
+        # 全数字记录落 verify_ledger.jsonl（人读）与条目 verify 内部块
+        # （registry 渲染白名单不含它）。两轨对称：ic 轨=IC 序列、tail 轨
+        # =逐采样日尾价差（2026-11-05 收尾任务书 §四 1 接线，同码 SPRT
+        # 内核，尾轨额度与 ic 轨同桶）。
+        _verify_report = None
+        _verify_tier = None
+        if _verify_mode == "internal_sprt" and accepted:
+            if admit_basis == "ic" and source:
+                from .factor.verify import (SegmentsError as _SegErr,
+                                            TEXT_ERROR as _T_ERR,
+                                            TEXT_REJECT as _T_REJ,
+                                            TEXT_SEGMENTS_BROKEN as _T_SEGB,
+                                            run_internal_verification as _riv)
+                try:
+                    _vr = _riv(self.state_root, str(source), _sub_env,
+                               float(diagnosis.get("ic_ir_train") or 0.0),
+                               (int(hor_tb) if hor_tb is not None else None),
+                               str(source_hash or ""), name=name,
+                               lane=current_lane())
+                    _verify_report = _vr["report"]
+                    _verify_tier = _vr["tier"]
+                    gate_event(self.state_root, "segment_sprt", source_hash,
+                               verdict=("pass" if _vr["verdict"] == "pass"
+                                        else "reject"))
+                    if _vr["verdict"] != "pass":
+                        accepted = False
+                        _rk = "substantive"
+                        reason = _T_REJ
+                        ic_verdict = {"accepted": False,
+                                      "reason": str(_T_REJ)[:300]}
+                        if isinstance(next_moves, dict):
+                            next_moves["options"] = [
+                                "结构性新假设：换信息源/算子族构造新候选"
+                                "（样本外判定不针对构造方向本身）",
+                                "正交组合构造：与 registry/library 已入册维度交互",
+                                "继续探索其他维度（判定为最终判定，勿重试同一源码）",
+                            ]
+                except _SegErr as _se:
+                    import sys as _sv
+                    _sv.stderr.write(f"[verify] 段定义问题: {_se}\n")
+                    raise BridgeError(-32003, _T_SEGB) from None
+                except BridgeError:
+                    raise
+                except Exception as _ve:  # B8：固定文案，严禁 stack/数值外漏
+                    import sys as _sv
+                    _sv.stderr.write(f"[verify] 管线失败: {type(_ve).__name__}: {_ve}\n")
+                    try:
+                        from .factor.verify import ledger_append as _vled
+                        _vled(self.state_root, {
+                            "ts": __import__("time").strftime(
+                                "%Y-%m-%dT%H:%M:%S"),
+                            "name": name, "source_hash": source_hash,
+                            "error": f"{type(_ve).__name__}: {_ve}"[:200]})
+                    except Exception:
+                        pass
+                    raise BridgeError(-32003, _T_ERR) from None
+            else:
+                # 尾轨段验证（2026-11-05 收尾任务书 §四 1）：与 IC 轨同构的
+                # SPRT——累积对象=逐采样日尾价差（毛口径 top-K 组差，与生产
+                # 尾门同口径）；dev 参照=diagnosis.tail 的 train 区 spread_ir，
+                # 缺省由序列 dev 侧切片就地计算。tail_track_unverified_v1
+                # 标注自此退役（尾轨判定=dev 侧尾门链+段验证共同承担）。
+                from .factor.verify import (SegmentsError as _SegErr2,
+                                            TEXT_ERROR as _T_ERR2,
+                                            TEXT_REJECT as _T_REJ2,
+                                            TEXT_SEGMENTS_BROKEN as _T_SEGB2,
+                                            run_internal_verification_tail
+                                            as _rivt)
+                try:
+                    _dtl = diagnosis.get("tail") \
+                        if isinstance(diagnosis.get("tail"), dict) else {}
+                    _dev_sp = _dtl.get("spread_ir")
+                    _vr2 = _rivt(
+                        self.state_root, str(source), _sub_env,
+                        (float(_dev_sp)
+                         if isinstance(_dev_sp, (int, float)) else None),
+                        (int(hor_tb) if hor_tb is not None else None),
+                        str(source_hash or ""), name=name,
+                        lane=current_lane())
+                    _verify_report = _vr2["report"]
+                    _verify_tier = _vr2["tier"]
+                    gate_event(self.state_root, "segment_sprt", source_hash,
+                               verdict=("pass" if _vr2["verdict"] == "pass"
+                                        else "reject"))
+                    if _vr2["verdict"] != "pass":
+                        accepted = False
+                        _rk = "substantive"
+                        reason = _T_REJ2
+                except _SegErr2 as _se2:
+                    import sys as _sv2
+                    _sv2.stderr.write(f"[verify-tail] 段定义问题: {_se2}\n")
+                    raise BridgeError(-32003, _T_SEGB2) from None
+                except BridgeError:
+                    raise
+                except Exception as _ve2:  # B8：固定文案，严禁 stack/数值外漏
+                    import sys as _sv2
+                    _sv2.stderr.write(
+                        f"[verify-tail] 管线失败: {type(_ve2).__name__}: {_ve2}\n")
+                    try:
+                        from .factor.verify import ledger_append as _vled2
+                        _vled2(self.state_root, {
+                            "ts": __import__("time").strftime(
+                                "%Y-%m-%dT:%M:%S"),
+                            "name": name, "source_hash": source_hash,
+                            "track": "tail",
+                            "error": f"{type(_ve2).__name__}: {_ve2}"[:200]})
+                    except Exception:
+                        pass
+                    raise BridgeError(-32003, _T_ERR2) from None
         entry = {
             "name": name,
             # ts（2026-08-27 WS-A）：紧凑投影的时间字段——旧条目无此键，
@@ -7712,6 +8241,16 @@ class Bridge:
             # 仅 ~4/19，有区分度的信号质量维度）
             "tracks": {"ic": ic_verdict, "tail": tail_verdict},
             "dual_pass": dual_pass,
+            # A3（2026-11-05）：入册分层 + 内部验证记录 + 衰减带。
+            # tier ∈ core|observation（弱段登记不告诉模型——registry 渲染
+            # 白名单不含 tier 依据，仅人读面可见）；verify 为引擎内部全数字
+            # 记录（段 IR/累积 t，永不进模型面）；decay_band=McLean-Pontiff
+            # 预期前向带（纯 dev 侧变换，册内跟踪判据）。
+            "tier": (_verify_tier if accepted else None),
+            **({"verify": _verify_report} if _verify_report is not None else {}),
+            **({"decay_band": decay_band(float(diagnosis.get("ic_ir_train") or 0.0))}
+               if accepted and isinstance(diagnosis.get("ic_ir_train"),
+                                          (int, float)) else {}),
             "source": source,
             "source_hash": source_hash,
             # WS-C 灵感源标注（2026-09-01）：与引擎 trail 同一判定口径
@@ -7767,6 +8306,15 @@ class Bridge:
                         _sx.stderr.write(
                             "[orthogonality] 秩缓存追加跳过（缺失/日期/指纹"
                             "不符）——运行 book.backfill 重建基线\n")
+                elif accepted and cand_ts_values is not None:
+                    from .book_ranks import append_ts_cache as _ortho_append_ts
+                    if not _ortho_append_ts(self.state_root, name,
+                                            cand_ts_dates, cand_ts_values,
+                                            str(entry.get("fingerprint"))):
+                        import sys as _sx
+                        _sx.stderr.write(
+                            "[orthogonality] ts 序列缓存追加跳过（缺失/日期/"
+                            "指纹不符）——运行 book.backfill 重建基线\n")
             except Exception as _exc_o:
                 import sys as _sx2
                 _sx2.stderr.write(f"[orthogonality] 秩缓存追加失败（不阻断）: "
@@ -7857,6 +8405,10 @@ class Bridge:
                   "tail_track": tail_track,
                   "tracks": {"ic": ic_verdict, "tail": tail_verdict},
                   "dual_pass": dual_pass}
+        if _verify_report is not None and _verify_report.get("verdict") in ("pass", "reject"):
+            # 二值判定标记（A2）：随提交响应同步返回；零数字零段数零原因
+            # （全数字在 verify_ledger.jsonl，人读）。
+            result["verification"] = {"verdict": _verify_report["verdict"]}
         if gate_result is not None:
             # B1 遥测：shadow 违规对模型可见（教学窗口——切 enforce 前
             # 模型有机会适应预注册纪律）；enforce 档违规不会到达这里
@@ -7867,6 +8419,167 @@ class Bridge:
             result["next_moves"] = next_moves
         return result
 
+    def _factor_book_audit(self, params):
+        """册子季度复审（机械判据版，2026-11-05 收尾任务书 §四 3）。
+
+        对 registry 全部 accepted 条目逐只用**延长后的前向带**（sel_end
+        之后到面板末尾——纯样本外，数据每延长一个季度审计一次即可复跑）
+        重算前向带 IR，按**入册时冻结的衰减带**（McLean-Pontiff 26-58%，
+        entry.decay_band 或 decay_band(dev_ir) 就地重算）机械判定：
+
+        - 对齐前向 IR < 带 low（**衰减穿带**）→ 机械标记 watch，tier
+          自动降观察（core→observation；除名不存在——registry 只有
+          观察/核心两态+复活通道）；
+        - 对齐前向 IR ≥ 带 high（**回升穿带上沿**）→ 机械标记复议候选
+          （重议=新数据延长后按新 verify_ledger 判，段定义不动；语义人群
+          =tier=observation+watchlist——core 已在核心册无复议必要）；
+        - 带内 → keep。
+
+        动作全部机械（无人审轮——人只有事后驳回权）：tier 降写在
+        state_write_lock 内完成并逐条留痕。成本：每只一次因子求值+前向
+        带统计（秒到分钟级/只），手动触发语义。产出落 stateRoot
+        reports/book_audit_<ts>.json（人读全数字）；模型面响应保持 B5
+        最小面（状态+文件名，零逐只结论——防 OOS 判断经名单外泄）。
+        """
+        import time as _t_audit
+        env_id = params.get("envId", "primary")
+        env = self._require_eval_env(env_id)
+        registry = read_registry(self.state_root)
+        entries = [e for e in registry if isinstance(e, dict) and e.get("accepted")
+                   and (e.get("source") or "").strip()]
+        # 前向带边界（2026-11-06 收尾二期 §四 前置迁移）：优先冻结段定义
+        # 的 panel.dev_end（与内部段验证同源——selection 退役后 sel_end
+        # 不再保证存在）；段文件缺失/损坏时兜底 calibration.sel_end，
+        # 两者皆缺 → 审计不可进行（fail-closed）。
+        _bound = None
+        try:
+            from .factor.verify import load_segments as _ls
+            _bound = str((_ls(self.state_root).get("panel") or {})
+                         .get("dev_end") or "") or None
+        except Exception:
+            _bound = None
+        if _bound is None:
+            _bound = str(getattr(env.calibration, "sel_end", "") or "") or None
+        if _bound is None:
+            raise BridgeError(-32003,
+                              "前向带边界不可得（segments.panel.dev_end 与 "
+                              "sel_end 皆缺）——审计无法进行")
+        sel_end = _bound
+        from .factor.verify import decay_band as _decay_band
+        rows, n_err, downgrades = [], 0, []
+        for e in entries:
+            row = {"name": e.get("name"), "source_hash": e.get("source_hash"),
+                   "admit_basis": e.get("admit_basis"),
+                   "tier": e.get("tier")}
+            try:
+                _wf = self._run_factor(
+                    "factor.walk_forward", str(e.get("source")),
+                    {"n_folds": 4, "t0_date": str(sel_end)}, env)
+                if not isinstance(_wf, dict) or _wf.get("error"):
+                    row["status"] = "eval_failed"
+                    row["note"] = str((_wf or {}).get("error"))[:120]
+                    n_err += 1
+                    rows.append(row)
+                    continue
+                dev_ir = ((e.get("diagnosis") or {}).get("ic_ir_train")
+                          if isinstance(e.get("diagnosis"), dict)
+                          else None)
+                dev_ir = e.get("ic_ir_train") if not isinstance(dev_ir, (int, float)) else dev_ir
+                fold_irs = [f.get("ic_ir") for f in _wf.get("per_fold", [])
+                            if isinstance(f.get("ic_ir"), (int, float))]
+                fwd_ir = (sum(fold_irs) / len(fold_irs)) if fold_irs else None
+                if not isinstance(dev_ir, (int, float)) or fwd_ir is None:
+                    row["status"] = "stats_missing"
+                    n_err += 1
+                    rows.append(row)
+                    continue
+                band = e.get("decay_band") if isinstance(e.get("decay_band"), dict) \
+                    and isinstance(e.get("decay_band", {}).get("low"), (int, float)) \
+                    else _decay_band(float(dev_ir))
+                aligned = (1.0 if dev_ir >= 0 else -1.0) * fwd_ir
+                ratio = aligned / max(abs(dev_ir), 1e-9)
+                sign_flip = (fwd_ir * dev_ir) < 0
+                mark = "keep"
+                if sign_flip or aligned < float(band["low"]):
+                    # 衰减穿带（或翻号）→ 机械标记 watch + 自动降观察
+                    mark = "watch"
+                    if e.get("tier") == "core":
+                        downgrades.append({"name": e.get("name"),
+                                           "source_hash": e.get("source_hash"),
+                                           "aligned_fwd_ir": round(float(aligned), 4),
+                                           "band_low": band["low"]})
+                elif aligned >= float(band["high"]) \
+                        and e.get("tier") != "core":
+                    # 回升穿带上沿 → 复议候选（观察册人群）
+                    mark = "reconsider_candidate"
+                row.update({"status": "ok", "dev_ir": round(float(dev_ir), 4),
+                            "fwd_ir": round(float(fwd_ir), 4),
+                            "aligned_fwd_ir": round(float(aligned), 4),
+                            "band": {"low": band["low"], "high": band["high"]},
+                            "ratio": round(float(ratio), 4),
+                            "sign_flip": bool(sign_flip),
+                            "fold_consistency": _wf.get("fold_consistency"),
+                            "mark": mark})
+            except Exception as _ae:
+                row["status"] = "error"
+                row["note"] = f"{type(_ae).__name__}: {_ae}"[:150]
+                n_err += 1
+            rows.append(row)
+        # 机械降观察（衰减穿带的 core 成员；动作自动、留痕、可逆——
+        # 复活通道仍由数据说话）
+        if downgrades:
+            dg_hashes = {d["source_hash"] for d in downgrades}
+            with state_write_lock(self.state_root):
+                cur = read_registry(self.state_root)
+                for ee in cur:
+                    if isinstance(ee, dict) and ee.get("source_hash") in dg_hashes \
+                            and ee.get("tier") == "core":
+                        ee["tier"] = "observation"
+                        ee["tier_updated_by"] = ("book_audit_decay_band_"
+                                                 + _t_audit.strftime("%Y%m%d"))
+                write_registry(cur, self.state_root)
+        summary = {
+            "ts": _t_audit.strftime("%Y-%m-%dT%H:%M:%S"),
+            "band": f"[{sel_end}, latest)",
+            "n_audited": len(rows),
+            "n_eval_failed": n_err,
+            "n_watch": sum(1 for r in rows if r.get("mark") == "watch"),
+            "n_reconsider_candidate": sum(
+                1 for r in rows if r.get("mark") == "reconsider_candidate"),
+            "n_keep": sum(1 for r in rows if r.get("mark") == "keep"),
+            "n_auto_downgraded_core_to_observation": len(downgrades),
+            "auto_downgrades": downgrades,
+            "criterion": ("衰减带（McLean-Pontiff 26-58%，入册时冻结）：对齐"
+                          "前向 IR < 带 low → watch+自动降观察；≥ 带 high 且"
+                          "非 core → 复议候选（新数据延长后按新 verify_ledger "
+                          "重议，段定义不动）；带内 keep。翻号视同穿带。"
+                          "动作机械自动，人只有事后驳回权。"),
+            "note": ("季度复审机械判据（2026-11-05 收尾任务书 §四 3）；"
+                     "前向带 IR 为 walk_forward 分块 IR 均值（近似口径）。"),
+        }
+        try:
+            rp = Path(self.state_root) / "reports"
+            rp.mkdir(parents=True, exist_ok=True)
+            out = rp / f"book_audit_{_t_audit.strftime('%Y%m%d_%H%M%S')}.json"
+            out.write_text(json.dumps({**summary, "per_factor": rows},
+                                      ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            summary["report"] = str(out)
+        except Exception as _we:
+            import sys as _sw
+            _sw.stderr.write(f"[book_audit] 报告落盘失败: {_we!r}\n")
+        # B5（2026-11-05 段隔离任务书）：审计全数字与逐只判定=前向带
+        # （样本外）产物——只入人读报表文件；模型面响应收敛为完成状态
+        # 与文件名，不给任何逐只结论/计数（防 OOS 判断经名单外泄）。
+        return {
+            "status": "done",
+            "n_audited": summary.get("n_audited"),
+            "report_file": (Path(summary["report"]).name
+                            if summary.get("report") else None),
+            "note": ("册子审计完成：全数字与逐只判定在人读报表文件"
+                     "（stateRoot/reports/），模型面不提供样本外结论"),
+        }
+
     def _book_backfill(self, params):
         """重建在册账本秩缓存（正交门基线，2026-09-06）。
 
@@ -7874,14 +8587,19 @@ class Bridge:
         book_ranks.npz。缓存过期（新入册未追加/指纹变更）时由提交路径
         提示运行本方法。→ {status, n_factors, n_dates, failed}"""
         env_id = params.get("envId", "primary")
-        env = self._require_panel_env(env_id)
-        from .book_ranks import rebuild_book_cache
+        env = self._require_eval_env(env_id)
         registry = read_registry(self.state_root)
         entries = [e for e in registry
                    if e.get("accepted") and (e.get("source") or "").strip()]
         fp = self._env_full_fingerprint(self._resolve_env_id(env_id))
-        report = rebuild_book_cache(self.state_root, env, entries,
-                                    fingerprint=fp)
+        if isinstance(env, TsEnv):
+            from .book_ranks import rebuild_book_cache_ts
+            report = rebuild_book_cache_ts(self.state_root, env, entries,
+                                           fingerprint=fp)
+        else:
+            from .book_ranks import rebuild_book_cache
+            report = rebuild_book_cache(self.state_root, env, entries,
+                                        fingerprint=fp)
         if isinstance(report, dict) and report.get("status") == "ok":
             say = getattr(self, "_on_progress", None)
             if say:

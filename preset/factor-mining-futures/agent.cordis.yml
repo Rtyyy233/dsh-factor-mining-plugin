@@ -1,0 +1,20 @@
+# Futures single-instrument time-series factor-mining agent preset.  It
+# composes the same Python engine provider and the same model-facing mining
+# tools as the cross-sectional line (same engine, same tool surface; the
+# futures line is dispatched by env kind inside the engine).  No data, factor
+# library, or mining state ships here: users provide those through
+# factor_data_probe / factor_config_write.
+
+- id: factor-mining-futures
+  name: '@deepseek-ai/dsh-factor-mining-python'
+  isolate:
+    factorMining: true
+  config:
+    pythonExecutable: python
+    stateRoot: !!js process.cwd() + '/.factor-mining-futures'
+    requestTimeoutMs: 360000
+
+- id: factor-mining-futures-tools
+  name: '@deepseek-ai/dsh-tool-factor-mining'
+  config:
+    enableArxivSearch: true

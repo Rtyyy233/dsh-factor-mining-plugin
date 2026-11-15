@@ -197,11 +197,25 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_status',
-    description: '报告因子挖掘服务概况：已配置的数据环境、Python 桥、用户状态目录；响应内嵌引擎停走指令（loop——state=running 表示必须继续挖掘内循环，strategy 为引擎机械选定的下一步方向类型）与本线最近 5 条试验投影。',
+    description: '报告因子挖掘服务概况：已配置的数据环境、Python 桥、用户状态目录；响应内嵌引擎停走指令（loop——state=running 表示必须继续挖掘内循环，strategy 为引擎机械选定的下一步方向类型）与本线最近 5 条试验投影。固定墙遥测在 fixed_wall 块：wall_mode（fixed/growing——fixed 模式下入册强度线恒定，不随已试假设数增长）、主值与尾轨固定值、验证额度档位（充裕/紧张/用尽——提交判定的族额度状态，只给档位不给数字）。',
     parameters: {},
     output: { schema: { type: 'json' }, render: JSON_RENDER },
     async execute(_args, exec) {
       return json(svcFor(exec).status({ lane: laneOfExec(exec) }))
+    },
+  }))
+
+  // 册子滚动审计（2026-11-01 固定墙时代 B5）：前向带复算 + 降级建议清单；
+  // 不自动除名——降级动作由人审轮裁决（三权分离）。手动触发、写类语义。
+  ctx.tools.register(defineTool({
+    name: 'factor_book_audit',
+    description: '册子滚动审计（运维工具）：对 registry 全部已入册因子复算跟踪判据，产出观察名单与降级建议。只产出建议——不自动除名，降级动作由人审轮裁决。响应只含完成状态与报表文件名；全数字与逐只判定在人读报表文件（stateRoot/reports/），不进模型面。成本为每只因子一次求值（秒到分钟级/只），在册量大时可达小时级；数据每延长一个季度跑一次即可。',
+    parameters: {
+      envId: { type: 'string', description: 'Environment id; defaults to primary.' },
+    },
+    output: { schema: { type: 'json' }, render: JSON_RENDER },
+    async execute(args, exec) {
+      return json(svcFor(exec).bookAudit({ envId: args.envId ?? 'primary' }))
     },
   }))
 
@@ -286,8 +300,8 @@ export function apply(ctx: Context, config: Config): void {
 
   const stage = {
     type: 'string' as const,
-    description: 'development (free) | selection (semi-consumable) | test (one-shot lock).',
-    enum: ['development', 'selection', 'test'] as const,
+    description: 'development（唯一开放区——不传即 development）。开发期评估全部在开发区数据上进行。',
+    enum: ['development'] as const,
   }
 
   ctx.tools.register(defineTool({
@@ -305,7 +319,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_evaluate',
-    description: '在选定数据区上评估一份因子源码，返回完整诊断对象（IC 均值、IC_IR 信息比率、列置换检验、beta 暴露、年度分解、衰减、Top-N 分组）。默认异步：返回 {job_id, status}——把 job_id 传回本工具轮询取结果（running/queued=未完成；返回完整诊断=完成）。若响应已带 verdict，那是评估缓存命中——结果终局，无需再轮询。在途作业期间重交完全相同的参数会自动并入同一作业（dedup: true，不重复计算）。第一稿就写向量化代码：可编译加速的循环实现会被引擎自动加速（等价性严格验证），被拒的慢实现会被自动重写（仅严格等价变换）；冒烟预检被拒不消耗试验计数——等 1-3 分钟原样重交同一份源码。',
+    description: '在开发数据区上评估一份因子源码，返回完整诊断对象（IC 均值、IC_IR 信息比率、列置换检验、beta 暴露、年度分解、衰减、Top-N 分组）。默认异步：返回 {job_id, status}——把 job_id 传回本工具轮询取结果（running/queued=未完成；返回完整诊断=完成）。若响应已带 verdict，那是评估缓存命中——结果终局，无需再轮询。在途作业期间重交完全相同的参数会自动并入同一作业（dedup: true，不重复计算）。第一稿就写向量化代码：可编译加速的循环实现会被引擎自动加速（等价性严格验证），被拒的慢实现会被自动重写（仅严格等价变换）；冒烟预检被拒不消耗试验计数——等 1-3 分钟原样重交同一份源码。因子源码只做面板内纯计算：任何文件读写/网络/动态导入符号会被评估拒收（数据经 env 参数进入）。入册流程：开发区自由迭代 → factor_registry_submit 提交 → 引擎在内部做样本外验证 → 响应返回二值判定（通过/未通过），样本外数据不提供任何数值。',
     parameters: {
       envId: { type: 'string', description: 'Environment id; defaults to primary.' },
       source: { type: 'string', description: 'Python source defining def factor(env) -> np.ndarray. OMIT when polling a job (job_id only).' },
@@ -389,7 +403,7 @@ export function apply(ctx: Context, config: Config): void {
       source: { type: 'string', required: true, description: 'Python factor source.' },
       n_folds: { type: 'integer', description: 'Number of ordered blocks (default 5).' },
       t0_date: { type: 'string', description: 'Inclusive start date (default DEV_END).' },
-      t1_date: { type: 'string', description: 'Exclusive end date (default end).' },
+      t1_date: { type: 'string', description: 'Exclusive end date (default dev_end; 开发区滚动验证——不得越过 dev_end).' },
     },
     output: { schema: { type: 'json' }, render: JSON_RENDER },
     async execute(args, exec) {
@@ -521,7 +535,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_state_reset',
-    description: '按范围重置插件状态——用 shell 删状态目录的安全替代品。scope：mining（试验账/已证伪路径/搜索路径/挖掘状态）| landscape（零分布地形/算子集）| registry（已入册候选）| config（data-config.json，回到冷启动）| all。每个被删文件先备份到 stateRoot/backups/<时间戳>/。test_lock.json 永不重置（test 区一次性纪律锁不能被工具撤销——只能手动删）。',
+    description: '按范围重置插件状态——用 shell 删状态目录的安全替代品。scope：mining（试验账/已证伪路径/搜索路径/挖掘状态）| landscape（零分布地形/算子集）| registry（已入册候选）| config（data-config.json，回到冷启动）| all。每个被删文件先备份到 stateRoot/backups/<时间戳>/。',
     parameters: {
       scope: { type: 'string', description: 'mining | landscape | registry | config | all (default mining).', enum: ['mining', 'landscape', 'registry', 'config', 'all'] },
     },
@@ -625,7 +639,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_registry_submit',
-    description: '对一个候选因子跑准入门判定并提交入册。要点：把完整的 factor_evaluate 结果作为 diagnosis **原样**传入——桥会校验其中的回执（回执在场但关键数字被改——包括 deflated_train 充分统计量——会被拒绝；p 值重算也以引擎试验账里记录的统计量为准），执行铁律（同一份源码不能换名重复入册；同一个名字不能提交两次——重复提交会被拒），并拒绝带红旗的结果。之后想改描述用 factor_registry_update，不要重新提交。提交时引擎自动跑四道门：噪声世界检验（|z|>=3 拒绝）、日期置换时间零检验（只报告不拒绝）、声明参数的平坦性检验（悬崖形态拒绝——最小步长下出现符号翻转/塌缩/退化）、尾部通道的价差噪声门（不可判定 => 尾部通道事务中止）。必须把源码里**全部**可调数字字面量声明进 flatness_params——声明的值若不在源码中出现，事务中止。注意：提交是一个长事务（多道门顺序执行，慢因子可能要几分钟）——这是正常现象，不要中途重试。',
+    description: '对一个候选因子跑准入门判定并提交入册。要点：把完整的 factor_evaluate 结果作为 diagnosis **原样**传入——桥会校验其中的回执（回执在场但关键数字被改——包括 deflated_train 充分统计量——会被拒绝；p 值重算也以引擎试验账里记录的统计量为准），执行铁律（同一份源码不能换名重复入册；同一个名字不能提交两次——重复提交会被拒），并拒绝带红旗的结果。之后想改描述用 factor_registry_update，不要重新提交。提交时引擎自动跑门链：噪声世界检验（|z|>=3 拒绝）、日期置换时间零检验（只报告不拒绝）、声明参数的平坦性检验（悬崖形态拒绝——最小步长下出现符号翻转/塌缩/退化）、尾部通道的价差噪声门（不可判定 => 尾部通道事务中止）、入册强度线（|IC_IR| 须达到固定墙线——墙值固定不随已试假设数增长）、构造复杂度门（AST 算子调用数上限——超标拒收并给一次简化重写机会：精简构造后换名重交）、最短回测长度门（样本太短撑不起该强度拒）。dev 侧门全部通过后，引擎在内部对样本外数据做证据累积验证，响应只返回二值判定（通过/未通过）——样本外过程与数值不提供。判定为最终判定：同一份源码不得重试；换构造的新候选照常提交。构造族有每周判定额度（按源码算子结构归类），超额拒收并提示换构造族或等下周。deflated p>0.05 为警告——进人审复核清单，不构成拒收。必须把源码里**全部**可调数字字面量声明进 flatness_params——声明的值若不在源码中出现，事务中止。注意：提交是一个长事务（多道门顺序执行+内部验证，慢因子可能要几分钟）——这是正常现象，不要中途重试。',
     parameters: {
       envId: { type: 'string', description: 'Environment id; defaults to primary.' },
       source: { type: 'string', required: true, description: 'Python factor source.' },
@@ -633,7 +647,7 @@ export function apply(ctx: Context, config: Config): void {
       signal: { type: 'string', description: 'Human-readable precise factor definition.' },
       diagnosis: { type: 'json', description: 'The complete factor_evaluate diagnosis object, passed through verbatim from the evaluate call you are registering. Required — submissions without it are rejected.' },
       flatness_params: { type: 'json', description: 'Parameter declaration for the flatness check: [{name, value, step}] — every tunable numeric literal of the source (window lengths, thresholds, weights; NOT structural constants like 252 annualization). value must appear as a numeric literal in the source (mismatch aborts); step is the minimal meaningful step (window 10 -> 1, weight 0.65 -> 0.05). Omit entirely for genuinely parameter-free factors.' },
-      admit_basis: { type: 'string', description: 'Admission track: "ic" (default, the IC_IR chain) or "tail" (the tail-spread chain for factors whose top-K group return is strong even with mediocre full IC — requires the auto-computed tail block from factor_evaluate; gates: top-N placebo z>=3, spread noise-gate |z|<3, selection-Jaccard N_eff deflation with cross-track Sidak alpha).', enum: ['ic', 'tail'] },
+      admit_basis: { type: 'string', description: 'Admission track: "ic" (default, the IC_IR chain — dev gates + internal segment verification) or "tail" (the tail-spread chain for factors whose top-K group return is strong even with mediocre full IC — requires the auto-computed tail block from factor_evaluate; gates: top-N placebo, spread noise-gate, tail deflation wall).', enum: ['ic', 'tail'] },
     },
     output: { schema: { type: 'json' }, render: JSON_RENDER },
     async execute(args, exec) {
@@ -743,7 +757,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'factor_incubate_judge',
-    description: '对新窗做 cohort 一次性判决（需要环境已加载 cohort 起算日之后的新数据；窗口未满返回 not_ready——判决不被消耗）。幸存者可带 incubated_cohort 提交入册，豁免开发段的多重检验校正判据（其余门全部照旧）。',
+    description: '对新窗做 cohort 一次性判决（需要环境已加载 cohort 起算日之后的新数据；窗口未满返回 not_ready——判决不被消耗）。幸存者可带 incubated_cohort 提交入册（孵化幸存证据自动入账本标注；其余门全部照旧，含内部样本外验证）。',
     parameters: {
       cohort_id: { type: 'string', required: true, description: 'Cohort id from factor_incubate_status.' },
       envId: { type: 'string', description: 'Environment id; defaults to primary.' },

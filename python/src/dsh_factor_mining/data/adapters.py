@@ -45,6 +45,10 @@ class MappingSpec:
     symbol_pattern: str | None = None
     field_pattern: str | None = None
     separator: str = "_"
+    # ts_single 专用（factor-mining-futures 线）：oi 必填、close2 可选；
+    # 面板不消费。序列化仅在有值时带出——面板配置字节保持不变。
+    oi: str | None = None
+    close2: str | None = None
 
 
 @dataclass
@@ -58,7 +62,7 @@ class SourceSpec:
 class EnvironmentSpec:
     id: str = "primary"
     label: str = ""
-    kind: str = "panel"  # panel | minute_features
+    kind: str = "panel"  # panel | minute_features | ts_single（期货单品种时序线）
     source: SourceSpec = field(default_factory=SourceSpec)
     layout: str = "long"  # long | wide | per_symbol | multiindex
     mapping: MappingSpec = field(default_factory=MappingSpec)
@@ -98,11 +102,17 @@ CALIBRATION_PROFILES: dict[str, dict[str, Any]] = {
 
 ALLOWED_CAL_KEYS = {"frequency", "horizon", "horizons", "cost_bps", "execution",
                     "dev_end", "sel_end", "annualization", "limit_up_down_mask",
-                    "ic_sample_every", "top_n", "k_frac", "bars_per_day"}
+                    "ic_sample_every", "top_n", "k_frac", "bars_per_day",
+                    "limit_pct"}
 
 
-def resolve_calibration(raw: dict[str, Any] | None) -> dict[str, Any]:
-    """calibration 段 → 合并后的口径 dict（profile 打底，字段覆盖）。"""
+def resolve_calibration(raw: dict[str, Any] | None,
+                        kind: str = "panel") -> dict[str, Any]:
+    """calibration 段 → 合并后的口径 dict（profile 打底，字段覆盖）。
+
+    kind 只影响 horizons 菜单宽度上限（面板 6 / ts_single 20——2026-11-07
+    用户拍板 ts 线放开 1-20 全菜单；菜单宽度=允许的假设维度，宽度本身
+    已被 trail 按 (hash, horizon) 计价与 null 校准 per-horizon 基线覆盖）。"""
     if not raw:
         return {}
     if not isinstance(raw, dict):
@@ -126,11 +136,12 @@ def resolve_calibration(raw: dict[str, Any] | None) -> dict[str, Any]:
         raise DataError("calibration.frequency 只支持 daily | minute")
     if merged.get("execution") not in (None, "t1", "t0"):
         raise DataError("calibration.execution 只支持 t1 | t0")
-    _validate_calibration_domain(merged, raw)
+    _validate_calibration_domain(merged, raw, kind)
     return merged
 
 
-def _validate_calibration_domain(merged: dict[str, Any], raw: dict[str, Any]) -> None:
+def _validate_calibration_domain(merged: dict[str, Any], raw: dict[str, Any],
+                                   kind: str = "panel") -> None:
     """数值域校验（写配置时拒绝，绝不拖到 load/评估时才炸）。
 
     horizon<=0 会让 fwd 收益语义崩坏；cost_bps<0 等于负成本（垃圾因子净收益全变正）；
@@ -146,8 +157,10 @@ def _validate_calibration_domain(merged: dict[str, Any], raw: dict[str, Any]) ->
             raise DataError(f"calibration.horizon 必须 > 0（收到 {h}）")
     if "horizons" in merged and merged["horizons"] is not None:
         # v2（2026-08-20）horizon 菜单：申报制评估的合法赌注集。
-        # 约束：正整数、去重、1~6 个（菜单宽度 = 允许的假设维度，防爆炸）、
-        # 必须包含主 horizon（主 horizon 是缺省申报）。
+        # 约束：正整数、去重、必须包含主 horizon（主 horizon 是缺省申报）、
+        # 菜单宽度上限按线分（面板 6 / ts_single 20，2026-11-07 用户拍板
+        # ts 线放开 1-20 全菜单）——菜单宽度=允许的假设维度，宽度本身已被
+        # trail 按 (hash, horizon) 计价与 null 校准 per-horizon 基线覆盖。
         raw_menu = merged["horizons"]
         if not isinstance(raw_menu, (list, tuple)):
             raise DataError(f"calibration.horizons 必须是正整数数组（收到 {raw_menu!r}）")
@@ -159,8 +172,9 @@ def _validate_calibration_domain(merged: dict[str, Any], raw: dict[str, Any]) ->
             raise DataError(f"calibration.horizons 必须非空且全为正整数（收到 {menu}）")
         if len(set(menu)) != len(menu):
             raise DataError(f"calibration.horizons 不得重复（收到 {menu}）")
-        if len(menu) > 6:
-            raise DataError(f"calibration.horizons 菜单最多 6 个（收到 {len(menu)} 个：{menu}）"
+        _cap = 20 if kind == "ts_single" else 6
+        if len(menu) > _cap:
+            raise DataError(f"calibration.horizons 菜单最多 {_cap} 个（收到 {len(menu)} 个：{menu}）"
                             "——菜单宽度 = 允许的假设维度，宽菜单 = 宽选择偏差")
         main_h = int(merged.get("horizon") or 20)
         if main_h not in menu:
@@ -212,6 +226,17 @@ def _validate_calibration_domain(merged: dict[str, Any], raw: dict[str, Any]) ->
         # （防忘设导致全部年化指标错几十倍；不写入配置文件，load 响应报告实际生效值）
         if "annualization" not in raw:
             merged["annualization"] = b * 252
+    # limit_pct（ts 线 G-limit 涨跌停幅度，面板不消费该键——面板行为不变）：
+    # 域 0.005–0.5（0.5%=极端最小、50%=无限制上限），如 rb≈0.05-0.10
+    if "limit_pct" in merged and merged["limit_pct"] is not None:
+        try:
+            lp = float(merged["limit_pct"])
+        except (TypeError, ValueError):
+            raise DataError(f"calibration.limit_pct 必须是数值（收到 {merged['limit_pct']!r}）")
+        if not (0.005 <= lp <= 0.5):
+            raise DataError(
+                f"calibration.limit_pct 必须在 0.005–0.5（收到 {lp}；"
+                "如 rb≈0.05-0.10——G-limit 涨跌停掩码参数）")
 
 
 @dataclass
@@ -273,6 +298,14 @@ class DataConfig:
                 for must in ("symbol", "date"):
                     if not str(mapping.get(must) or "").strip():
                         problems.append(f"environments['{key}'].mapping.{must} 缺失（数据中的列名）")
+            # ts_single（期货单品种时序线）：必填 = date + OHLCV + oi；
+            # close2 可选；symbol 不必填（单品种）。未知字段校验照旧。
+            if raw.get("kind") == "ts_single":
+                for must in ("date", "open", "high", "low", "close", "volume", "oi"):
+                    if not str(mapping.get(must) or "").strip():
+                        problems.append(
+                            f"environments['{key}'].mapping.{must} 缺失"
+                            "（ts_single 必填：date+OHLCV+oi；close2 可选；symbol 不必填）")
             envs[key] = EnvironmentSpec(
                 id=key,
                 label=raw.get("label", key),
@@ -289,7 +322,8 @@ class DataConfig:
                 constraints=raw.get("constraints") or {},
                 features=raw.get("features") or {},
                 description=raw.get("description") or "",
-                calibration=resolve_calibration(raw.get("calibration") or {}),
+                calibration=resolve_calibration(raw.get("calibration") or {},
+                                                 kind=str(raw.get("kind", "panel"))),
             )
         if problems:
             raise DataError("数据配置结构错误（已拒绝写入，不落盘）:\n- " + "\n- ".join(problems)
@@ -338,12 +372,14 @@ def _mapping_from_dict(d: dict[str, Any]) -> MappingSpec:
         symbol_pattern=d.get("symbolPattern") or d.get("symbol_pattern"),
         field_pattern=d.get("fieldPattern") or d.get("field_pattern"),
         separator=d.get("separator", "_"),
+        oi=d.get("oi"),
+        close2=d.get("close2"),
     )
 
 
 def _dataclass_to_dict(obj) -> dict[str, Any]:
     if isinstance(obj, MappingSpec):
-        return {
+        d = {
             "symbol": obj.symbol, "date": obj.date,
             "open": obj.open, "high": obj.high, "low": obj.low,
             "close": obj.close, "volume": obj.volume,
@@ -354,6 +390,12 @@ def _dataclass_to_dict(obj) -> dict[str, Any]:
             "field_pattern": obj.field_pattern,
             "separator": obj.separator,
         }
+        # ts_single 专用键仅有值时带出——面板配置序列化字节不变（红线 1）
+        if obj.oi is not None:
+            d["oi"] = obj.oi
+        if obj.close2 is not None:
+            d["close2"] = obj.close2
+        return d
     if isinstance(obj, SourceSpec):
         return {"type": obj.type, "path": obj.path, "options": obj.options}
     if isinstance(obj, EnvironmentSpec):
@@ -561,6 +603,98 @@ def _load_minute_features(spec: EnvironmentSpec) -> pd.DataFrame:
     return df
 
 
+def _load_ts_single(spec: EnvironmentSpec) -> dict[str, Any]:
+    """kind=ts_single：单品种期货连续主力日线 → (T,) 一维字段。
+
+    与面板路径的差异（factor-mining-futures 线）：
+    - mapping：date + open/high/low/close/volume + **oi** 必填，
+      close2（次主力收盘，复权口径）可选；symbol 不必填（单品种）。
+    - 约束：minDates 照用（缺省 200）；minSymbols 跳过（无截面）。
+    - NaN 检查比截面严：期货连续主力序列不应有洞——有洞=拼接事故，
+      直接 DataError（报首末洞日与计数），不做截面那套 report 三态。
+    - 同目录存在 tsdata_fingerprint.json 则读出附在返回 dict
+      （"tsdata_fingerprint" 键）；不存在不报错（用户自备 parquet 合法，
+      指纹存在性校验由评估层负责）。
+    """
+    df = _read_source(spec.source)
+    m = spec.mapping
+    if m.date is None:
+        raise DataError(f"[{spec.id}] ts_single 缺少 date 列映射")
+    df = _coerce_date(df, m.date, spec.id)
+    cols: dict[str, str] = {}
+    for f in (*REQUIRED_OHLCV, "oi"):
+        col = _resolve_column(df, getattr(m, f), f, spec.id)
+        if col is None:
+            raise DataError(
+                f"[{spec.id}] ts_single 缺少 {f} 列映射（必填：date+OHLCV+oi）")
+        cols[f] = col
+    close2_col = _resolve_column(df, m.close2, "close2", spec.id)
+    df = df.sort_values("__date__", kind="stable").reset_index(drop=True)
+    dates = pd.DatetimeIndex(df["__date__"])
+    out: dict[str, Any] = {"kind": "ts_single", "dates": dates}
+    try:
+        for f, col in cols.items():
+            out[f] = pd.to_numeric(df[col], errors="raise").to_numpy(dtype=np.float64)
+        out["close2"] = (pd.to_numeric(df[close2_col], errors="raise")
+                         .to_numpy(dtype=np.float64) if close2_col is not None else None)
+    except (TypeError, ValueError) as e:
+        raise DataError(f"[{spec.id}] ts_single 数值列无法转 float64: {e}") from e
+    min_dates = int((spec.constraints or {}).get("minDates", 200))
+    if len(dates) < min_dates:
+        raise DataError(f"[{spec.id}] 日期数 {len(dates)} < minDates {min_dates}")
+    bad = ~np.isfinite(np.vstack([out[f] for f in (*REQUIRED_OHLCV, "oi")])).all(axis=0)
+    n_bad = int(bad.sum())
+    if n_bad:
+        bad_dates = dates[bad]
+        raise DataError(
+            f"[{spec.id}] 期货连续主力序列存在 {n_bad} 个洞（OHLCV/oi 含非有限值）："
+            f"首 {bad_dates[0].date()} 末 {bad_dates[-1].date()}。"
+            "连续主力序列有洞=拼接事故（比截面 report 模式严是刻意的）；"
+            "请用 tsdata.fetch_and_build 重建或修正源文件")
+    # 高频特征低频化字段（f_* 命名空间）：数据层预聚合的日频特征列。
+    # 显式 mapping 优先（spec.features: {f_x: 列名}）；未声明时自动探测
+    # 文件里 f_ 前缀的数值列（名字即字段名）。NaN 允许（暖机期）——计数
+    # 报告在 load 响应，评估按有限性剔除；不与 OHLCV 的严无洞规则混同
+    # （特征列暖期 NaN 是聚合窗口的合法形态）。
+    feats: dict[str, np.ndarray] = {}
+    declared = {k: v for k, v in (spec.features or {}).items()
+                if isinstance(k, str) and isinstance(v, str) and k and v}
+    feat_cols: dict[str, str] = {}
+    if declared:
+        from ..factor.env import TS_FEATURE_RE
+        for name, col in declared.items():
+            if not TS_FEATURE_RE.match(name):
+                raise DataError(
+                    f"[{spec.id}] features 字段名 {name!r} 非法——必须 f_ 前缀小写"
+                    "标识符（f_* 是高频特征低频化专用命名空间）")
+            feat_cols[name] = _resolve_column(df, col, name, spec.id)
+    else:
+        for col in df.columns:
+            c = str(col)
+            if c.startswith("f_") and c != "__date__" \
+                    and pd.api.types.is_numeric_dtype(df[col]):
+                feat_cols[c] = c
+    if feat_cols:
+        try:
+            for name, col in feat_cols.items():
+                feats[name] = pd.to_numeric(df[col], errors="raise") \
+                    .to_numpy(dtype=np.float64)
+        except (TypeError, ValueError) as e:
+            raise DataError(
+                f"[{spec.id}] ts_single 特征列无法转 float64: {e}") from e
+        out["features"] = feats
+        out["features_auto_detected"] = not declared
+    src_path = str(spec.source.path)
+    if not any(ch in src_path for ch in "*?["):
+        fp_path = Path(src_path).parent / "tsdata_fingerprint.json"
+        if fp_path.exists():
+            try:
+                out["tsdata_fingerprint"] = json.loads(fp_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                out["tsdata_fingerprint"] = None    # 指纹损坏：带上 None 交给评估层拒
+    return out
+
+
 def _pivot_long(long: pd.DataFrame, env_label: str) -> dict[str, Any]:
     required_cols = {}
     for f in REQUIRED_OHLCV:
@@ -623,10 +757,20 @@ def validate_env_lightweight(spec: EnvironmentSpec) -> None:
     else:
         return  # 未知后缀留给 load 时报错
     m = spec.mapping
-    for field in ("symbol", "date", *REQUIRED_OHLCV, "amount", "listed"):
+    if spec.kind == "ts_single":
+        fields = ("date", *REQUIRED_OHLCV, "oi", "close2")
+    else:
+        fields = ("symbol", "date", *REQUIRED_OHLCV, "amount", "listed")
+    for field in fields:
         col = getattr(m, field)
         if col and col not in names:
             raise DataError(f"映射列 '{col}'（{field}）在数据列中不存在；可用列: {sorted(names)[:20]}")
+    # ts 特征列（显式声明时校验存在；自动探测模式列名即字段名，天然存在）
+    if spec.kind == "ts_single" and spec.features:
+        for fname, fcol in spec.features.items():
+            if isinstance(fcol, str) and fcol and fcol not in names:
+                raise DataError(
+                    f"特征列 '{fcol}'（{fname}）在数据列中不存在；可用列: {sorted(names)[:20]}")
 
 
 def _validate_matrices(mats: dict[str, Any], spec: EnvironmentSpec) -> None:
@@ -686,6 +830,9 @@ def normalize_environment(spec: EnvironmentSpec) -> dict[str, Any]:
         df = _load_minute_features(spec)
         # Feature table is returned raw; alignment to a panel env happens in FactorRuntime.
         return {"kind": "minute_features", "frame": df}
+
+    if spec.kind == "ts_single":
+        return _load_ts_single(spec)
 
     if spec.layout == "long":
         long = _load_long(spec)
@@ -751,6 +898,63 @@ def build_factor_env(mats: dict[str, Any], calibration: dict[str, Any] | None = 
         listed=listed.values if listed is not None else None,
         amount=amount.values if amount is not None else None,
         calibration=cal,
+    )
+
+
+def build_ts_env(mats: dict[str, Any], calibration: dict[str, Any] | None = None,
+                 instrument: str = ""):
+    """Build TsEnv from normalize_environment(kind=ts_single) output.
+
+    与 build_factor_env 同款三区逻辑：dev_end/sel_end 显式给出则用之，
+    缺省按数据范围 60/20/20 自适应保底并回填实际值（regions_auto 标记）；
+    校验 dev_end>起点、sel_end>dev_end、sel_end<末端。
+
+    期货单品种口径（与面板刻意的差异）：
+    - cost_bps 缺省 2.0（calibration dict 无显式 cost_bps 键时；显式给值
+      则用显式值）——position_sim/净口径的成本基线。
+    - limit_pct = calibration.get("limit_pct", 0.05)（G-limit 涨跌停掩码
+      参数，如 rb≈0.05-0.10；域校验在 resolve_calibration 写配置时完成）。
+    - instrument 由调用方传入（环境 id 无法从 mats 拿到——bridge 用 env id）。
+    """
+    if mats.get("kind") != "ts_single":
+        raise DataError("build_ts_env 需要 kind=ts_single 的 normalize_environment 输出")
+    from ..factor.env import Calibration, TsEnv
+
+    cal_raw = dict(calibration or {})
+    cal_raw.pop("profile", None)  # profile 已在 resolve 阶段展开
+    limit_pct = float(cal_raw.pop("limit_pct", 0.05))
+    if cal_raw.get("cost_bps") is None:
+        cal_raw["cost_bps"] = 2.0   # 期货单品种口径缺省（显式给值则不变）
+    dates = pd.DatetimeIndex(mats["dates"]).tz_localize(None)
+
+    explicit_regions = ("dev_end" in cal_raw and "sel_end" in cal_raw
+                        and cal_raw.get("dev_end") and cal_raw.get("sel_end"))
+    cal = Calibration(**{k: v for k, v in cal_raw.items()
+                         if k in Calibration.__dataclass_fields__})
+    if not explicit_regions:
+        n = len(dates)
+        if n < 30:
+            raise DataError(f"日期数 {n} < 30，无法划分三区")
+        cal.dev_end = str(dates[int(n * 0.6)].date())
+        cal.sel_end = str(dates[int(n * 0.8)].date())
+        cal.regions_auto = True
+
+    if pd.Timestamp(cal.dev_end) <= dates[0]:
+        raise DataError(
+            f"dev_end={cal.dev_end} 早于数据起点 {str(dates[0].date())}——train 区为空，"
+            "请检查三区分界与数据的匹配")
+    if pd.Timestamp(cal.sel_end) <= pd.Timestamp(cal.dev_end):
+        raise DataError(f"sel_end={cal.sel_end} 必须晚于 dev_end={cal.dev_end}")
+    if pd.Timestamp(cal.sel_end) >= dates[-1]:
+        raise DataError(
+            f"sel_end={cal.sel_end} 不早于数据末端 {str(dates[-1].date())}——test 区为空，"
+            "请检查三区分界与数据的匹配")
+
+    return TsEnv(
+        mats["open"], mats["high"], mats["low"], mats["close"], mats["volume"],
+        mats["oi"], dates, instrument=str(instrument),
+        close2=mats.get("close2"), limit_pct=limit_pct, calibration=cal,
+        features=(mats.get("features") or None),
     )
 
 

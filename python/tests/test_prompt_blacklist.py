@@ -31,6 +31,12 @@ BLACKLIST = [
     "方案 B", "方案B",
     "may_stop",
     "暂停自动推进，等待真人指示",
+    # 2026-11-05 段隔离任务书 §五 C：退役语义禁现（模型面零样本外
+    # 语义——selection 工具面/凭据/一次性锁话术全部退役）
+    "selection 区",
+    "样本外（OOS）凭据", "OOS 凭据", "样本外凭据",
+    "test_lock", "evaluate_test",
+    "stage='selection'", 'stage="selection"',
 ]
 #: 日期引用（ISO 格式示例除外——后面跟 T 的是格式教学）
 _DATE_RE = re.compile(r"202[0-9]-[0-9]{2}-[0-9]{2}(?!T)")
@@ -84,6 +90,26 @@ def _skill_body() -> str:
     return "\n".join(bodies)
 
 
+def _skill_body_futures() -> str:
+    # 期货时序线技能（factor-mining-futures）：repo 内 preset 副本（随插件
+    # 交付的权威源）+ ~/.zcode / ~/.agents 安装副本（激活面，preset 的
+    # customSkillDirs 指向 ~/.zcode/skills）。存在的副本都扫
+    bodies = []
+    repo_copy = (ROOT.parent / "preset" / "factor-mining-futures" / "skill"
+                 / "factor-mining-futures" / "SKILL.md")
+    if repo_copy.exists():
+        bodies.append(repo_copy.read_text(encoding="utf-8"))
+    for base in (".zcode", ".agents"):
+        p = Path.home() / base / "skills" / "factor-mining-futures" / "SKILL.md"
+        if p.exists():
+            bodies.append(p.read_text(encoding="utf-8"))
+    if not bodies:
+        raise FileNotFoundError(
+            "factor-mining-futures SKILL.md 副本均不存在（repo preset 与 "
+            "~/.zcode、~/.agents 安装面）")
+    return "\n".join(bodies)
+
+
 def _bridge_model_text() -> str:
     p = ROOT / "src" / "dsh_factor_mining" / "bridge.py"
     s = p.read_text(encoding="utf-8")
@@ -124,6 +150,7 @@ def _module_model_text(name: str) -> str:
 SURFACES = {
     "index.ts descriptions": _index_ts_descriptions,
     "SKILL.md": _skill_body,
+    "SKILL.md (futures)": _skill_body_futures,
     "bridge.py model text": _bridge_model_text,
     "primitives.decide": _primitives_decide_text,
     "drive.ts model text": _drive_model_text,

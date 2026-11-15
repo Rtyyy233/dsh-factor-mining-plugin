@@ -34,7 +34,7 @@ import ast
 
 import numpy as np
 
-from .env import FactorEnv
+from .env import FactorEnv, TsEnv
 
 
 def replace_numeric_literal(source: str, old, new) -> str | None:
@@ -72,6 +72,13 @@ def train_ic_ir(F: np.ndarray, env: FactorEnv) -> float | None:
     与 evaluate ic_ir_train 同区口径（采样日 + PIT + 双方 finite），
     统计量用 fast_rank_ic（向量化，与噪声门同语义）；中心与全部邻居
     用同一内部统计量——平坦性是变体间比较，内部一致即公平。"""
+    if isinstance(env, TsEnv):
+        # ts 线分派（factor-mining-futures）：dev 窗乘积序列 IR
+        # （与 evaluate_ts 诊断同口径；中心与邻居共用同一统计量）。
+        from .evaluate_ts import series_ir, ts_product_series
+        ir = series_ir(ts_product_series(F, env,
+                                         end_date=env.calibration.dev_end))
+        return None if not np.isfinite(ir) else float(ir)
     import pandas as pd
 
     from .evaluate import _forward_returns, _pit_mask

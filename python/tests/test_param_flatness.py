@@ -24,6 +24,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 from dsh_factor_mining.factor.flatness import (  # noqa: E402
     flatness_test, literal_present, replace_numeric_literal)
@@ -88,6 +89,7 @@ def test_decl_value_must_be_in_source(tmp_path):
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
     with pytest.raises(BridgeError, match="未出现在 source"):
+        grant_oos(b.state_root, WINDOW_SOURCE)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "f_bad_decl", "signal": "x",
             "source": WINDOW_SOURCE,
@@ -100,6 +102,7 @@ def test_decl_value_must_be_in_source(tmp_path):
             "flatness_params": [
                 {"name": "window", "value": 63, "step": 1}]})  # 63 不在 source
     with pytest.raises(BridgeError, match="正数 step"):
+        grant_oos(b.state_root, WINDOW_SOURCE)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "f_bad_step", "signal": "x",
             "source": WINDOW_SOURCE,
@@ -181,6 +184,7 @@ def test_submit_flatness_wiring_and_ledger_isolation(tmp_path):
         return len(json.loads(p.read_text(encoding="utf-8")))
 
     n_before = _n_engine_trail()
+    grant_oos(b.state_root, WINDOW_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "f_flat", "signal": "window momentum",
         "source": WINDOW_SOURCE,
@@ -208,6 +212,7 @@ def test_submit_without_decl_skips(tmp_path):
     b = _make_drift_bridge(tmp_path)
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, WINDOW_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "f_nodecl", "signal": "x",
         "source": WINDOW_SOURCE,
@@ -239,6 +244,7 @@ def test_submit_cliff_rejects(tmp_path, monkeypatch):
     b = _make_drift_bridge(tmp_path)
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, WINDOW_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "f_cliff", "signal": "window momentum",
         "source": WINDOW_SOURCE,

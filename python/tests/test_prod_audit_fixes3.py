@@ -19,6 +19,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 from dsh_factor_mining.factor import random_gen  # noqa: E402
 
@@ -91,15 +92,18 @@ def test_rendered_source_defines_factor(tmp_path):
 def test_same_name_resubmit_rejected(tmp_path):
     b = _setup(tmp_path)
     diag = b.dispatch("factor.evaluate", {"envId": "etf", "source": GOOD, "stage": "development"})
+    grant_oos(b.state_root, GOOD)  # B3 OOS 凭据前置（E1 适配）
     b.dispatch("registry.submit", {"name": "f1", "source": GOOD, "signal": "d1", "diagnosis": diag})
     # 同名同 hash（想改描述）
     try:
+        grant_oos(b.state_root, GOOD)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {"name": "f1", "source": GOOD, "signal": "d2", "diagnosis": diag})
         raise AssertionError("同名同因子重复提交应被拒")
     except BridgeError as e:
         assert "registry_update" in str(e) or "重复" in str(e)
     # 同名不同 hash（换汤不换药）
     try:
+        grant_oos(b.state_root, GOOD2)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {"name": "f1", "source": GOOD2, "signal": "d3", "diagnosis": diag})
         raise AssertionError("同名不同源码应被拒")
     except BridgeError as e:

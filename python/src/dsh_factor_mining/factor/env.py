@@ -21,6 +21,11 @@ import numpy as np
 #: tail.K_FRAC 引用本常量保持同名兼容。
 TAIL_K_FRAC_DEFAULT = 0.2
 
+#: ts 线高频特征低频化字段的命名规则：f_ 前缀 + 小写标识符
+#: （f_ 命名空间与既有字段/方法机械隔离，leaves/AST 过滤按前缀识别）。
+import re as _re
+TS_FEATURE_RE = _re.compile(r"^f_[a-z][a-z0-9_]*$")
+
 
 @dataclass
 class Calibration:
@@ -117,3 +122,76 @@ def env_from_arrays(o, h, l, c, v, dates, symbols, listed=None, amount=None) -> 
     if c.shape[1] != len(symbols):
         raise ValueError(f"symbols length {len(symbols)} != N {c.shape[1]}")
     return FactorEnv(o, h, l, c, v, dates, symbols, listed=listed, amount=amount)
+
+
+class TsEnv:
+    """单品种时序环境（factor-mining-futures 线，2026-11-07 任务书 §〇.2）。
+
+    与 FactorEnv（(T,N) 截面面板）平行的第二类环境：一切字段为 (T,)
+    一维 float64 数组，无截面维度。因子契约：def factor(env) -> np.ndarray
+    输出 (T,)。
+
+    字段（全部对齐同一时间轴 dates，长度 T）：
+    - o/h/l/c/v：日线 OHLCV（主力连续，G-roll 增量复权后价格）
+    - oi：主力合约持仓量（当日主力合约原始值，不跨合约调整）
+    - close2：次主力合约收盘（增量复权口径；数据不含时为 None）
+    - limit_pct：品种涨跌停幅度（G-limit 掩码参数，如 rb≈0.05-0.10）
+    - instrument：品种代码（如 "rb"）；换品种 = 新赌注 = 新环境
+
+    只用过去数据纪律与截面线同：因果门（扰动法）对 TsEnv 同样适用。
+    cs_* 截面算子在单品种线上无语义——引擎侧拒绝使用（固定文案）。
+    """
+
+    # 无 __slots__：_env_horizon_view 以 __dict__ 快照构造 horizon 视图
+    # （dataclass replace 语义），slots 类没有 __dict__ 会破坏该机制。
+
+    def __init__(self, o, h, l, c, v, oi, dates, instrument="",
+                 close2=None, limit_pct=0.05,
+                 calibration: "Calibration | None" = None,
+                 features: dict | None = None):
+        self.o = np.asarray(o, dtype=np.float64)
+        self.h = np.asarray(h, dtype=np.float64)
+        self.l = np.asarray(l, dtype=np.float64)
+        self.c = np.asarray(c, dtype=np.float64)
+        self.v = np.asarray(v, dtype=np.float64)
+        self.oi = np.asarray(oi, dtype=np.float64)
+        n = self.c.shape[0]
+        if not (self.o.shape == self.h.shape == self.l.shape
+                == self.c.shape == self.v.shape == self.oi.shape):
+            raise ValueError("TsEnv 字段必须同为 (T,) 一维数组且等长")
+        if self.c.ndim != 1:
+            raise ValueError(f"TsEnv 字段必须一维（收到 ndim={self.c.ndim}）")
+        if len(dates) != n:
+            raise ValueError(f"dates 长度 {len(dates)} != T {n}")
+        self.close2 = (np.asarray(close2, dtype=np.float64)
+                       if close2 is not None else None)
+        if self.close2 is not None and self.close2.shape != self.c.shape:
+            raise ValueError("close2 必须与 c 同形 (T,)")
+        self.dates = list(dates)
+        self.instrument = str(instrument)
+        self.limit_pct = float(limit_pct)
+        self.calibration = calibration if calibration is not None else Calibration()
+        self.T = n
+        # 高频特征低频化字段（f_* 命名空间）：日频聚合特征 (T,) 数组，
+        # 由数据层预聚合（因子契约不变 (T,)）。NaN 允许（暖机期）——
+        # 评估按有限性剔除；causality 扰动与 npz 序列化全覆盖。
+        self.features: dict = {}
+        for k, arr in (features or {}).items():
+            if not TS_FEATURE_RE.match(str(k)):
+                raise ValueError(
+                    f"特征字段名 {k!r} 非法——必须匹配 f_<小写字母开头的小写字母数字下划线>"
+                    "（f_ 前缀=高频特征低频化专用命名空间，防与既有字段冲突）")
+            a = np.asarray(arr, dtype=np.float64)
+            if a.ndim != 1 or a.shape[0] != n:
+                raise ValueError(f"特征字段 {k} 必须是 ({n},) 一维数组（收到 {a.shape}）")
+            self.features[str(k)] = a
+            setattr(self, str(k), a)
+
+    def feature_nan_counts(self) -> dict:
+        """每特征字段的非有限计数（加载/审计报告面）。"""
+        return {k: int((~np.isfinite(v)).sum())
+                for k, v in self.features.items()}
+
+    def __repr__(self):
+        return (f"TsEnv(instrument={self.instrument!r}, T={self.T}, "
+                f"dates={self.dates[0]}~{self.dates[-1]})")

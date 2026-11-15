@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge
 
 SRC_MOM = ("def factor(env):\n    import pandas as pd\n"
@@ -177,25 +178,30 @@ def test_incubate_window_not_ready(bridge):
 
 def test_submit_incubation_waiver(bridge):
     b, state = bridge, bridge.state_root
+    from conftest import set_verify_mode
+    set_verify_mode(state, "off")  # 行为保持型：考孵化豁免链不考段验证
     # 注意:submit 的因子不做前置 evaluate——trail 有权威记录时手造诊断
     # 会被防编造门拦(_authoritative_dsr_stats 对账);与既有 submit 测试
     # 同模式(无记录 → verified=False 但不拦)
-    # 不豁免基线:弱 deflated p(diagnosis 自报 p=0.9)→ 拒
+    # B2（2026-11-01）：deflated p>0.05 全量降级为警告——"弱 p 拒"基线
+    # 前提消失，基线断言改为"警告挂载"；豁免链路的区分度=孵化标记+
+    # 幸存者自动补开 OOS 凭据（B3：incubation_survivor 票据）。
     diag = {"ic_ir_train": 0.4, "ic_n_train": 50,
             "column_perm_train": {"z": 4.0, "p": 0.0001},
             "beta_exposure": 0.1,
             "deflated_train": {"p": 0.9, "n_trials": 5, "sr_hat": 0.4,
                                "skew": 0.0, "kurt": 3.0, "n_obs": 60},
-            "red_flags": ["deflated p=0.9000 > 0.05:5 次已试假设的多重检验校正下不显著"],
             "verdict": "needs_review"}
+    grant_oos(b.state_root, SRC_MOM.replace("shift(20)", "shift(40)"))  # B3 OOS 凭据前置（E1 适配）
     base = b.dispatch("registry.submit", {
         "name": "incub_test_no_waiver", "signal": "test",
         "source": SRC_MOM.replace("shift(20)", "shift(40)"),
         "diagnosis": diag})
-    assert base["accepted"] is False
+    assert any("deflated p" in w
+               for w in (base["entry"]["diagnosis"].get("warnings") or [])), base
     # 豁免:伪造幸存者(引擎写入口是 survivors.jsonl;测试直接造一行)+
-    # incubated_cohort → deflated 红旗剥离。铁律:同源不得重复登记——
-    # 豁免提交用另一源(shift(50)),幸存者行按其 hash 造
+    # incubated_cohort → 幸存者证据自动补开 OOS 凭据。铁律:同源不得重复
+    # 登记——豁免提交用另一源(shift(50)),幸存者行按其 hash 造
     src = SRC_MOM.replace("shift(20)", "shift(50)")
     from dsh_factor_mining.discipline import source_fingerprint
     hh = source_fingerprint(src)
@@ -207,8 +213,18 @@ def test_submit_incubation_waiver(bridge):
     waived = b.dispatch("registry.submit", {
         "name": "incub_test_waived", "signal": "test",
         "source": src,
-        "diagnosis": json.loads(json.dumps(diag)),
+        # 声明强度抬高（sr/ic_ir 1.2）：本测试考孵化豁免链不考强度——
+        # 模块共享 stateRoot 的增长墙随文件内试验数上涨，0.4 的手造
+        # 值会被墙红牌拦截（顺序耦合，2026-11-05 修）
+        "diagnosis": json.loads(json.dumps({**diag, "ic_ir_train": 1.2,
+                                            "deflated_train": {
+                                                **diag["deflated_train"],
+                                                "sr_hat": 1.2}})),
         "incubated_cohort": "INC-test"})
     assert waived["accepted"] is True, waived.get("reason")
     assert waived["entry"].get("incubated_admitted", {}).get("cohort_id") == "INC-test"
     assert "incubated" in waived["reason"]
+    # B3 自动补票：幸存者的凭据以 incubation_survivor 开出（本提交未手动授权）
+    from dsh_factor_mining.factor.hardening import oos_receipt_for
+    rc = oos_receipt_for(state, hh)
+    assert rc is not None and rc.get("kind") == "incubation_survivor", rc

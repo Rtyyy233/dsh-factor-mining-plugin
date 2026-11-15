@@ -13,6 +13,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError
 from dsh_factor_mining.discipline import (
     dict_fingerprint,
@@ -178,6 +179,7 @@ def test_receipt_verification_flow():
         diag = b.dispatch("factor.evaluate", {"envId": "primary", "source": GOOD,
                                               "stage": "development"})
         # 1) 带 receipt 的真实诊断 → verified
+        grant_oos(b.state_root, GOOD)  # B3 OOS 凭据前置（E1 适配）
         r = b.dispatch("registry.submit", {
             "envId": "primary", "source": GOOD, "name": "mom20",
             "diagnosis": diag})
@@ -188,6 +190,7 @@ def test_receipt_verification_flow():
         forged = dict(diag)
         forged["ic_ir_train"] = 99.0
         try:
+            grant_oos(b.state_root, GOOD + "\n# variant")  # B3 OOS 凭据前置（E1 适配）
             b.dispatch("registry.submit", {
                 "envId": "primary", "source": GOOD + "\n# variant",
                 "name": "forged", "diagnosis": forged})
@@ -196,6 +199,7 @@ def test_receipt_verification_flow():
             assert "receipt" in e.message, e.message
         # 3) 同一 source 换名重复登记 → 铁律拒绝
         try:
+            grant_oos(b.state_root, GOOD)  # B3 OOS 凭据前置（E1 适配）
             b.dispatch("registry.submit", {
                 "envId": "primary", "source": GOOD, "name": "rename_dup",
                 "diagnosis": diag})

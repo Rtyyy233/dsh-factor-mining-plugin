@@ -247,6 +247,7 @@ def red_flags_and_verdict(diag: dict[str, Any], region: str = "train",
     （OOS 显著优于 train 是 regime/前视红旗）。
     """
     flags: list[str] = []
+    warnings: list[str] = []
     ic_ir = diag.get("ic_ir_train" if region == "train" else "ic_ir")
     ic_n = diag.get("ic_n_train" if region == "train" else "ic_n", 0)
     if isinstance(ic_ir, (int, float)):
@@ -264,22 +265,41 @@ def red_flags_and_verdict(diag: dict[str, Any], region: str = "train",
                 and ic_ir != 0 and t_ir > 0 and t_ir > 2 * abs(ic_ir)):
             flags.append(f"test IC_IR({t_ir:.2f}) 显著优于 train（{ic_ir:.2f}）：regime/前视红旗")
 
-    # 多重检验门控（2026-08-18 复核补全）：deflated p 是入册硬门。此前 p 只是
-    # 报告数字——z≥3 的不显著因子（p=0.9997 实测）照样 verdict=pass + 入册，
-    # 选择运气不可排除。进 red_flags → verdict=needs_review → submit 拒绝
-    # （复用现有「red_flags 未清不入册」链路）。
+    # 多重检验降级为警告（B2 2026-11-01 固定墙时代）：deflated p 计算与
+    # 落盘一字不减，但不再作入册红牌——硬拒由入册强度线（下方新增）+
+    # 雕刻门 + 提交链各门承担。p>0.05 / 不可算 → warnings（人审轮消费）。
     if region == "train":
         dp = diag.get("deflated_train") or {}
-        p, n_trials = dp.get("p"), dp.get("n_trials") or 1
-        if p is None and isinstance(n_trials, (int, float)) and n_trials > 1:
+        p = dp.get("p")
+        if isinstance(p, (int, float)):
+            if p > 0.05:
+                warnings.append(
+                    f"deflated p={p:.4f} > 0.05：多次试验口径下不显著（选择运气"
+                    "未能排除）——已降级为警告，入册判定以入册强度线为准；"
+                    "人审轮将复核该因子")
+        elif p is None and isinstance(dp.get("n_trials"), (int, float)) \
+                and dp["n_trials"] > 1:
+            warnings.append(
+                "deflated p 不可算（缺池分布基线）——已降级为警告；"
+                "入册强度线仍生效")
+        # 入册强度线（固定墙主门）：|IC_IR| 低于墙线（bar_sigma×pool_std，
+        # 固定模式下为常量）→ 红牌。墙值由 bridge 注入（fixed 模式恒定；
+        # growing 回滚时随试验数增长——措辞按 wall_mode 区分）。
+        sr = dp.get("sr_hat")
+        sr0 = dp.get("sr0")
+        if (isinstance(sr, (int, float)) and isinstance(sr0, (int, float))
+                and sr0 > 0 and abs(float(sr)) < float(sr0)):
+            _mode = "fixed" if dp.get("wall_mode") == "fixed" else "growing"
+            _line_name = ("入册固定线" if _mode == "fixed"
+                          else "入册线（随已试假设数增长）")
             flags.append(
-                f"N={n_trials:.0f} 次已试假设但缺池分布基线（trail<10 且未 null 校准）——"
-                "deflated p 不可算，先跑 factor_random_generate(mode='null-calibration') 再入册")
-        elif isinstance(p, (int, float)) and p > 0.05:
-            flags.append(
-                f"deflated p={p:.4f} > 0.05：{n_trials:.0f} 次已试假设的多重检验校正下不显著"
-                f"（sr0={dp.get('sr0')} vs |IC_IR|="
-                f"{abs(ic_ir) if isinstance(ic_ir, (int, float)) else '?'}）——选择运气不可排除，不入册")
+                f"强度低于{_line_name}：|IC_IR|={abs(float(sr)):.3f} < "
+                f"{float(sr0):.3f}（线 = 墙 {dp.get('bar_sigma')}σ × 池内 "
+                f"IC_IR 标准差 {dp.get('pool_std')}）——强度未达入册要求")
+        # 雕刻门退役（2026-11-05 段隔离任务书 §〇）：逐年一致性统计由
+        # evaluate 照常计算并留在诊断对象 diagnosis.carving（描述字段），
+        # 但不再产生红牌/判定/文案——"信号形态门只配路由"原则下该门
+        # 整体退役，终审权归内部段验证（SPRT）。
 
     # 结构化 verdict（H5）：把散落的信号聚合成机器可读结论
     cp = diag.get("column_perm_train" if region == "train" else "column_perm") or {}
@@ -295,4 +315,4 @@ def red_flags_and_verdict(diag: dict[str, Any], region: str = "train",
         verdict = "needs_review"  # beta 伪装嫌疑，不是硬失败
     else:
         verdict = "pass"
-    return {"verdict": verdict, "red_flags": flags}
+    return {"verdict": verdict, "red_flags": flags, "warnings": warnings}

@@ -1,0 +1,2 @@
+name: Factor Mining Futures
+description: 期货单品种时序因子挖掘专用会话：单品种主力连续日线上的时序信号研究，样本外验证由引擎内部执行，模型只收二值判定。

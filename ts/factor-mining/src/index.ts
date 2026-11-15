@@ -15,6 +15,8 @@ import type {
   AuditReport,
   BatchDiagnosis,
   BatchRequest,
+  BookAuditRequest,
+  BookAuditResult,
   JournalAppendRequest,
   JournalAppendResult,
   JournalDistillRequest,
@@ -179,6 +181,12 @@ export abstract class FactorMiningService extends Service {
 
   /** Update descriptive fields (signal/note) of one registry entry. Iron-rule fields rejected. */
   abstract registryUpdate(request: RegistryUpdateRequest): Promise<RegistryUpdateResult>
+
+  /** Rolling registry audit (2026-11-01 fixed-wall era): re-evaluate every
+   *  accepted factor on the extended forward band and produce downgrade
+   *  suggestions (watchlist). Never auto-removes — human adjudication owns
+   *  the demotion decision. Manual trigger; minute-scale per factor. */
+  abstract bookAudit(request: BookAuditRequest): Promise<BookAuditResult>
 
   /** Reasoning journal (interpretation layer over the engine fact trail,
    *  per parallel lane): progressive-disclosure read — 0=INDEX, 1=live,

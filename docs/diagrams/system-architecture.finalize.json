@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
-  "ok": true,
+  "ok": false,
   "command": "finalize",
-  "status": "pass",
+  "status": "fail",
   "type": "architecture",
   "quality": "showcase",
-  "startedAt": "2026-10-30T16:40:32.594Z",
+  "startedAt": "2026-11-05T12:05:39.552Z",
   "specification": {
-    "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
-    "sha256": "cbcc3e600fb2b56a8cd44505dc2cca691c079e52be6a17dbf737e48b089789c1",
-    "bytes": 19944
+    "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\src\\system-architecture.json",
+    "sha256": "da366edd4ee3ce8f3bd9358c6c7f3dbdb7a33462d403c05576139acc0c3cb428",
+    "bytes": 15913
   },
   "artifact": {
     "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
-    "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-    "bytes": 893571
+    "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+    "bytes": 893607
   },
   "stages": {
     "validate": {
@@ -27,12 +27,12 @@
         "C:\\Users\\RTyyyy\\.zcode\\skills\\archify\\bin\\archify.mjs",
         "deliver",
         "architecture",
-        "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
+        "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\src\\system-architecture.json",
         "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
         "--quality",
         "showcase",
         "--repo-root",
-        "C:\\Users\\RTyyyy\\AppData\\Local\\Temp\\fm-evidence2",
+        "C:\\Users\\RTyyyy\\AppData\\Local\\Temp\\dsh-mirror-render",
         "--json"
       ],
       "receipt": {
@@ -40,8 +40,8 @@
         "ok": true,
         "command": "validate",
         "specification": {
-          "sha256": "cbcc3e600fb2b56a8cd44505dc2cca691c079e52be6a17dbf737e48b089789c1",
-          "bytes": 19944
+          "sha256": "da366edd4ee3ce8f3bd9358c6c7f3dbdb7a33462d403c05576139acc0c3cb428",
+          "bytes": 15913
         },
         "validation": {
           "checksPassed": 9,
@@ -56,35 +56,35 @@
     "deliver": {
       "status": "pass",
       "exitCode": 0,
-      "durationMs": 878,
+      "durationMs": 856,
       "command": [
         "C:\\Program Files\\nodejs\\node.exe",
         "C:\\Users\\RTyyyy\\.zcode\\skills\\archify\\bin\\archify.mjs",
         "deliver",
         "architecture",
-        "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
+        "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\src\\system-architecture.json",
         "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
         "--quality",
         "showcase",
         "--repo-root",
-        "C:\\Users\\RTyyyy\\AppData\\Local\\Temp\\fm-evidence2",
+        "C:\\Users\\RTyyyy\\AppData\\Local\\Temp\\dsh-mirror-render",
         "--json"
       ],
       "receipt": {
         "schemaVersion": 1,
-        "receiptId": "eda69206-473a-410a-ab06-796bdbeb80cd",
+        "receiptId": "4fe021cf-a34a-4110-8a62-5c37bd28f087",
         "ok": true,
         "command": "deliver",
         "type": "architecture",
-        "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
+        "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\src\\system-architecture.json",
         "output": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
         "specification": {
-          "sha256": "cbcc3e600fb2b56a8cd44505dc2cca691c079e52be6a17dbf737e48b089789c1",
-          "bytes": 19944
+          "sha256": "da366edd4ee3ce8f3bd9358c6c7f3dbdb7a33462d403c05576139acc0c3cb428",
+          "bytes": 15913
         },
         "artifact": {
-          "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-          "bytes": 893571
+          "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+          "bytes": 893607
         },
         "validation": {
           "checksPassed": 9,
@@ -116,7 +116,7 @@
     "check": {
       "status": "pass",
       "exitCode": 0,
-      "durationMs": 221,
+      "durationMs": 215,
       "command": [
         "C:\\Program Files\\nodejs\\node.exe",
         "C:\\Users\\RTyyyy\\.zcode\\skills\\archify\\bin\\archify.mjs",
@@ -128,8 +128,8 @@
         "ok": true,
         "file": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
         "artifact": {
-          "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-          "bytes": 893571
+          "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+          "bytes": 893607
         },
         "checks": [
           {
@@ -301,13 +301,13 @@
           "issues": []
         },
         "provenance": "current",
-        "deliveryReceiptId": "eda69206-473a-410a-ab06-796bdbeb80cd"
+        "deliveryReceiptId": "4fe021cf-a34a-4110-8a62-5c37bd28f087"
       }
     },
     "browser-check": {
-      "status": "pass",
-      "exitCode": 0,
-      "durationMs": 3562,
+      "status": "fail",
+      "exitCode": 1,
+      "durationMs": 66,
       "command": [
         "C:\\Program Files\\nodejs\\node.exe",
         "C:\\Users\\RTyyyy\\.zcode\\skills\\archify\\bin\\archify.mjs",
@@ -319,690 +319,62 @@
       "execution": "in-process",
       "receipt": {
         "schemaVersion": 1,
-        "ok": true,
+        "ok": false,
         "command": "browser-check",
         "evidenceKind": "automated-browser",
-        "status": "pass",
+        "status": "fail",
         "visualReview": "not-requested",
         "provenance": "current",
-        "deliveryReceiptId": "eda69206-473a-410a-ab06-796bdbeb80cd",
+        "deliveryReceiptId": "4fe021cf-a34a-4110-8a62-5c37bd28f087",
         "artifact": {
           "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
-          "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-          "bytes": 893571
+          "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+          "bytes": 893607
         },
         "state": {
           "detail": "read",
           "motion": "still"
         },
         "chrome": {
-          "status": "available",
-          "executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+          "status": "not-checked",
+          "executable": null
         },
-        "diagnostics": [],
+        "diagnostics": [
+          {
+            "code": "viewer/evidence-path-conflict",
+            "severity": "error",
+            "message": "browser-check will not replace the existing unowned evidence path \"C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json\".",
+            "subject": {
+              "artifact": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
+              "evidencePath": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json"
+            },
+            "evidence": {
+              "reason": {
+                "code": "ownership-artifact-mismatch"
+              }
+            },
+            "supportedFixes": [
+              "move the conflicting file aside, or choose a separate --out-dir, then rerun browser-check"
+            ]
+          }
+        ],
         "containment": {
-          "status": "pass",
+          "status": "fail",
           "policy": "fit-or-reader-declared-readable-vertical-scroll",
-          "viewports": [
-            {
-              "width": 1440,
-              "height": 900,
-              "theme": "light",
-              "innerWidth": 1440,
-              "innerHeight": 900,
-              "scrollWidth": 1440,
-              "scrollHeight": 1750,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 12,
-                "headerPx": 78,
-                "diagramChromePx": 78,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 1600,
-              "height": 1000,
-              "theme": "light",
-              "innerWidth": 1600,
-              "innerHeight": 1000,
-              "scrollWidth": 1600,
-              "scrollHeight": 1816,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 86,
-                "diagramChromePx": 84,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 1920,
-              "height": 1080,
-              "theme": "light",
-              "innerWidth": 1920,
-              "innerHeight": 1080,
-              "scrollWidth": 1920,
-              "scrollHeight": 1816,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 86,
-                "diagramChromePx": 84,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 2048,
-              "height": 1320,
-              "theme": "light",
-              "innerWidth": 2048,
-              "innerHeight": 1320,
-              "scrollWidth": 2048,
-              "scrollHeight": 1834,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1038,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 94,
-                "diagramChromePx": 94,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 44,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            }
-          ]
+          "viewports": []
         },
         "themeStates": {
-          "status": "pass",
-          "viewports": [
-            {
-              "width": 1440,
-              "height": 900,
-              "requestedTheme": "light",
-              "resolvedTheme": "light",
-              "ok": true
-            },
-            {
-              "width": 1600,
-              "height": 1000,
-              "requestedTheme": "light",
-              "resolvedTheme": "light",
-              "ok": true
-            },
-            {
-              "width": 1920,
-              "height": 1080,
-              "requestedTheme": "light",
-              "resolvedTheme": "light",
-              "ok": true
-            },
-            {
-              "width": 2048,
-              "height": 1320,
-              "requestedTheme": "light",
-              "resolvedTheme": "light",
-              "ok": true
-            },
-            {
-              "width": 1440,
-              "height": 900,
-              "requestedTheme": "dark",
-              "resolvedTheme": "dark",
-              "ok": true
-            },
-            {
-              "width": 2048,
-              "height": 1320,
-              "requestedTheme": "dark",
-              "resolvedTheme": "dark",
-              "ok": true
-            }
-          ]
+          "status": "fail",
+          "viewports": []
         },
         "readability": {
-          "status": "pass",
+          "status": "fail",
           "minimumProjectedNodeTextPx": 6,
-          "viewports": [
-            {
-              "width": 1440,
-              "height": 900,
-              "theme": "light",
-              "innerWidth": 1440,
-              "innerHeight": 900,
-              "scrollWidth": 1440,
-              "scrollHeight": 1750,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 12,
-                "headerPx": 78,
-                "diagramChromePx": 78,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 1600,
-              "height": 1000,
-              "theme": "light",
-              "innerWidth": 1600,
-              "innerHeight": 1000,
-              "scrollWidth": 1600,
-              "scrollHeight": 1816,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 86,
-                "diagramChromePx": 84,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 1920,
-              "height": 1080,
-              "theme": "light",
-              "innerWidth": 1920,
-              "innerHeight": 1080,
-              "scrollWidth": 1920,
-              "scrollHeight": 1816,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 86,
-                "diagramChromePx": 84,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 2048,
-              "height": 1320,
-              "theme": "light",
-              "innerWidth": 2048,
-              "innerHeight": 1320,
-              "scrollWidth": 2048,
-              "scrollHeight": 1834,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1038,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 94,
-                "diagramChromePx": 94,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 44,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            }
-          ]
+          "viewports": []
         },
         "viewerChrome": {
-          "status": "pass",
-          "viewports": [
-            {
-              "width": 1440,
-              "height": 900,
-              "theme": "light",
-              "innerWidth": 1440,
-              "innerHeight": 900,
-              "scrollWidth": 1440,
-              "scrollHeight": 1750,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 12,
-                "headerPx": 78,
-                "diagramChromePx": 78,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 1600,
-              "height": 1000,
-              "theme": "light",
-              "innerWidth": 1600,
-              "innerHeight": 1000,
-              "scrollWidth": 1600,
-              "scrollHeight": 1816,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 86,
-                "diagramChromePx": 84,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 1920,
-              "height": 1080,
-              "theme": "light",
-              "innerWidth": 1920,
-              "innerHeight": 1080,
-              "scrollWidth": 1920,
-              "scrollHeight": 1816,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1018,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 86,
-                "diagramChromePx": 84,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 54,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            },
-            {
-              "width": 2048,
-              "height": 1320,
-              "theme": "light",
-              "innerWidth": 2048,
-              "innerHeight": 1320,
-              "scrollWidth": 2048,
-              "scrollHeight": 1834,
-              "overflowX": false,
-              "overflowY": true,
-              "verticalScrollAccepted": true,
-              "overflowDisposition": "readable-vertical-scroll",
-              "readerLayout": "adaptive",
-              "readerOverflow": "authored",
-              "readerFit": "intrinsic-height",
-              "ok": true,
-              "readerWidth": 1038,
-              "diagramWidth": 988,
-              "pageComposition": {
-                "bodyPaddingPx": 64,
-                "headerPx": 94,
-                "diagramChromePx": 94,
-                "svgPx": 1582,
-                "cardsPx": 0,
-                "viewBoxHeight": 1582
-              },
-              "viewBoxWidth": 988,
-              "minimumProjectedNodeTextPx": 6.4,
-              "minimumProjectedNonEdgeTextPx": 6.4,
-              "minimumProjectedEdgeTextPx": 8,
-              "minimumProjectedNodeText": "filelock · lane · procinfo · smoke · rewrite · derivation",
-              "minimumProjectedNodeTextDetail": "context",
-              "minimumProjectedNodeTextOwner": {
-                "kind": "node",
-                "id": "util"
-              },
-              "minimumRequiredNodeTextPx": 6,
-              "readabilityOk": true,
-              "hasLegend": true,
-              "hasNavigationDock": true,
-              "legendDockIntersectionArea": 0,
-              "dockStageIntersectionArea": 0,
-              "dockStageGap": 10,
-              "requiredDockStageGap": 10,
-              "viewerChromeStageOk": true,
-              "viewerChromeReserve": 44,
-              "viewerChromeActive": true,
-              "viewerChromeOk": true,
-              "resolvedTheme": "light"
-            }
-          ]
+          "status": "fail",
+          "viewports": []
         },
         "captures": {
           "status": "not-requested",
@@ -1012,32 +384,51 @@
         "sidecars": {
           "receipt": "system-architecture.browser-check.json",
           "files": []
-        }
+        },
+        "error": "browser-check will not replace the existing unowned evidence path \"C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json\"."
       }
     }
   },
   "browserCheck": {
     "requested": true,
-    "ran": true
+    "ran": false
   },
-  "diagnostics": [],
+  "diagnostics": [
+    {
+      "code": "viewer/evidence-path-conflict",
+      "severity": "error",
+      "message": "browser-check will not replace the existing unowned evidence path \"C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json\".",
+      "subject": {
+        "artifact": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
+        "evidencePath": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json"
+      },
+      "evidence": {
+        "reason": {
+          "code": "ownership-artifact-mismatch"
+        }
+      },
+      "supportedFixes": [
+        "move the conflicting file aside, or choose a separate --out-dir, then rerun browser-check"
+      ]
+    }
+  ],
   "evidence": {
     "receipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.finalize.json",
     "summaryReceipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.finalize-summary.json",
     "browserCheckReceipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json"
   },
   "visualReview": "not-requested",
-  "finishedAt": "2026-10-30T16:40:38.026Z",
-  "durationMs": 5431,
+  "failedStage": "browser-check",
+  "finishedAt": "2026-11-05T12:05:41.241Z",
+  "durationMs": 1689,
   "update": {
-    "status": "unavailable",
-    "installedVersion": null,
-    "availableVersion": null,
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
     "releaseNotes": null,
-    "checkedAt": null,
-    "source": null,
+    "checkedAt": "2026-11-05T00:56:40.628Z",
+    "source": "cache",
     "noticeRequired": false,
-    "noticeText": null,
-    "reason": "cache-valid"
+    "noticeText": null
   }
 }

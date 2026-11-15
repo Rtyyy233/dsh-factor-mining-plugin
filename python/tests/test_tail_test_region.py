@@ -23,6 +23,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 from dsh_factor_mining.factor.tailgate import tail_ledger  # noqa: E402
 
@@ -79,30 +80,21 @@ def test_full_chain_dev_submit_test(tmp_path):
         "diagnosis": diag, "admit_basis": "tail"})
     assert sub["accepted"] is True, sub.get("reason")
 
-    test = b.dispatch("factor.evaluate", {"envId": "primary",
-                                          "source": TILT_SOURCE,
-                                          "stage": "test"})
-    # test 尾块最小集：无 topn/placebo（null 是 train 区语义）
-    tail = test.get("tail")
-    assert isinstance(tail, dict) and tail.get("region") == "test", tail
-    assert isinstance(tail.get("spread_ir"), float), tail
-    assert "k_typical" in tail and "topn" not in tail, tail
-    # train 对照在场（dev 评估先做过）
-    decay = test.get("tail_decay")
-    assert isinstance(decay, dict), test.keys()
-    assert decay.get("spread_ir_train") == diag["tail"]["spread_ir"], decay
-    assert decay.get("spread_ir_test") == tail["spread_ir"], decay
-    assert isinstance(decay.get("ratio"), float), decay
-    assert "sign_flip" in decay, decay
-    # test_lock 的 diagnosis_summary 带 spread_ir_test
-    lock = json.loads((tmp_path / "state" / "test_lock.json")
-                      .read_text(encoding="utf-8"))
-    assert lock["diagnosis_summary"]["spread_ir_test"] == tail["spread_ir"]
-    # trail test 条目带尾块（stage="test"）
+    # 2026-11-05 段隔离：test stage 已下线——入册后也无 test 评估通道，
+    # 锁文件永不出现；样本外终审在提交路径内部（tail 轨本版不做段验证，
+    # 见 verify 模块 scope 标注）。
+    try:
+        b.dispatch("factor.evaluate", {"envId": "primary",
+                                       "source": TILT_SOURCE,
+                                       "stage": "test"})
+        raise AssertionError("stage=test 应被固定文案拒收")
+    except Exception as e:
+        assert "样本外评估已内部化" in str(e), str(e)
+    assert not (tmp_path / "state" / "test_lock.json").exists()
     trail = json.loads((tmp_path / "state" / "trail_engine.json")
                        .read_text(encoding="utf-8"))
     test_entries = [e for e in trail if e.get("stage") == "test"]
-    assert test_entries and isinstance(test_entries[-1]["tail"], dict)
+    assert not test_entries  # 无 test 轨迹产生
 
 
 # ---- 3. 防线 a：test 条目不进账本 ----
@@ -117,21 +109,23 @@ def test_ledger_excludes_test_stage(tmp_path):
                    root=str(tmp_path / "state"))
     b.dispatch("factor.evaluate", {"envId": "primary", "source": TILT_SOURCE,
                                    "stage": "development"})
-    b.dispatch("factor.evaluate", {"envId": "primary", "source": TILT_SOURCE,
-                                   "stage": "test"})
+    # 2026-11-05 段隔离：test stage 无通道——stage="test" 的 trail 条目
+    # 不可能再产生；账本排除逻辑仍由直构 trail 验证（下）。
     trail = json.loads((tmp_path / "state" / "trail_engine.json")
                        .read_text(encoding="utf-8"))
-    # test 条目带尾块但账本不收
     test_entries = [e for e in trail if e.get("stage") == "test"]
-    assert test_entries and isinstance(test_entries[-1]["tail"], dict)
+    assert not test_entries
     dev_tail = next(e["tail"] for e in trail if e.get("stage") == "development")
     led = tail_ledger(trail)
     assert len(led) == 1, led                    # 只 dev 那条
-    # 内容级：账本条目是 dev 块（placebo_z 在场；test 块无 topn）
+    # 内容级：账本条目是 dev 块（placebo_z 在场）
     assert led[0]["spread_ir"] == dev_tail["spread_ir"], led
     assert led[0]["placebo_z"] == dev_tail["topn"]["placebo_z"], led
-    # 直构验证：只含 test 条目的 trail → 空账本
-    assert tail_ledger(test_entries) == []
+    # 直构验证：只含 test 条目的 trail → 空账本（排除逻辑不随通道退役消失）
+    assert tail_ledger([{"source_hash": "x", "stage": "test",
+                         "tail": {"spread_ir": 1.0, "k_frac": 0.2,
+                                  "spread_moments": {"g3": 0.0, "g4": 3.0,
+                                                     "n": 100}}}]) == []
 
 
 # ---- 4. 防线 b：submit 反查排除 test ----
@@ -157,6 +151,7 @@ def test_submit_lookup_skips_test(tmp_path):
     ]
     (tmp_path / "state" / "trail_engine.json").write_text(
         json.dumps(trail), encoding="utf-8")
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "dual_stage", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": {"ic_ir_train": 0.25, "ic_n_train": 50,
@@ -176,6 +171,7 @@ def test_submit_lookup_skips_test(tmp_path):
     (tmp_path / "state" / "trail_engine.json").write_text(
         json.dumps([trail[1]]), encoding="utf-8")
     (tmp_path / "state" / "registry.json").write_text("[]", encoding="utf-8")
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub2 = b.dispatch("registry.submit", {
         "name": "test_only", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": {"ic_ir_train": 0.25, "ic_n_train": 50,

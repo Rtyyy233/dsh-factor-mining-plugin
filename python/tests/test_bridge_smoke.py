@@ -16,6 +16,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError
 
 BASELINE_SOURCE = """
@@ -213,6 +214,9 @@ def test_registry_submit_decoupled():
                      "deflated_train": {"p": 0.001, "n_trials": 1,
                                         "sr_hat": 0.5, "skew": 0.0, "kurt": 3.0,
                                         "n_obs": 60}}
+        from conftest import set_verify_mode
+        set_verify_mode(bridge.state_root, "off")  # 行为保持型：考解耦不考段验证
+        grant_oos(bridge.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
         res = bridge.dispatch("registry.submit", {
             "name": "candidate_a", "signal": "momentum20",
             "diagnosis": diagnosis, "source": BASELINE_SOURCE,
@@ -232,30 +236,29 @@ def test_registry_submit_decoupled():
 
 
 def test_bridge_test_stage_consumes_lock():
-    """pytest 入口：test stage 一次性锁（evaluate_test 消费后 raise，跨 worker 子进程可见）。"""
+    """pytest 入口：selection/test stage 已内部化（P0 2026-11-05）——
+    模型调用一律固定文案拒收（已入册候选/未入册候选同语义），不再有
+    一次性锁消费通道。断言改写为新语义（旧行为断言随 selection 工具
+    面退役，见任务书 §〇/§二）。"""
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        # 早起点 + 长周期，让 test 区 [2024-01-01, end) 有足够信号日样本
         bridge, _ = _make_bridge(root, T=2600, start="2015-01-05")
-        # 2026-08-28 加固配套：test 只测已入册候选——先入册再消费
         from dsh_factor_mining.discipline import source_fingerprint
         from dsh_factor_mining.state import write_registry
         write_registry([{"name": "baseline_mom",
                          "source_hash": source_fingerprint(BASELINE_SOURCE),
                          "accepted": True, "source": BASELINE_SOURCE}],
                        root=str(root / "state"))
-        r1 = _poll_evaluate(bridge, bridge.dispatch(
-            "factor.evaluate",
-            {"envId": "primary", "source": BASELINE_SOURCE, "stage": "test"}),
-            timeout_s=180.0)
-        assert r1.get("region") == "test", r1
-        try:
-            bridge.dispatch("factor.evaluate",
-                            {"envId": "primary", "source": BASELINE_SOURCE, "stage": "test"})
-            raise AssertionError("第二次 test 评估应 raise（test_lock 一次性）")
-        except BridgeError as e:
-            assert e.code == -32003, e.code
-            assert "test 已被消费" in e.message, e.message
+        for stage in ("selection", "test"):
+            try:
+                bridge.dispatch("factor.evaluate", {
+                    "envId": "primary", "source": BASELINE_SOURCE,
+                    "stage": stage})
+                raise AssertionError(f"stage={stage} 应被固定文案拒收")
+            except BridgeError as e:
+                assert e.code == -32003, e.code
+                assert "样本外评估已内部化" in e.message, e.message
+                assert "registry_submit" in e.message, e.message
 
 
 def main():

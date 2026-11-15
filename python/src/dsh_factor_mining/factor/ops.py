@@ -19,6 +19,28 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
+# Series 桥（期货单品种 ts 线，2026-11-07）：算子契约仍是 (T,N) DataFrame；
+# ts 线以 pd.Series((T,)) 复用同一算子库。守护式原则——面板路径
+# （DataFrame 入参）零变化：只有 isinstance(x, pd.Series) 分支才走桥
+# （桥到单列 DataFrame 跑同一实现再桥回 Series，保留 index）。对 Series
+# 原生可算（rolling/逐元素族）的算子不加桥——直接返回即正确。
+# ---------------------------------------------------------------------------
+_SERIES_BRIDGE_COL = "__s__"
+
+
+def _to_df(x):
+    """pd.Series → 单列 DataFrame（列名 __s__，index 保留）；DataFrame 原样。"""
+    return x.to_frame(_SERIES_BRIDGE_COL) if isinstance(x, pd.Series) else x
+
+
+def _from_proto(out, proto):
+    """单列 DataFrame → pd.Series（沿用 proto 的 index）；DataFrame 原样。"""
+    if isinstance(proto, pd.Series):
+        return pd.Series(out[_SERIES_BRIDGE_COL].values, index=proto.index)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 时序算子（窗口沿时间轴，只向后看）
 # ---------------------------------------------------------------------------
 def ts_mean(x, w):
@@ -52,9 +74,19 @@ def ts_kurt(x, w):
     return x.rolling(w, min_periods=max(4, w)).kurt()
 
 def ts_corr(x, y, w):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        # ts 线 Series 桥（Series×Series / Series×DataFrame 混合）：桥 df
+        # 跑同一实现；双 Series → 桥回 Series，混合 → DataFrame
+        out = ts_corr(_to_df(x), _to_df(y), w)
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.rolling(w, min_periods=max(3, w // 2)).corr(y)
 
 def ts_cov(x, y, w):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = ts_cov(_to_df(x), _to_df(y), w)   # ts 线 Series 桥（同 ts_corr）
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.rolling(w, min_periods=max(3, w // 2)).cov(y)
 
 def ts_slope(x, w):
@@ -66,6 +98,8 @@ def ts_slope(x, w):
     与窗口内相对位置的协方差等价（窗口内常数平移被均值消去），全长
     计数器与原意图同数学。
     """
+    if isinstance(x, pd.Series):
+        return _from_proto(ts_slope(_to_df(x), w), x)   # ts 线 Series 桥
     mp = max(2, w // 2)
     mean_x = x.rolling(w, min_periods=mp).mean()
     var_x = x.rolling(w, min_periods=mp).var()
@@ -92,6 +126,8 @@ def ts_decay_linear(x, w):
         return col.rolling(w, min_periods=mp).apply(
             lambda v: float(np.dot(v, weights[-len(v):] / weights[-len(v):].sum()))
             if len(v) < w else float(np.dot(v, weights)), raw=True)
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：Series.apply 是逐元素语义
+        return _from_proto(ts_decay_linear(_to_df(x), w), x)
     return x.apply(_apply)
 
 def ts_av_diff(x, w):
@@ -104,12 +140,20 @@ def ts_momentum(x, w):
 
 def ts_vol_ratio(x, y, w):
     """x 的 w 期 std 除以 y 的 w 期 std（相对波动结构）。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = ts_vol_ratio(_to_df(x), _to_df(y), w)   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     mp = max(2, w // 2)
     return x.rolling(w, min_periods=mp).std().div(
         y.rolling(w, min_periods=mp).std().clip(lower=1e-12))
 
 def ts_resid(y, x, w):
     """滚动 OLS 残差：y 对 x 的窗口回归残差（对冲腿机械化——负相关对冲=残差结构）。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = ts_resid(_to_df(y), _to_df(x), w)   # ts 线 Series 桥
+        return _from_proto(out, y) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     mp = max(3, w // 2)
     cov = y.rolling(w, min_periods=mp).cov(x)
     var = x.rolling(w, min_periods=mp).var()
@@ -118,6 +162,10 @@ def ts_resid(y, x, w):
 
 def ts_beta(y, x, w):
     """滚动 OLS 斜率（敏感度/对冲系数）。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = ts_beta(_to_df(y), _to_df(x), w)   # ts 线 Series 桥
+        return _from_proto(out, y) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     mp = max(3, w // 2)
     cov = y.rolling(w, min_periods=mp).cov(x)
     var = x.rolling(w, min_periods=mp).var()
@@ -134,6 +182,8 @@ def ts_decay_exp(x, w):
         return col.rolling(w, min_periods=mp).apply(
             lambda v: float(np.dot(v, weights[-len(v):] / weights[-len(v):].sum()))
             if len(v) < w else float(np.dot(v, weights)), raw=True)
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：Series.apply 是逐元素语义
+        return _from_proto(ts_decay_exp(_to_df(x), w), x)
     return x.apply(_apply)
 
 def hump(x, h):
@@ -150,6 +200,10 @@ def hump(x, h):
 # ---------------------------------------------------------------------------
 def ts_wmean(x, wgt, w):
     """加权滚动均值：Σ(x·wgt)/Σ(wgt)——量腿加权的单算子化（战役三度兑现）。"""
+    if isinstance(x, pd.Series) or isinstance(wgt, pd.Series):
+        out = ts_wmean(_to_df(x), _to_df(wgt), w)   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(wgt, pd.Series)) else out
     mp = max(2, w // 2)
     num = x.mul(wgt).rolling(w, min_periods=mp).sum()
     den = wgt.rolling(w, min_periods=mp).sum()
@@ -172,12 +226,16 @@ def ts_range_pos(x, w):
 def ts_arg_max(x, w):
     """窗口内最大值的位置（0=最新，w−1=最旧）——极值新近度（与 decay 族同成本档）。"""
     mp = max(2, w // 2)
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：Series.apply 是逐元素语义
+        return _from_proto(ts_arg_max(_to_df(x), w), x)
     return x.apply(lambda col: col.rolling(w, min_periods=mp).apply(
         lambda v: float(len(v) - 1 - np.argmax(v)), raw=True))
 
 def ts_arg_min(x, w):
     """窗口内最小值的位置（0=最新，w−1=最旧）。"""
     mp = max(2, w // 2)
+    if isinstance(x, pd.Series):   # ts 线 Series 桥
+        return _from_proto(ts_arg_min(_to_df(x), w), x)
     return x.apply(lambda col: col.rolling(w, min_periods=mp).apply(
         lambda v: float(len(v) - 1 - np.argmin(v)), raw=True))
 
@@ -194,6 +252,8 @@ def ts_iqr(x, w):
 
 def ts_winsor(x, w):
     """时序 winsorize：clip 到滚动均值 ± 3σ（volmom_winsor_only 入册因子的机械化）。"""
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：重建需 columns
+        return _from_proto(ts_winsor(_to_df(x), w), x)
     mp = max(3, w // 2)
     m = x.rolling(w, min_periods=mp).mean()
     s = x.rolling(w, min_periods=mp).std()
@@ -204,6 +264,10 @@ def ts_winsor(x, w):
 
 def ts_rank_corr(x, y, w):
     """滚动秩相关（Spearman）：对滚动秩再相关——稳健版 ts_corr。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = ts_rank_corr(_to_df(x), _to_df(y), w)   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     mp = max(3, w // 2)
     rx = x.rolling(w, min_periods=mp).rank(pct=True)
     ry = y.rolling(w, min_periods=mp).rank(pct=True)
@@ -214,6 +278,8 @@ def ts_streak(x, w):
 
     每列 O(T) 纯 numpy（无逐单元 Python）；x 恒定列产常量 0 → 健康门兜底。
     """
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：主体按 (T,N) 解包
+        return _from_proto(ts_streak(_to_df(x), w), x)
     s = np.sign(x.diff().values)
     T, N = s.shape
     out = np.full((T, N), np.nan)
@@ -233,6 +299,10 @@ def ts_coskew(x, y, w):
 
     展开式全滚动均值可算（无逐窗 Python）：E[x²y]−2mx·E[xy]−my·E[x²]+2mx²·my。
     """
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = ts_coskew(_to_df(x), _to_df(y), w)   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     mp = max(4, w // 2)
     mx = x.rolling(w, min_periods=mp).mean()
     my = y.rolling(w, min_periods=mp).mean()
@@ -250,6 +320,13 @@ def ts_triple_corr(x, y, z, w):
 
     展开式：E[xyz]−mx·E[yz]−my·E[xz]−mz·E[xy]+2·mx·my·mz。
     """
+    if (isinstance(x, pd.Series) or isinstance(y, pd.Series)
+            or isinstance(z, pd.Series)):
+        out = ts_triple_corr(_to_df(x), _to_df(y), _to_df(z), w)   # ts 线桥
+        if (isinstance(x, pd.Series) and isinstance(y, pd.Series)
+                and isinstance(z, pd.Series)):
+            return _from_proto(out, x)
+        return out
     mp = max(4, w // 2)
     mx = x.rolling(w, min_periods=mp).mean()
     my = y.rolling(w, min_periods=mp).mean()
@@ -307,29 +384,62 @@ def cs_robust_z(x):
 # 二元算子（逐元素）
 # ---------------------------------------------------------------------------
 def add(x, y):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        # ts 线 Series 桥：双 Series → Series（保 index）；混合 → DataFrame
+        out = add(_to_df(x), _to_df(y))
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.add(y)
 
 def sub(x, y):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = sub(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.sub(y)
 
 def mul(x, y):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = mul(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.mul(y)
 
 def div(x, y):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = div(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.div(y.abs().clip(lower=1e-9) * np.sign(y.replace(0, 1.0)))
 
 def minv(x, y):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = minv(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return np.minimum(x, y)
 
 def maxv(x, y):
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = maxv(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return np.maximum(x, y)
 
 def signed_diff(x, y):
     """x−y 的符号（方向结构，无量纲）。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = signed_diff(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return np.sign(x.sub(y))
 
 def sfdiff(x, y):
     """无量纲差：(x−y)/(|x|+|y|) ∈ [−1,1]——跨量纲比较，免同空间约束。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = sfdiff(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.sub(y).div(x.abs().add(y.abs()).clip(lower=1e-12))
 
 # ---------------------------------------------------------------------------
@@ -346,10 +456,14 @@ def log1p_abs(x):
     return np.log1p(x.abs())
 
 def sigmoid(x):
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：重建需 columns
+        return _from_proto(sigmoid(_to_df(x)), x)
     return pd.DataFrame(1.0 / (1.0 + np.exp(-np.clip(x.values, -30, 30))),
                         index=x.index, columns=x.columns)
 
 def tanhx(x):
+    if isinstance(x, pd.Series):   # ts 线 Series 桥：重建需 columns
+        return _from_proto(tanhx(_to_df(x)), x)
     return pd.DataFrame(np.tanh(np.clip(x.values, -30, 30)),
                         index=x.index, columns=x.columns)
 
@@ -375,14 +489,29 @@ def softsign(x):
 # ---------------------------------------------------------------------------
 def gt(x, y):
     """逐元素 x>y → 1.0/0.0（与 NaN 比较为 False）。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = gt(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.gt(y).astype("float64")
 
 def lt(x, y):
     """逐元素 x<y → 1.0/0.0。"""
+    if isinstance(x, pd.Series) or isinstance(y, pd.Series):
+        out = lt(_to_df(x), _to_df(y))   # ts 线 Series 桥
+        return _from_proto(out, x) if (isinstance(x, pd.Series)
+                                       and isinstance(y, pd.Series)) else out
     return x.lt(y).astype("float64")
 
 def where(cond, a, b):
     """条件三分支：cond∈{0,1}（来自 gt/lt）→ cond·a + (1−cond)·b，NaN 自然传播。"""
+    if (isinstance(cond, pd.Series) or isinstance(a, pd.Series)
+            or isinstance(b, pd.Series)):
+        out = where(_to_df(cond), _to_df(a), _to_df(b))   # ts 线 Series 桥
+        if (isinstance(cond, pd.Series) and isinstance(a, pd.Series)
+                and isinstance(b, pd.Series)):
+            return _from_proto(out, cond)
+        return out
     return cond.mul(a).add(b.mul(1.0 - cond))
 
 # ---------------------------------------------------------------------------

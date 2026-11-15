@@ -1,30 +1,49 @@
 {
   "schemaVersion": 1,
-  "ok": true,
+  "ok": false,
   "command": "finalize",
-  "status": "pass",
+  "status": "fail",
   "type": "architecture",
   "quality": "showcase",
   "specification": {
-    "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
-    "sha256": "cbcc3e600fb2b56a8cd44505dc2cca691c079e52be6a17dbf737e48b089789c1",
-    "bytes": 19944
+    "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\src\\system-architecture.json",
+    "sha256": "da366edd4ee3ce8f3bd9358c6c7f3dbdb7a33462d403c05576139acc0c3cb428",
+    "bytes": 15913
   },
   "artifact": {
     "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
-    "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-    "bytes": 893571
+    "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+    "bytes": 893607
   },
   "gates": {
     "validate": "pass",
     "deliver": "pass",
     "check": "pass",
-    "browser-check": "pass"
+    "browser-check": "fail"
   },
-  "diagnostics": [],
+  "failedStage": "browser-check",
+  "diagnostics": [
+    {
+      "code": "viewer/evidence-path-conflict",
+      "severity": "error",
+      "message": "browser-check will not replace the existing unowned evidence path \"C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json\".",
+      "subject": {
+        "artifact": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
+        "evidencePath": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json"
+      },
+      "evidence": {
+        "reason": {
+          "code": "ownership-artifact-mismatch"
+        }
+      },
+      "supportedFixes": [
+        "move the conflicting file aside, or choose a separate --out-dir, then rerun browser-check"
+      ]
+    }
+  ],
   "diagnosticSummary": {
-    "total": 0,
-    "shown": 0,
+    "total": 1,
+    "shown": 1,
     "truncated": false
   },
   "evidence": {
@@ -32,79 +51,20 @@
     "summaryReceipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.finalize-summary.json",
     "browserCheckReceipt": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.browser-check.json"
   },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-11-05T00:56:40.628Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
   "visualReview": "not-requested",
-  "durationMs": 5431,
+  "durationMs": 1689,
   "browserCheck": {
     "requested": true,
-    "ran": true
-  },
-  "visualReviewRecommendation": {
-    "action": "inspect-route-readability",
-    "signals": {
-      "resolvedCrossovers": 1,
-      "routesOverSuggestedBends": 2,
-      "routesOverSuggestedStretch": 1
-    },
-    "reason": "Automated gates passed, but crossings or detours still need perceptual review before claiming visual quality.",
-    "affectedRoutes": {
-      "crossings": [
-        {
-          "left": {
-            "id": "bridge-inspire",
-            "from": "bridge",
-            "to": "inspire",
-            "label": "",
-            "collectionIndex": 11,
-            "artifactIndex": 12
-          },
-          "right": {
-            "id": "bridge-state",
-            "from": "bridge",
-            "to": "state",
-            "label": "",
-            "collectionIndex": 12,
-            "artifactIndex": 13
-          },
-          "point": [
-            595,
-            767
-          ],
-          "sharedNode": "bridge"
-        }
-      ],
-      "detours": [
-        {
-          "relationship": {
-            "id": "host-drive",
-            "from": "dsh-host",
-            "to": "drive",
-            "label": "轮末事件",
-            "collectionIndex": 2,
-            "artifactIndex": 3
-          },
-          "bends": 4,
-          "stretch": 1.5
-        },
-        {
-          "relationship": {
-            "id": "state-file",
-            "from": "state",
-            "to": "f-state",
-            "label": "write_json 原子写（trail/registry/seeds 同通道）",
-            "collectionIndex": 17,
-            "artifactIndex": 18
-          },
-          "bends": 3,
-          "stretch": 1.106
-        }
-      ],
-      "truncated": false
-    },
-    "hints": [
-      "bridge → inspire and bridge → state cross next to bridge: move node inspire or state so the two reach bridge from different sides (for example one level with it, one directly above or below it).",
-      "dsh-host → drive needs 4 bends: move node dsh-host or drive so they share a row or column with matching centers, or sit diagonally with a clear corner.",
-      "state → f-state needs 3 bends: move node state or f-state so they share a row or column with matching centers, or sit diagonally with a clear corner."
-    ],
-    "repair": "Trace these relationships at the desktop viewport. For Architecture, use references/architecture-layout-repair.md: reflow a blocked main path or tangled connected scene, and repair an isolated defect locally only when the surrounding composition is accepted. Preserve all semantic content and user-fixed geometry. Rerun finalize once after the edit."
+    "ran": false
   }
 }

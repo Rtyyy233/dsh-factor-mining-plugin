@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,16 +21,15 @@ import pandas as pd
 
 from .factor.audit import audit
 from .factor.causality import check_causality
-from .factor.env import FactorEnv
+from .factor.env import FactorEnv, TsEnv
 from .factor.eval_cache import cached_evaluate
 from .factor.evaluate import (
     evaluate,
     evaluate_batch,
     evaluate_composite,
-    evaluate_selection,
-    evaluate_test,
     evaluate_walk_forward,
 )
+from .factor.evaluate_ts import evaluate_ts, evaluate_walk_forward_ts
 from .factor.noise import factor_perf
 from .discipline import source_fingerprint
 from .panel_mmap import load_bundle_mmap
@@ -44,10 +44,32 @@ from .smoke import (
 )
 
 
-def write_env_npz(path, env: FactorEnv) -> None:
+def write_env_npz(path, env) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     from dataclasses import asdict
+
+    if isinstance(env, TsEnv):
+        # ts 线（factor-mining-futures）：(T,) 一维字段 + oi；close2 可选；
+        # f_* 特征字段（高频特征低频化）以 feat__<name> 键序列化。
+        # meta["instrument"] 键的存在性 = ts npz 的判别标记（面板 meta 无此键）。
+        meta = {"dates": [str(d) for d in env.dates],
+                "symbols": [env.instrument],
+                "instrument": env.instrument,
+                "limit_pct": float(env.limit_pct),
+                "calibration": asdict(env.calibration)}
+        arrays = {"o": env.o, "h": env.h, "l": env.l, "c": env.c,
+                  "v": env.v, "oi": env.oi}
+        if env.close2 is not None:
+            arrays["close2"] = env.close2
+        if getattr(env, "features", None):
+            meta["feature_names"] = sorted(env.features)
+            for k, arr in env.features.items():
+                arrays[f"feat__{k}"] = arr
+        np.savez_compressed(p, **arrays)
+        p.with_suffix(p.suffix + ".meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        return
 
     meta = {"dates": [str(d) for d in env.dates], "symbols": list(env.symbols),
             "calibration": asdict(env.calibration)}
@@ -61,10 +83,34 @@ def write_env_npz(path, env: FactorEnv) -> None:
         json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
-def load_env_npz(path) -> FactorEnv:
+def load_env_npz(path) -> "FactorEnv | TsEnv":
     p = Path(path)
     meta_path = p.with_suffix(p.suffix + ".meta.json")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if "instrument" in meta:
+        # ts npz（factor-mining-futures 线）：meta["instrument"] 存在 → TsEnv；
+        # 旧面板 meta 无此键 → 下方原面板路径（字节不变）。
+        with np.load(p, allow_pickle=False) as data:
+            o = data["o"]; h = data["h"]; l = data["l"]; c = data["c"]
+            v = data["v"]; oi = data["oi"]
+            close2 = data["close2"] if "close2" in data else None
+            feats = {str(k): data[f"feat__{k}"] for k in
+                     (meta.get("feature_names") or [])
+                     if f"feat__{k}" in data} or None
+        dates = pd.to_datetime(meta["dates"])
+        calibration = None
+        if meta.get("calibration"):
+            from .factor.env import Calibration
+
+            known = {f for f in Calibration.__dataclass_fields__}
+            calibration = Calibration(**{k: v for k, v in meta["calibration"].items()
+                                         if k in known})
+        return TsEnv(o, h, l, c, v, oi, dates,
+                     instrument=str(meta.get("instrument") or ""),
+                     close2=close2,
+                     limit_pct=float(meta.get("limit_pct", 0.05)),
+                     calibration=calibration,
+                     features=feats)
     with np.load(p, allow_pickle=False) as data:
         o = data["o"]; h = data["h"]; l = data["l"]; c = data["c"]; v = data["v"]
         amount = data["amount"] if "amount" in data else None
@@ -82,6 +128,11 @@ def load_env_npz(path) -> FactorEnv:
 
 
 def _compile(source: str):
+    # B7（2026-11-05 段隔离任务书）：AST IO 黑名单——与桥侧 _compile_factor
+    # 同语义（worker 子进程是生产执行路径）。
+    from .factor.hardening import IO_BLACKLIST_MSG, io_blacklist_check
+    if io_blacklist_check(source).get("rejected"):
+        raise ValueError(IO_BLACKLIST_MSG)
     ns = {"__name__": "dsh_factor_mining_worker_factor"}
     exec(compile(source, "<factor_source>", "exec"), ns)
     if "factor" not in ns or not callable(ns["factor"]):
@@ -315,6 +366,13 @@ def _engine_telemetry(params: dict) -> dict:
 def run_request(req: dict) -> dict:
     env = load_env_any(req["npzPath"], req.get("pbinPath"))
     method = req["method"]
+    # ts 线契约（任务书 §七.3）：cs_* 截面算子禁用——worker 侧同拒
+    # （与 bridge in_process 同文案，防旁路）。batch 无单 source，跳过。
+    if isinstance(env, TsEnv) and req.get("source") \
+            and method != "factor.evaluate_batch":
+        from .factor.hardening import CS_OPERATOR_MSG, cs_operator_check
+        if cs_operator_check(str(req["source"])).get("rejected"):
+            raise ValueError(CS_OPERATOR_MSG)
     # evaluate_batch 是多 source 方法（sources dict），无单个 source——
     # 入口编译跳过，由其分支自行编译每个 source（2026-08-18 修复：
     # 此前无条件编译空串导致 batch 从未成功过）
@@ -356,24 +414,36 @@ def run_request(req: dict) -> dict:
         except (TypeError, ValueError):
             horizon = None
         if stage == "development":
-            # C1（修正案 A 2026-08-28）：development 是纯读——走磁盘缓存。
-            # F 仍先算（perf 遥测要诚实的 fn(env) 计时），缓存只免
-            # evaluate() 本体的分钟级成本。source_hash/env_fp 由 bridge
-            # 注入 params（与桥侧预检同一键空间）；selection/test 是
-            # 消耗品语义，一概不缓存。
-            out = cached_evaluate(
-                F, env, state_root=state_root,
-                source_hash=(params.get("source_hash")
-                             or source_fingerprint(req["source"])),
-                env_fp=params.get("env_fp"),
-                horizon=horizon, n_trials=n_trials,
-                pool_std=pool_std, bar_sigma=bar_sigma)
-        elif stage == "selection":
-            out = evaluate_selection(F, env)
-        elif stage == "test":
-            # test 是消耗品：锁写在用户 state_root，worker 子进程写同一文件，跨调用可见
-            out = evaluate_test(F, env, state_root=state_root,
-                                source_hash=params.get("source_hash"))
+            # ts 线（factor-mining-futures）：evaluate_ts 直评，不缓存
+            # （(T,) 评估毫秒级；缓存键复杂度不值——与桥侧预检同款决定）
+            if isinstance(env, TsEnv):
+                _wm = params.get("wall_mode")
+                out = evaluate_ts(
+                    F, env, n_trials=n_trials, pool_std=pool_std,
+                    horizon=horizon, bar_sigma=bar_sigma,
+                    wall_mode=(_wm if _wm in ("fixed", "growing") else None))
+            else:
+                # C1（修正案 A 2026-08-28）：development 是纯读——走磁盘缓存。
+                # F 仍先算（perf 遥测要诚实的 fn(env) 计时），缓存只免
+                # evaluate() 本体的分钟级成本。source_hash/env_fp 由 bridge
+                # 注入 params（与桥侧预检同一键空间）；selection/test 是
+                # 消耗品语义，一概不缓存。
+                _wm = params.get("wall_mode")
+                out = cached_evaluate(
+                    F, env, state_root=state_root,
+                    source_hash=(params.get("source_hash")
+                                 or source_fingerprint(req["source"])),
+                    env_fp=params.get("env_fp"),
+                    horizon=horizon, n_trials=n_trials,
+                    pool_std=pool_std, bar_sigma=bar_sigma,
+                    wall_mode=(_wm if _wm in ("fixed", "growing") else None))
+        elif stage in ("selection", "test"):
+            # P0（2026-11-05 段隔离任务书 §二）：selection/test 已内部化，
+            # worker 子进程同语义拒收（防绕过主入口的旁路调用）。
+            raise ValueError(
+                "样本外评估已内部化，提交后由引擎验证，无可提供数字。"
+                "开发期评估不传 stage（默认 development 区）；入册走 "
+                "factor_registry_submit，判定结果随提交响应返回")
         else:
             raise ValueError(f"worker 不支持的 stage: {stage}")
         if isinstance(out, dict):
@@ -381,6 +451,10 @@ def run_request(req: dict) -> dict:
             out["perf"] = _perf
         return out
     if method == "factor.evaluate_composite":
+        if isinstance(env, TsEnv):
+            raise ValueError(
+                "组合评估是截面面板工具（成分截面秩叠加在单品种时间轴上无定义）"
+                "——ts 线请用 factor.evaluate 单因子评估")
         parts_srcs = params.get("ingredients") or {}
         parts = {}
         for name, src in parts_srcs.items():
@@ -413,6 +487,10 @@ def run_request(req: dict) -> dict:
                     bar_sigma=_num(params.get("bar_sigma")))
         return evaluate_composite(fn(env), parts, env, eval_fn=eval_fn)
     if method == "factor.evaluate_batch":
+        if isinstance(env, TsEnv):
+            raise ValueError(
+                "批量评估是截面面板工具（批内截面族口径在单品种时间轴上无定义）"
+                "——ts 线请逐因子 factor.evaluate")
         sources = params.get("sources") or {}
         horizon = params.get("horizon")
         try:
@@ -442,6 +520,10 @@ def run_request(req: dict) -> dict:
         return evaluate_batch(F_dict, env, horizon=horizon, pool_std=pool_std,
                               factors=factors)
     if method == "factor.walk_forward":
+        if isinstance(env, TsEnv):
+            return evaluate_walk_forward_ts(
+                fn(env), env, n_folds=int(params.get("n_folds", 5)),
+                t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
         return evaluate_walk_forward(fn(env), env, n_folds=int(params.get("n_folds", 5)),
                                      t0_date=params.get("t0_date"), t1_date=params.get("t1_date"))
     if method == "factor.noise_test":
@@ -461,6 +543,10 @@ def run_request(req: dict) -> dict:
                                k_frac=float(env.calibration.tail_k))
         return noise_test(fn, env, m, base_seed, statistic=stat)
     if method == "factor.tail_placebo":
+        if isinstance(env, TsEnv):
+            raise ValueError(
+                "placebo 是截面 top-N 工具（随机选股 null 在单品种线上无定义）"
+                "——ts 线尾轨不适用（v1 单轨）")
         # G1 权威 placebo（WS2 2026-08-25）：submit 侧重跑——样本加厚
         # m≥60 + 预算自适应截断。horizon 视图与 tail_metrics 同口径
         # （fwd/pit/sample_step/topn 都从视图读，F 在基础 env 上算——
@@ -538,6 +624,14 @@ def main(argv=None):
         print(json.dumps({"ok": True, "worker": "ready",
                           "python": sys.version.split()[0]}))
         return 0
+    # B7（2026-11-05 段隔离任务书）：worker 子进程内剥离网络环境变量
+    # （代理/证书链）——因子执行环境无网络配置可寻；bridge 主进程不受
+    # 影响（arxiv 检索在桥侧）。
+    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY",
+               "NO_PROXY", "http_proxy", "https_proxy", "ftp_proxy",
+               "all_proxy", "no_proxy", "REQUESTS_CA_BUNDLE",
+               "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        os.environ.pop(_k, None)
     if not args.request:
         parser.error("需要 --request（或 --ping 做启动自检）")
     req = json.loads(Path(args.request).read_text(encoding="utf-8"))

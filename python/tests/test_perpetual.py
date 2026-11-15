@@ -93,8 +93,8 @@ def test_check_termination_fail_streak_is_informational():
 
 def test_loop_state_domain(tmp_path):
     """finalized=True + 满池 + arc 触顶等组合输入下，loop.state ∈
-    {running, must_rotate}；test 烧毁走状态页告警（loop.test_burned），
-    不走停点。"""
+    {running, must_rotate}（永续钉死）。2026-11-05 段隔离：test 面整体
+    下线，test_burned 告警随消费通道退役——遗留锁文件不得再生告警。"""
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "test_lock.json").write_text(json.dumps(
@@ -106,8 +106,7 @@ def test_loop_state_domain(tmp_path):
         "fam_conv_window": 0}), encoding="utf-8")
     loop = b._loop_directive()
     assert loop["state"] in ("running", "must_rotate"), loop["state"]
-    assert loop["test_burned"] is not None, "test 烧毁必须走状态页告警"
-    assert "数据集轮换" in loop["test_burned"], loop["test_burned"]
+    assert "test_burned" not in loop, "test 面已退役，遗留锁不再产生告警"
     # 永续：strategy 永不 None（must_rotate 下强制 rotate/literature）
     assert loop["strategy"] is not None, loop
 
@@ -131,15 +130,15 @@ def test_pick_strategy_never_none():
 
 
 def test_test_burned_claim_window(tmp_path):
-    """test 的 claim→finalize 窗口（锁文件已在、consumed 未置）不算已烧；
-    consumed=True 才告警。"""
+    """2026-11-05 段隔离：test 消费通道退役——任何遗留锁状态（claim
+    窗口/consumed）都不再产生 loop 告警（防旧 stateRoot 迁移后误亮）。"""
     b = _make_bridge(tmp_path)
     state = tmp_path / "state"
     (state / "test_lock.json").write_text(json.dumps(
         {"consumed": False, "claim": "w1"}), encoding="utf-8")
     loop = b._loop_directive()
-    assert "test_burned" not in loop, "claim 窗口不得误亮已烧告警"
+    assert "test_burned" not in loop
     (state / "test_lock.json").write_text(json.dumps(
         {"consumed": True}), encoding="utf-8")
     loop2 = b._loop_directive()
-    assert loop2.get("test_burned") is not None
+    assert "test_burned" not in loop2

@@ -26,6 +26,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 from dsh_factor_mining.factor.evaluate import (  # noqa: E402
     _LuckSampler,
@@ -350,6 +351,7 @@ def test_submit_recompute_carries_bar_sigma(tmp_path):
                {"envId": "primary", "mode": "null-calibration", "n": 5})
     diag = b.dispatch("factor.evaluate",
                       {"envId": "primary", "source": GOOD, "stage": "development", "async": False})
+    grant_oos(b.state_root, GOOD)  # B3 OOS 凭据前置（E1 适配）
     res = b.dispatch("registry.submit",
                      {"name": "f_luck", "signal": "momentum20",
                       "source": GOOD, "diagnosis": diag})

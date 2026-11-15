@@ -28,6 +28,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 from dsh_factor_mining.discipline import source_fingerprint  # noqa: E402
 
@@ -85,6 +86,7 @@ def test_procedural_reject_tagged_and_actionable(tmp_path):
     b.dispatch("factor.random_generate",
                {"envId": "primary", "mode": "null-calibration", "n": 5})
     never_evaluated = TILT_SOURCE + "\n# variant never evaluated\n"
+    grant_oos(b.state_root, never_evaluated)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "ghost", "signal": "x", "source": never_evaluated,
         "diagnosis": {"ic_ir_train": 0.2, "ic_n_train": 50,
@@ -126,6 +128,7 @@ def test_name_iron_rule_heals_procedural(tmp_path):
     diag = b.dispatch("factor.evaluate", {"envId": "primary",
                                           "source": TILT_SOURCE,
                                           "stage": "development"})
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "rp_w30", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": diag, "admit_basis": "tail"})
@@ -153,6 +156,7 @@ def test_hash_iron_rule_heals_procedural(tmp_path):
     diag = b.dispatch("factor.evaluate", {"envId": "primary",
                                           "source": TILT_SOURCE,
                                           "stage": "development"})
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "fresh_name", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": diag, "admit_basis": "tail"})
@@ -168,6 +172,7 @@ def test_hash_iron_rule_heals_procedural(tmp_path):
     (tmp_path / "state" / "registry.json").write_text(
         json.dumps(reg2), encoding="utf-8")
     try:
+        grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "another_name", "signal": "x", "source": TILT_SOURCE,
             "diagnosis": diag, "admit_basis": "tail"})
@@ -192,6 +197,7 @@ def test_source_mismatch_transactional_reject(tmp_path):
     drifted = TILT_SOURCE + "\n"          # 一个换行 = 字节漂移
     assert source_fingerprint(drifted) != source_fingerprint(TILT_SOURCE)
     try:
+        grant_oos(b.state_root, drifted)  # B3 OOS 凭据前置（E1 适配）
         b.dispatch("registry.submit", {
             "name": "drift", "signal": "x", "source": drifted,
             "diagnosis": diag})

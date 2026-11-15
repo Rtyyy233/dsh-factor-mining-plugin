@@ -22,6 +22,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 from dsh_factor_mining.factor.tailgate import (  # noqa: E402
     tail_admission, tail_deflation_bar)
@@ -172,6 +173,7 @@ def test_submit_corrected_mode(tmp_path):
     b = _make_drift_bridge(tmp_path)
     b.dispatch("factor.random_generate",
                {"envId": "primary", "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "tilt_mom", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": b.dispatch(

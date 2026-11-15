@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .env import FactorEnv
+from .env import FactorEnv, TsEnv
 
 # ---- 噪声门结构常量（2026-08-26 规划书 W2）----
 # submit 噪声门至少重跑 NOISE_MIN_WORLDS 个世界、预算 NOISE_BUDGET_SECS
@@ -101,6 +101,8 @@ def _pool_logvol(v: np.ndarray, listed: np.ndarray) -> tuple[float, float]:
 
 def generate_noise_world(env: FactorEnv, rng: np.random.Generator) -> FactorEnv:
     """从真实 env 派生一个截面可交换的 IID 噪声世界（见模块 docstring）。"""
+    if isinstance(env, TsEnv):
+        return generate_noise_world_ts(env, rng)
     T, N = env.c.shape
     listed = env.listed
     sigma = _pool_vol(env.c, listed)
@@ -135,6 +137,60 @@ def generate_noise_world(env: FactorEnv, rng: np.random.Generator) -> FactorEnv:
     return FactorEnv(o, hi, lo, c, v, env.dates, env.symbols,
                      listed=listed, amount=amount,
                      calibration=env.calibration)
+
+
+def generate_noise_world_ts(env: TsEnv, rng: np.random.Generator) -> TsEnv:
+    """ts 线噪声世界（factor-mining-futures）：品种波动率匹配的单序列
+    随机游走（结构梯子 R4 级——无任何截面/时序可预测结构）。
+
+    与面板版同纪律的 (T,) 版：
+    - σ = env.c 日收益（c[1:]/c[:-1]−1，finite 样本）std（<200 样本或 0
+      → 0.02）；价格 p0×cumprod(1+N(0,σ)) 保证为正
+    - open = 前收 × exp(N(0,σ/√2))（缺口噪声）；high/low =
+      max/min(o,c) ×÷ exp|N(0,σ/2)|（合法 OHLC 关系）
+    - v / oi = exp(N(μ,σ))，μ/σ 取 log 全样本矩（缺省 v=(8,0.5)、
+      oi=(11,0.3)）；close2 = c×exp(N(0,σ/√2))（原 None 则 None）
+    - dates/instrument/limit_pct/calibration 原样（口径与涨跌停参数
+      结构不是可挖掘的 alpha 源）"""
+    rets = env.c[1:] / env.c[:-1] - 1.0
+    x = rets[np.isfinite(rets)]
+    sigma = 0.02
+    if len(x) >= 200:
+        v = float(np.std(x))
+        if v > 0:
+            sigma = v
+
+    def _log_stats(a, default: tuple[float, float]) -> tuple[float, float]:
+        la = np.log(np.maximum(np.asarray(a, dtype=np.float64), 1e-9))
+        y = la[np.isfinite(la)]
+        if len(y) >= 200:
+            mu = float(np.mean(y))
+            sd = float(np.std(y))
+            if np.isfinite(mu) and np.isfinite(sd) and sd > 0:
+                return mu, sd
+        return default
+
+    vmu, vsd = _log_stats(env.v, (8.0, 0.5))
+    omu, osd = _log_stats(env.oi, (11.0, 0.3))
+    T = int(env.c.shape[0])
+    p0 = float(env.c[0]) if np.isfinite(env.c[0]) else float(np.nanmedian(env.c))
+    c = p0 * np.cumprod(1.0 + rng.normal(0.0, sigma, size=T))
+    prev_c = np.concatenate([[p0], c[:-1]])
+    o = prev_c * np.exp(rng.normal(0.0, sigma / np.sqrt(2.0), size=T))
+    spread = np.exp(np.abs(rng.normal(0.0, sigma / 2.0, size=T)))
+    hi = np.maximum(o, c) * spread
+    lo = np.minimum(o, c) / spread
+    v = np.exp(rng.normal(vmu, vsd, size=T))
+    oi = np.exp(rng.normal(omu, osd, size=T))
+    close2 = (c * np.exp(rng.normal(0.0, sigma / np.sqrt(2.0), size=T))
+              if env.close2 is not None else None)
+    # f_* 特征字段（高频特征低频化）保持真实：门的语义=「真实特征能否
+    # 预测假价格」——真特征-假价格下仍系统性显著 = 因子在拟合特征构造
+    # 管道与价格的 artifact 耦合，无条件拒收（与价格世界同判）。
+    feats = dict(getattr(env, "features", {}) or {}) or None
+    return TsEnv(o, hi, lo, c, v, oi, env.dates, env.instrument,
+                 close2=close2, limit_pct=env.limit_pct,
+                 calibration=env.calibration, features=feats)
 
 
 def fast_rank_ic(F: np.ndarray, fwd: np.ndarray, pit: np.ndarray,
@@ -175,6 +231,17 @@ def noise_world_ic_ir(fn, env: FactorEnv, rng: np.random.Generator,
 
     world = generate_noise_world(env, rng)
     F = fn(world)
+    if isinstance(env, TsEnv):
+        # ts 线分支：统计量 = 乘积序列 IR（诊断同形口径，world 自带
+        # calibration.dev_end 分界）；statistic 显式传入时仍优先
+        # （通用机制保留，签名与面板版一致：(F, fwd, pit, step)）。
+        from .evaluate_ts import (series_ir, ts_forward_returns,
+                                  ts_pit_mask, ts_product_series)
+        if statistic is not None:
+            return statistic(F, ts_forward_returns(world), ts_pit_mask(world),
+                             world.calibration.sample_step)
+        ir = series_ir(ts_product_series(F, world))
+        return float(ir) if np.isfinite(ir) else None
     fwd = _forward_returns(world)
     pit = _pit_mask(world)
     if statistic is not None:

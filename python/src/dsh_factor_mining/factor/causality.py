@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from .env import FactorEnv
+from .env import FactorEnv, TsEnv
 
 
 def check_causality(factor_fn, env: FactorEnv, t0_samples: int = 6, seed: int = 42, atol: float = 1e-9):
@@ -58,16 +58,33 @@ def check_causality(factor_fn, env: FactorEnv, t0_samples: int = 6, seed: int = 
     for t0 in t0_list:
         def _noise(a):
             b = a.copy()
-            scale = np.nanstd(a[:t0]) or 1.0
+            s = float(np.nanstd(a[:t0]))
+            # NaN 安全（特征字段暖机期可能全 NaN）：非有限或零 → 1.0。
+            # 注意 `or 1.0` 抓不住 NaN（NaN 为真值）——显式判定。
+            scale = s if np.isfinite(s) and s > 0 else 1.0
             b[t0:] = rng.normal(0, scale, size=b[t0:].shape)
             return b
 
-        env_p = FactorEnv(
-            _noise(env.o), _noise(env.h), _noise(env.l), _noise(env.c), _noise(env.v),
-            env.dates, env.symbols, listed=env.listed,
-            amount=(_noise(env.amount) if env.amount is not None else None),
-            calibration=env.calibration,
-        )
+        if isinstance(env, TsEnv):
+            # ts 线分支（factor-mining-futures）：扰动环境重建为 TsEnv
+            # （含 oi；close2 有则同扰动；口径字段原样；**f_* 特征字段
+            # 全量同扰动**——特征不扰动=经由特征读未来的通路漏检）
+            _feats = {k: _noise(v) for k, v in
+                      getattr(env, "features", {}).items()} or None
+            env_p = TsEnv(
+                _noise(env.o), _noise(env.h), _noise(env.l), _noise(env.c),
+                _noise(env.v), _noise(env.oi), env.dates, env.instrument,
+                close2=(_noise(env.close2) if env.close2 is not None else None),
+                limit_pct=env.limit_pct, calibration=env.calibration,
+                features=_feats,
+            )
+        else:
+            env_p = FactorEnv(
+                _noise(env.o), _noise(env.h), _noise(env.l), _noise(env.c), _noise(env.v),
+                env.dates, env.symbols, listed=env.listed,
+                amount=(_noise(env.amount) if env.amount is not None else None),
+                calibration=env.calibration,
+            )
         F_p = np.asarray(factor_fn(env_p), dtype=np.float64)
 
         past_full = F_full[:t0]
@@ -109,14 +126,28 @@ def check_causality_nan(factor_fn, env: FactorEnv, t0_samples: int = 6, seed: in
             b[t0:] = False
             return b
 
-        env_nan = FactorEnv(
-            _nan_cut(env.o), _nan_cut(env.h), _nan_cut(env.l),
-            _nan_cut(env.c), _nan_cut(env.v),
-            env.dates, env.symbols,
-            listed=(_nan_cut_bool(env.listed) if env.listed is not None else None),
-            amount=(_nan_cut(env.amount) if env.amount is not None else None),
-            calibration=env.calibration,
-        )
+        if isinstance(env, TsEnv):
+            # ts 线分支：NaN 截断环境重建为 TsEnv（close2 与 f_* 特征字段
+            # 全量同截——特征不截=经由特征读未来的通路漏检）
+            _feats_nan = {k: _nan_cut(v) for k, v in
+                          getattr(env, "features", {}).items()} or None
+            env_nan = TsEnv(
+                _nan_cut(env.o), _nan_cut(env.h), _nan_cut(env.l),
+                _nan_cut(env.c), _nan_cut(env.v), _nan_cut(env.oi),
+                env.dates, env.instrument,
+                close2=(_nan_cut(env.close2) if env.close2 is not None else None),
+                limit_pct=env.limit_pct, calibration=env.calibration,
+                features=_feats_nan,
+            )
+        else:
+            env_nan = FactorEnv(
+                _nan_cut(env.o), _nan_cut(env.h), _nan_cut(env.l),
+                _nan_cut(env.c), _nan_cut(env.v),
+                env.dates, env.symbols,
+                listed=(_nan_cut_bool(env.listed) if env.listed is not None else None),
+                amount=(_nan_cut(env.amount) if env.amount is not None else None),
+                calibration=env.calibration,
+            )
         F_nan = np.asarray(factor_fn(env_nan), dtype=np.float64)
         past_full = F_full[:t0]
         past_nan = F_nan[:t0]

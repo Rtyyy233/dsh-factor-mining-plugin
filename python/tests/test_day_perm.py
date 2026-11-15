@@ -25,6 +25,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 from dsh_factor_mining.factor.permute import (  # noqa: E402
     day_permutation_test, ic_ir_statistic)
@@ -221,6 +222,7 @@ def test_submit_carries_day_perm(tmp_path):
     b = _make_plain_bridge(tmp_path)
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "weak_dp", "signal": "weak",
         "source": BASELINE_SOURCE,

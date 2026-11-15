@@ -6,11 +6,11 @@
   "status": "pass",
   "visualReview": "not-requested",
   "provenance": "current",
-  "deliveryReceiptId": "eda69206-473a-410a-ab06-796bdbeb80cd",
+  "deliveryReceiptId": "4fe021cf-a34a-4110-8a62-5c37bd28f087",
   "artifact": {
     "path": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
-    "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-    "bytes": 893571
+    "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+    "bytes": 893607
   },
   "state": {
     "detail": "read",

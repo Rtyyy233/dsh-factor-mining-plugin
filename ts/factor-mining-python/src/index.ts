@@ -75,6 +75,8 @@ import type {
   RegistrySubmitResult,
   RegistryUpdateRequest,
   RegistryUpdateResult,
+  BookAuditRequest,
+  BookAuditResult,
   StateResetRequest,
   StateResetResult,
   StatusRequest,
@@ -265,6 +267,10 @@ class BridgeBackend {
 
   async registryUpdate(request: RegistryUpdateRequest): Promise<RegistryUpdateResult> {
     return await this.client.request('registry.update', request as unknown as Record<string, unknown>) as RegistryUpdateResult
+  }
+
+  async bookAudit(request: BookAuditRequest): Promise<BookAuditResult> {
+    return await this.client.request('factor.book_audit', request as unknown as Record<string, unknown>) as BookAuditResult
   }
 
   async journalRead(request: JournalReadRequest): Promise<JournalReadResult> {
@@ -474,6 +480,10 @@ export class FactorMiningPythonService extends FactorMiningService {
 
   async registryUpdate(request: RegistryUpdateRequest): Promise<RegistryUpdateResult> {
     return await this.d().registryUpdate(request)
+  }
+
+  async bookAudit(request: BookAuditRequest): Promise<BookAuditResult> {
+    return await this.d().bookAudit(request)
   }
 
   async journalRead(request: JournalReadRequest): Promise<JournalReadResult> {

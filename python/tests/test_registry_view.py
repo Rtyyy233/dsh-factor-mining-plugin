@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 
 _LONG_REASON = "G3 拒收：spread_ir=0.312 低于门 0.471（E[max|X|]=2.31σ×s0，N_eff=29）——" \
@@ -153,6 +154,7 @@ def test_registry_get_old_entries_without_new_fields(tmp_path):
 
 def test_registry_submit_stamps_ts(tmp_path):
     """新 submit 的 entry 落盘带 ts（投影的时间字段）。"""
+    from conftest import set_verify_mode
     import numpy as np
     import pandas as pd
     rng = np.random.default_rng(4)
@@ -170,6 +172,7 @@ def test_registry_submit_stamps_ts(tmp_path):
     data = tmp_path / "panel.parquet"
     pd.DataFrame(rows).to_parquet(data)
     b = Bridge(state_root=str(tmp_path / "state"), execution_mode="in_process")
+    set_verify_mode(b.state_root, "off")  # 行为保持型测试：考 ts 落盘不考段验证
     b.dispatch("config.save", {"config": {"version": 1, "environments": {
         "primary": {"source": {"type": "parquet", "path": str(data)},
                     "layout": "long",
@@ -179,6 +182,9 @@ def test_registry_submit_stamps_ts(tmp_path):
     b.dispatch("data.load", {"envId": "primary"})
     b.dispatch("factor.random_generate", {"envId": "primary",
                                           "mode": "null-calibration", "n": 5})
+    grant_oos(b.state_root, "\ndef factor(env):\n    import pandas as pd\n"
+                  "    c = pd.DataFrame(env.c)\n"
+                  "    return (c / c.shift(20) - 1.0).values\n")  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "ts_probe", "signal": "momentum",
         "source": "\ndef factor(env):\n    import pandas as pd\n"

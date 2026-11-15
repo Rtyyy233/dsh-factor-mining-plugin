@@ -22,6 +22,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 from dsh_factor_mining.factor.tail import topn_placebo  # noqa: E402
 
@@ -69,6 +70,7 @@ def _submit_tail(b: Bridge, name: str, diag=None, source=TILT_SOURCE):
         diag = b.dispatch("factor.evaluate", {"envId": "primary",
                                               "source": source,
                                               "stage": "development"})
+    grant_oos(b.state_root, source)  # B3 OOS 凭据前置（E1 适配）
     return b.dispatch("registry.submit", {
         "name": name, "signal": "x", "source": source,
         "diagnosis": diag, "admit_basis": "tail"})
@@ -193,6 +195,7 @@ def test_placebo_infra_failure_transaction(tmp_path, monkeypatch):
                                            "source": TILT_SOURCE,
                                            "stage": "development"})
     monkeypatch.setattr(tail_mod, "topn_placebo", boom)
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub = b.dispatch("registry.submit", {
         "name": "boom_ic", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": diag2})

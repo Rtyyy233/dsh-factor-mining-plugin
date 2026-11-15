@@ -21,6 +21,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge, BridgeError  # noqa: E402
 
 BASELINE_SOURCE = """
@@ -128,6 +129,7 @@ def test_reset_allows_light_trail_without_confirm(tmp_path):
 def test_reset_blocked_when_registry_nonempty(tmp_path):
     """registry 非空时即使 trail 轻，自助 reset 也被拒（防洗账重登）。"""
     b = _make_bridge(tmp_path)
+    grant_oos(b.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     b.dispatch("registry.submit", {
         "name": "reg_a", "signal": "x", "source": BASELINE_SOURCE,
         "diagnosis": {"ic_ir_train": 0.25, "ic_n_train": 50,
@@ -148,6 +150,7 @@ def test_reset_blocked_when_registry_nonempty(tmp_path):
 def test_ledger_permanent_and_survives_reset(tmp_path):
     """submit 落 ledger.json；scope=mining reset 不清除（永久审计）。"""
     b = _make_bridge(tmp_path)
+    grant_oos(b.state_root, BASELINE_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     b.dispatch("registry.submit", {
         "name": "led_a", "signal": "x", "source": BASELINE_SOURCE,
         "diagnosis": {"ic_ir_train": 0.25, "ic_n_train": 50,

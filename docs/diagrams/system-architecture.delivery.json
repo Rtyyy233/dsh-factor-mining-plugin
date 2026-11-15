@@ -1,17 +1,17 @@
 {
   "schemaVersion": 1,
-  "receiptId": "eda69206-473a-410a-ab06-796bdbeb80cd",
+  "receiptId": "4fe021cf-a34a-4110-8a62-5c37bd28f087",
   "status": "current",
   "command": "deliver",
   "type": "architecture",
-  "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\.archify\\architecture-dsh-fm-20261030-1\\candidate.json",
+  "input": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\src\\system-architecture.json",
   "output": "C:\\Users\\RTyyyy\\Desktop\\life-os\\projects\\dsh-factor-mining-plugin\\docs\\diagrams\\system-architecture.html",
   "specification": {
-    "sha256": "cbcc3e600fb2b56a8cd44505dc2cca691c079e52be6a17dbf737e48b089789c1",
-    "bytes": 19944
+    "sha256": "da366edd4ee3ce8f3bd9358c6c7f3dbdb7a33462d403c05576139acc0c3cb428",
+    "bytes": 15913
   },
   "artifact": {
-    "sha256": "7180a6c3be174c202ea03fcb0301f9f9e7af31d5f891801730117121614abc2a",
-    "bytes": 893571
+    "sha256": "7537f19cf33a6a0fb5678554c6168a0965c6c5cf8d63ba81bbe9653050781bcf",
+    "bytes": 893607
   }
 }

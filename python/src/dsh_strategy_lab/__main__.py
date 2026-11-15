@@ -514,8 +514,10 @@ def cmd_factor_select(args) -> int:
     for i, e in enumerate(cands):
         name = str(e.get("name"))
         try:
+            # 2026-11-05 段隔离：selection 区已下线——比较评估改用开发区
+            # （dev）数字；策略层比较不需要样本外读数（样本外终审在因子
+            # 层提交路径内部完成，策略层只消费 registry 判定）。
             r = fb.dispatch("factor.evaluate", {"envId": env_id,
-                                                "stage": "selection",
                                                 "source": e["source"]})
             topn = r.get("topn") or {}
             bb = topn.get("block_bootstrap") or {}
@@ -527,18 +529,18 @@ def cmd_factor_select(args) -> int:
                 "track": "dual" if (ic_ok and tail_ok) else ("tail" if tail_ok else "ic"),
                 "hash12": str(e.get("source_hash"))[:12],
                 "train_ic_ir": e.get("ic_ir_train"),
-                "sel_ic_ir": r.get("ic_ir"),
-                "sel_net_annual": topn.get("net_annual"),
-                "sel_gross_annual": topn.get("gross_annual"),
-                "sel_turn_avg": topn.get("turn_avg"),
-                "sel_boot_z": bb.get("z"),
+                "dev_ic_ir": r.get("ic_ir_train", r.get("ic_ir")),
+                "dev_net_annual": topn.get("net_annual"),
+                "dev_gross_annual": topn.get("gross_annual"),
+                "dev_turn_avg": topn.get("turn_avg"),
+                "dev_boot_z": bb.get("z"),
             }
             if args.battery:
                 F = _compile(e["source"])(fb.envs[env_id])
                 item["battery"] = battery(F, fb.envs[env_id])
             entries.append(item)
             print(f"[{i + 1}/{len(cands)}] {name}: "
-                  f"sel_ic_ir={r.get('ic_ir')}",
+                  f"dev_ic_ir={item['dev_ic_ir']}",
                   file=sys.stderr, flush=True)
         except Exception as ex:  # noqa: BLE001 — 单因子失败不烧整轮
             entries.append({"name": name, "error": f"{type(ex).__name__}: {ex}"[:200]})

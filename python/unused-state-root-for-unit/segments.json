@@ -1,0 +1,23 @@
+{
+ "line": "TEST",
+ "created_at": "2026-11-07T16:01:07",
+ "panel": {
+  "start": "2000-01-01",
+  "end": "2099-12-31",
+  "dev_end": "2000-01-01",
+  "source": "synthetic-test"
+ },
+ "segments": [
+  {
+   "id": "seg1",
+   "start": "2000-01-01",
+   "end": "2099-12-31",
+   "burn_baseline": 0
+  }
+ ],
+ "upgrade_clause": "synthetic-test",
+ "detection": null,
+ "yearly_stats": [],
+ "method_note": "tests/conftest.py 自动注入的合成段（全覆盖窗口）",
+ "content_sha": "90aec7e931948cdf38eb27c2c8a2795916478d1b6a7b50d774bb153b44311b6b"
+}

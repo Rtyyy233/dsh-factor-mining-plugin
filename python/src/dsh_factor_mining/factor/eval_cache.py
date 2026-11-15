@@ -159,16 +159,20 @@ def cache_write(state_root, key: str, result: dict) -> None:
 
 def cached_evaluate(F, env, *, state_root, source_hash, env_fp=None,
                     train_end=None, horizon=None, n_trials=1.0,
-                    pool_std=None, bar_sigma=None, _evaluate=None):
+                    pool_std=None, bar_sigma=None, wall_mode=None,
+                    _evaluate=None):
     """read-through evaluate：命中回缓存值（附 eval_cache="hit" 标记），
     未命中算一次并写回。仅 development 口径可用（调用方责任）。
 
     F 仍由调用方预先计算（worker 的 perf 遥测需要诚实的 fn(env) 计时），
-    缓存只免 evaluate() 本体的分钟级成本。"""
+    缓存只免 evaluate() 本体的分钟级成本。wall_mode 只透传不进缓存键
+    （键内 bar_sigma 已承载墙值差异；同 bar 下两模式的 p/统计量相同，
+    仅 wall_mode 标注随命中回旧值——遥测级偏差，不影响判定）。"""
     ev = _evaluate or evaluate
     if not state_root or not source_hash:
         return ev(F, env, train_end=train_end, horizon=horizon,
-                  n_trials=n_trials, pool_std=pool_std, bar_sigma=bar_sigma)
+                  n_trials=n_trials, pool_std=pool_std, bar_sigma=bar_sigma,
+                  wall_mode=wall_mode)
     fp = env_fp or env_value_fingerprint(env)
     key = eval_key_from_parts(source_hash, fp, env, horizon=horizon,
                               n_trials=n_trials, pool_std=pool_std,
@@ -177,7 +181,7 @@ def cached_evaluate(F, env, *, state_root, source_hash, env_fp=None,
     if hit is not None:
         return {**hit, "eval_cache": "hit"}
     out = ev(F, env, train_end=train_end, horizon=horizon, n_trials=n_trials,
-             pool_std=pool_std, bar_sigma=bar_sigma)
+             pool_std=pool_std, bar_sigma=bar_sigma, wall_mode=wall_mode)
     if isinstance(out, dict) and not out.get("error"):
         cache_write(state_root, key, out)
     return out

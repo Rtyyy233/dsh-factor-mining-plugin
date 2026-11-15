@@ -23,6 +23,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 from dsh_factor_mining.factor.tail import spread_ir_statistic  # noqa: E402
 from dsh_factor_mining.factor.tailgate import tail_deflation_bar  # noqa: E402
@@ -172,6 +173,7 @@ def test_submit_chain_s0_source(tmp_path):
     diag = b.dispatch("factor.evaluate", {"envId": "primary",
                                           "source": TILT_SOURCE,
                                           "stage": "development"})
+    grant_oos(b.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub0 = b.dispatch("registry.submit", {
         "name": "tilt_analytic", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": diag, "admit_basis": "tail"})
@@ -185,6 +187,7 @@ def test_submit_chain_s0_source(tmp_path):
     diag2 = b2.dispatch("factor.evaluate", {"envId": "primary",
                                             "source": TILT_SOURCE,
                                             "stage": "development"})
+    grant_oos(b2.state_root, TILT_SOURCE)  # B3 OOS 凭据前置（E1 适配）
     sub1 = b2.dispatch("registry.submit", {
         "name": "tilt_empirical", "signal": "x", "source": TILT_SOURCE,
         "diagnosis": diag2, "admit_basis": "tail"})

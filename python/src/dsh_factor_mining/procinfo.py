@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 #: CPU/墙钟比值 ≥ 此值判 cpu_dense（真慢：修实现）
 DENSE_RATIO = 0.70
@@ -170,6 +171,21 @@ def worker_mem_bytes() -> int | None:
         except ValueError:
             pass
     return DEFAULT_WORKER_MEM_MB * 1024 * 1024
+
+
+def worker_python_exe() -> str:
+    """B7（2026-11-05 收尾任务书 §四 4）：worker 专用解释器路径。
+
+    优先同目录的 dsh-worker-nonet.exe（python.exe 的字节级副本——同
+    目录保证 stdlib/DLL 解析不变）。运维脚本
+    （analysis/glm_mining/b7_worker_network_off.py）用 Windows 防火墙
+    对该副本加出站阻断规则，实现因子求值 worker 子进程的网络不可用
+    化；主桥与数据链共用的 python.exe 不受影响。副本缺失 → 回退
+    sys.executable（fail-open，行为与未加固版一致）。
+    """
+    cand = os.path.join(os.path.dirname(sys.executable),
+                        "dsh-worker-nonet.exe")
+    return cand if os.path.exists(cand) else sys.executable
 
 
 def _win_apply_job(proc, cpu_s: float | None, mem_bytes: int | None):

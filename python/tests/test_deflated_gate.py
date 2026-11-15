@@ -16,6 +16,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _fixedwall import grant_oos  # noqa: E402
 from dsh_factor_mining.bridge import Bridge  # noqa: E402
 from dsh_factor_mining.discipline import red_flags_and_verdict  # noqa: E402
 from dsh_factor_mining.factor.evaluate import passes_acceptance  # noqa: E402
@@ -42,19 +43,26 @@ SIGNIFICANT = {
 
 
 def test_verdict_flags_insignificant_deflated():
+    # B2（2026-11-01 固定墙时代）：deflated p>0.05 从红牌降级为警告——
+    # 不再进 red_flags/verdict，进 warnings（人审轮消费）。断言随行为更新。
     gv = red_flags_and_verdict(STRONG_Z_INSIGNIFICANT, region="train")
-    assert gv["verdict"] != "pass", gv
-    assert any("deflated p" in f for f in gv["red_flags"]), gv["red_flags"]
+    assert not any("deflated p" in f for f in gv["red_flags"]), gv["red_flags"]
+    assert any("deflated p" in w for w in gv.get("warnings", [])), gv
 
 
 def test_acceptance_rejects_insignificant_deflated():
+    # B2：p>0.05 不再拒收——警告语义（原拒信语义反转）。
     ok, reason = passes_acceptance(STRONG_Z_INSIGNIFICANT)
-    assert not ok and "deflated p" in reason, (ok, reason)
+    assert ok and "警告" in reason, (ok, reason)
 
 
 def test_verdict_flags_missing_pool_baseline():
+    # B2：p 不可算（缺基线）同降级为警告。
     gv = red_flags_and_verdict(NO_BASELINE, region="train")
-    assert any("null-calibration" in f or "池分布" in f for f in gv["red_flags"]), gv
+    assert not any("null-calibration" in f or "池分布" in f
+                   for f in gv["red_flags"]), gv
+    assert any("deflated p 不可算" in w or "池分布" in w
+               for w in gv.get("warnings", [])), gv
 
 
 def test_acceptance_rejects_missing_pool_baseline():
@@ -70,10 +78,11 @@ def test_significant_factor_still_passes():
 
 
 def test_n1_first_factor_uses_plain_p():
-    """n_trials=1 时 p 是普通校正 t 检验——同样受门控（不显著照拦）。"""
+    """n_trials=1 时 p 是普通校正 t 检验——B2 后 p 大同样只警告不拦；
+    拦截由入册强度线承担（p=None 不可算仍拒——null 校准是硬前提）。"""
     first_insig = {**SIGNIFICANT, "deflated_train": {"p": 0.5, "n_trials": 1, "sr0": 0.0}}
     ok, reason = passes_acceptance(first_insig)
-    assert not ok and "deflated p" in reason
+    assert ok and "警告" in reason, (ok, reason)
     first_sig = {**SIGNIFICANT, "deflated_train": {"p": 0.001, "n_trials": 1, "sr0": 0.0}}
     assert passes_acceptance(first_sig)[0]
 
@@ -113,6 +122,7 @@ def test_end_to_end_submit_gated(tmp_path):
     diag = b.dispatch("factor.evaluate", {"envId": "etf", "source": weak, "stage": "development"})
     p = (diag.get("deflated_train") or {}).get("p")
     if isinstance(p, (int, float)) and p > 0.05:
+        grant_oos(b.state_root, weak)  # B3 OOS 凭据前置（E1 适配）
         sub = b.dispatch("registry.submit", {"envId": "etf", "name": "weak_probe",
                                              "source": weak, "signal": "s", "diagnosis": diag})
         assert not sub["accepted"], f"deflated p={p} 的因子必须被门控拒绝: {sub['reason']}"

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .env import TsEnv
 from .ops import (DEFAULT_DELAYS, DEFAULT_HUMPS, DEFAULT_WINDOWS, LEAVES,
                   OPERATOR_REGISTRY, SAME_SPACE_BINARY, THREE_INPUT_TS,
                   TWO_INPUT_TS)
@@ -114,12 +115,26 @@ def opset_fingerprint(opset) -> str:
                                      ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+def _iter_leaves(node):
+    """先序遍历产出全部叶子节点（render 的 f_* 叶子探测用）。"""
+    if node.category == "leaf":
+        yield node
+    for ch in node.children:
+        yield from _iter_leaves(ch)
+
+
 def env_leaves(env):
     """按 env 实际可用字段过滤叶子（amount 缺失时剔除）。
 
     2026-09-18 缝2c：explore 补齐同款过滤（此前只有 null 校准过滤——
     无 amount 的 env 上 explore 含 amount 的树整棵 error）。
     """
+    if isinstance(env, TsEnv):
+        # ts 线（factor-mining-futures）：(T,) 字段面（无 amount/截面）；
+        # f_* 特征字段（高频特征低频化）全量入叶——随机探索面自动覆盖
+        return ["o", "h", "l", "c", "v", "oi"] + (
+            ["close2"] if getattr(env, "close2", None) is not None else []) \
+            + sorted(getattr(env, "features", {}) or {})
     return ["o", "h", "l", "c", "v"] + (
         ["amount"] if getattr(env, "amount", None) is not None else [])
 
@@ -223,7 +238,8 @@ def _space(n: Node) -> str:
                       and _space(n.children[1]) == "norm") else "raw"
 
 
-def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=None):
+def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=None,
+                  require_cs: bool = True):
     """生成一棵满足结构约束的组合树（2026-09-18 结构扩充：空间类型+模板通道）。
 
     约束由生成保证（后不需单独校验）：
@@ -235,6 +251,10 @@ def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=No
       （空间 wrap 如 ts(cs(leaf)) 可到 +2）——有界边界行为而非违约。
     - template（结构模板名）：走带槽骨架（出身=结构先验，非零先验），
       槽内组合仍均匀随机。
+    - require_cs=False（ts 单品种线，2026-11-07）：跳过「至少 1 个 cs_*」
+      校验与 force_cs 传播（仍强制 ≥1 ts_*；cs 算子不在 opset 时各分支
+      自然绕过——force_cs 相关分支已用 require_cs 门住）。缺省 True 与
+      现状逐字节一致。
     """
     if template is not None:
         return _from_template(rng, opset, leaves or LEAVES, template)
@@ -247,7 +267,7 @@ def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=No
     una_names = list(ops.get("unary", {}).keys())
     cmp_names = list(ops.get("cmp", {}).keys())
     cond_names = list(ops.get("cond", {}).keys()) if cmp_names else []
-    if not ts_names or not cs_names:
+    if not ts_names or (require_cs and not cs_names):
         raise ValueError("算子集必须至少含 1 个 ts_* 与 1 个 cs_* 算子")
     ts_single = [n for n in ts_names
                  if n not in TWO_INPUT_TS and n not in THREE_INPUT_TS]
@@ -297,7 +317,9 @@ def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=No
             return Node(name, "ts", _param(name), kids)
 
         # ---- 中间节点：类别采样 + 空间约束过滤 ----
-        choices = ["ts", "cs", "unary", "leaf"]
+        # ts 线（require_cs=False 且 opset 无 cs）："cs" 不入采样池
+        choices = (["ts", "cs", "unary", "leaf"] if cs_names
+                   else ["ts", "unary", "leaf"])
         if depth + 2 <= max_depth:
             choices += ["binary", "binary"]   # 鼓励结构组合
         if cmp_names and depth + 2 <= max_depth:
@@ -395,7 +417,7 @@ def generate_tree(rng, opset, min_depth=3, max_depth=5, leaves=None, template=No
             kids.append(_leaf())
         return Node(name, "ts", _param(name), kids)
 
-    root = _grow(1, force_ts=True, force_cs=True)
+    root = _grow(1, force_ts=True, force_cs=require_cs)
     return root
 
 
@@ -477,21 +499,23 @@ def _from_template(rng, opset, leaves, template):
     raise ValueError(f"未知模板: {template}")
 
 
-def generate_one(rng, opset, leaves=None):
+def generate_one(rng, opset, leaves=None, require_cs: bool = True):
     """一次生成（explore/null 共用入口）：按 template_share 掷模板或均匀树。
 
     返回 (tree, template_name|None)。null 校准与 explore 走同一通道——
     墙必须覆盖实际采样空间（模板与占比进 opset 指纹，改配置=须重校准）。
-    """
+    require_cs=False（ts 单品种线）：透传 generate_tree（ts_opset 已关
+    模板通道，故不掷模板）。"""
     tpls = opset.get("templates_enabled") or []
     share = float(opset.get("template_share", DEFAULT_TEMPLATE_SHARE))
     if tpls and share > 0 and rng.random() < share:
         t = str(rng.choice(tpls))
         return generate_tree(rng, opset, leaves=leaves, template=t), t
-    return generate_tree(rng, opset, leaves=leaves), None
+    return generate_tree(rng, opset, leaves=leaves, require_cs=require_cs), None
 
 
-def render_factor_source(tree: Node, name: str, template: str | None = None) -> tuple[str, list[str]]:
+def render_factor_source(tree: Node, name: str, template: str | None = None,
+                         series_mode: bool = False) -> tuple[str, list[str]]:
     """把组合树渲染成自包含的 factor(env) 源码。
 
     返回 (source, imports)。源码引用包内 ops 算子库（算子真值源，可配置）。
@@ -500,12 +524,27 @@ def render_factor_source(tree: Node, name: str, template: str | None = None) -> 
     轮冷启动必踩 5 次「缺少 factor(env)」ERR。tree id 移入注释保留可读性。
     template（2026-09-18）：模板出身的树在首行注释带 template 标记——出身
     诚实（结构先验非零先验），台账/审阅按此区分纯随机与模板产物。
-    """
-    leaf_exprs = {
-        "o": "pd.DataFrame(env.o)", "h": "pd.DataFrame(env.h)",
-        "l": "pd.DataFrame(env.l)", "c": "pd.DataFrame(env.c)",
-        "v": "pd.DataFrame(env.v)", "amount": "pd.DataFrame(env.amount)",
-    }
+    series_mode（ts 单品种线，2026-11-07）：叶子映射 pd.Series(env.*)（含
+    oi/close2）——ops 的 Series 桥使其与 DataFrame 路径同数学，返回仍是
+    ({body}).values 的 (T,)。缺省 False 与面板现状一致。"""
+    if series_mode:
+        leaf_exprs = {
+            "o": "pd.Series(env.o)", "h": "pd.Series(env.h)",
+            "l": "pd.Series(env.l)", "c": "pd.Series(env.c)",
+            "v": "pd.Series(env.v)", "oi": "pd.Series(env.oi)",
+            "close2": "pd.Series(env.close2)",
+        }
+        # f_* 特征叶子（高频特征低频化）：属性名即表达式——名字空间
+        # 由 TsEnv 构造器保证合法（f_ 前缀），此处无需白名单
+        for _ln in sorted({n.op for n in _iter_leaves(tree)
+                           if str(n.op).startswith("f_")}):
+            leaf_exprs[_ln] = f"pd.Series(env.{_ln})"
+    else:
+        leaf_exprs = {
+            "o": "pd.DataFrame(env.o)", "h": "pd.DataFrame(env.h)",
+            "l": "pd.DataFrame(env.l)", "c": "pd.DataFrame(env.c)",
+            "v": "pd.DataFrame(env.v)", "amount": "pd.DataFrame(env.amount)",
+        }
     # 收集树里用到的算子名 → import 列表
     used = []
 
@@ -621,6 +660,37 @@ def light_ic_scan(F, env, spread_ref: dict | None = None):
     except Exception:
         pass
     return out
+
+
+# ---------------------------------------------------------------------------
+# ts 单品种线（factor-mining-futures，2026-11-07）：算子集 / 轻量扫描 / null 地形
+# ---------------------------------------------------------------------------
+def ts_opset(state_root=None) -> dict:
+    """ts 线生效算子集：面板生效集剔除全部 cs_* 算子 + 关模板通道。
+
+    返回新 dict（不写盘）——与面板线共用 operator_set.json 覆盖文件
+    （disable/windows/delays/humps 同配置生效），但截面算子在单品种
+    (T,) 上无语义（hardening.cs_operator_check 拒评估），四个结构模板
+    骨架均含 cs 收口节点故一并关闭（templates_enabled=[] /
+    template_share=0）。opset_fingerprint 对该集照常工作（算子集不同
+    → 指纹自然不同）。"""
+    base = effective_operator_set(state_root)
+    ops = {}
+    for cat, entries in base["ops"].items():
+        kept = {n: t for n, t in entries.items() if not n.startswith("cs_")}
+        if kept:
+            ops[cat] = kept
+    return {**base, "ops": ops, "templates_enabled": [], "template_share": 0.0}
+
+
+def light_ic_scan_ts(F, env: TsEnv) -> dict:
+    """ts 线轻量扫描：乘积序列 IR（诊断同形口径；无 column_perm/
+    position_sim 重计算）。F 为 (T,)。"""
+    from .evaluate_ts import series_ir, ts_product_series
+    s = ts_product_series(F, env)
+    ir = series_ir(s)
+    return {"ic_ir": (float(ir) if np.isfinite(ir) else None),
+            "n": int(len(s)), "line": "ts_single"}
 
 
 # ---------------------------------------------------------------------------
@@ -900,15 +970,154 @@ def read_null_landscape(state_root):
         return None
 
 
+def run_null_calibration_ts(env: TsEnv, state_root, n=200, seed=42, opset=None,
+                            env_fingerprint=None, horizons=None) -> dict:
+    """ts 线 null 地形（factor-mining-futures）：n 个随机树的 ts IR 经验分布。
+
+    与面板 run_null_calibration 同骨架（同批树逐 horizon 评估 + matrix_health
+    健康门 + 分位持久化 null_landscape.json），差别只在生成与统计量：
+    - 生成：generate_one(require_cs=False)（cs_* 不在 ts opset——单品种
+      无截面；模板通道关闭）
+    - 统计量：ts_product_series 乘积序列 IR（无截面 rank）
+    跨 horizon 相关：各 horizon 有效树 IR 向量的两两 Pearson（>=30 共同
+    样本才记，否则该对 None），键同面板 "{h1|h2}"。ts 线独立 state root
+    ——与面板 landscape 同文件名不冲突。面板 run_null_calibration 零改动。
+    """
+    from .evaluate import _env_horizon_view
+    from .evaluate_ts import series_ir, ts_product_series
+    opset = opset or ts_opset(state_root)
+    menu = [int(h) for h in horizons] if horizons else [int(env.calibration.horizon)]
+    leaves = env_leaves(env)
+    rng = np.random.default_rng(seed)
+    views = {h: _env_horizon_view(env, h) for h in menu}
+    # train 区口径（与面板版同语义）：null 地形校准的是 dev 窗 IR 分布
+    # （墙门比较对象=ic_ir_train）——全面板口径的 IR 分布约紧 √2 倍，
+    # pool_std 会偏小、墙偏低。dev_end 缺失时退全面板（诚实标注）。
+    _train_end = getattr(env.calibration, "dev_end", None)
+    irs_by_h = {h: [] for h in menu}
+    ir_mat = {h: [] for h in menu}   # 每树一行（病态=整树跳过；失败=NaN）
+    n_pathological = 0
+    for _i in range(n):
+        tree, _tpl = generate_one(rng, opset, leaves=leaves, require_cs=False)
+        try:
+            F = np.asarray(_eval_tree(tree, env), dtype=np.float64)
+        except Exception:
+            continue
+        ph = matrix_health(F)
+        if ph is not None:
+            n_pathological += 1
+            continue
+        row = {}
+        for h in menu:
+            try:
+                ir = series_ir(ts_product_series(F, views[h], h,
+                                                 end_date=_train_end))
+            except Exception:
+                ir = float("nan")
+            row[h] = float(ir) if np.isfinite(ir) else float("nan")
+        for h in menu:
+            ir_mat[h].append(row[h])
+            if np.isfinite(row[h]):
+                irs_by_h[h].append(row[h])
+
+    def _q(arr, p):
+        return float(np.nanpercentile(arr, p)) if len(arr) else None
+
+    ic_ir_out = {}
+    for h in menu:
+        k = len(irs_by_h[h])
+        arr = np.array(irs_by_h[h]) if k else np.array([np.nan])
+        ic_ir_out[str(h)] = {
+            "p10": _q(arr, 10), "p25": _q(arr, 25), "p50": _q(arr, 50),
+            "p75": _q(arr, 75), "p90": _q(arr, 90), "p95": _q(arr, 95),
+            "p99": _q(arr, 99),
+            "max": float(np.nanmax(arr)) if k else None,
+            "mean_abs": float(np.nanmean(np.abs(arr))) if k else None,
+            "n_valid": int(k),
+        }
+
+    # 跨 horizon 相关：同批随机树 IR 向量的两两 Pearson（>=30 共同样本）
+    cross_h = {}
+    for i, h1 in enumerate(menu):
+        for h2 in menu[i + 1:]:
+            a = np.asarray(ir_mat[h1], dtype=np.float64)
+            b = np.asarray(ir_mat[h2], dtype=np.float64)
+            m = np.isfinite(a) & np.isfinite(b)
+            key = f"{min(h1, h2)}|{max(h1, h2)}"
+            if (int(m.sum()) >= 30 and float(np.std(a[m])) > 0
+                    and float(np.std(b[m])) > 0):
+                c = float(np.corrcoef(a[m], b[m])[0, 1])
+                cross_h[key] = round(c, 4) if np.isfinite(c) else None
+            else:
+                cross_h[key] = None
+
+    # 生产可见性（同面板纪律）：某 horizon 全空 = 该赌注无基线，stderr 可见
+    for h in menu:
+        if len(irs_by_h[h]) == 0:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[null-calibration-ts] horizon={h} 无有效随机因子样本"
+                    "（全部生成/评估失败）——该 horizon 的 pool_std 基线缺失\n")
+            except Exception:
+                pass
+
+    result = {
+        "line": "ts_single",
+        "n_generated": n, "n_valid": int(len(irs_by_h[menu[0]])), "seed": seed,
+        "n_pathological": int(n_pathological),
+        "env_fingerprint": env_fingerprint,
+        "horizons": menu,
+        "ic_ir": ic_ir_out,
+        "spread": {},
+        "cross_horizon_corr": cross_h or None,
+        "a4_dd": None,
+        "interpretation": (
+            "ts 线经验 null 分布（per-horizon）：随机树的单品种乘积序列 IR"
+            "集中在 p50 附近；候选 ts IR 超过对应 horizon 的 p95 才值得认真"
+            "对待。无截面维度——一切结构只来自品种时间轴。"
+        ),
+        "sampling_note": (
+            f"n={n} × {len(menu)} horizon：分位估计误差随 n 收敛，p99 基于"
+            "不足 1 个期望观测、只能当方向参考——需要精确尾部分位时用"
+            " n>=200 重跑。cross_horizon_corr 为同批随机树跨 horizon 的 IR"
+            " 相关（>=30 共同样本才记录）。"
+        ),
+    }
+    os.makedirs(state_root, exist_ok=True)
+    # 固定墙键穿越重校准（2026-11-07 用户令冻结 lh 墙）：wall_mode/fixed_* 是
+    # 运维层写进 landscape 的治理键，null 地形重跑只刷新统计面——静默洗回
+    # growing 等于未经签核解冻（红线 3：墙值修订须人签核）。
+    _land_p = _null_landscape_path(state_root)
+    if os.path.exists(_land_p):
+        try:
+            _prev = json.loads(open(_land_p, encoding="utf-8").read())
+            for _wk in ("wall_mode", "fixed_bar_ic", "fixed_bar_tail",
+                        "fixed_wall_note"):
+                if isinstance(_prev, dict) and _prev.get(_wk) is not None:
+                    result[_wk] = _prev[_wk]
+        except Exception:
+            pass
+    with open(_land_p, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 内联树执行（null 校准用，与渲染源码同一套算子）
 # ---------------------------------------------------------------------------
 def _eval_tree(node: Node, env):
-    """直接对树求值（不渲染源码）。叶子→DataFrame，算子→ops 函数。"""
+    """直接对树求值（不渲染源码）。叶子→DataFrame（ts 线→Series），
+    算子→ops 函数。"""
     import pandas as pd
     from . import ops as _ops
     if node.category == "leaf":
-        return pd.DataFrame(getattr(env, node.op))
+        val = getattr(env, node.op)
+        if isinstance(env, TsEnv):
+            val = pd.Series(val)      # ts 线：(T,) 叶子走 Series 桥
+        else:
+            val = pd.DataFrame(val)
+        return val
     fn = None
     for cat in ("ts", "cs", "binary", "unary", "cmp", "cond"):
         if node.op in OPERATOR_REGISTRY.get(cat, {}):

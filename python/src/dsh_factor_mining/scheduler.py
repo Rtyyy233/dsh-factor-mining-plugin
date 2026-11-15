@@ -108,8 +108,17 @@ def b_wall(n: float) -> float:
     return norm_ppf(1.0 - 1.0 / n)
 
 
-def wall_height(n: float, rho_bar: float = 0.0) -> float:
-    """层墙 Θ_l = √(1−ρ̄)·b_N（单因子表示，均衡相关下精确——F2）。"""
+def wall_height(n: float, rho_bar: float = 0.0,
+                fixed_z: float | None = None) -> float:
+    """层墙 Θ_l = √(1−ρ̄)·b_N（单因子表示，均衡相关下精确——F2）。
+
+    fixed_z（B1 2026-11-01 固定墙对齐）：主墙 wall_mode=fixed 时代入
+    固定主值（null_landscape fixed_bar_ic）——影子/重放口径与主墙同源，
+    防止影子评分用增长墙给固定墙时代定价。None = 增长语义（默认，行为
+    不变）。注：固定模式下 ρ̄ 折叠不再适用（墙值不随族结构变），直接
+    返回 fixed_z。"""
+    if fixed_z is not None and fixed_z > 0:
+        return float(fixed_z)
     rho_bar = min(max(float(rho_bar), 0.0), 0.99)
     return math.sqrt(1.0 - rho_bar) * b_wall(n)
 
@@ -783,11 +792,15 @@ REPLAY_STRATEGIES = ("uniform", "score_max", "novelty", "near_miss",
 
 
 def replay(root, budgets: tuple[float, ...] = (0.5, 1.0),
-           strategies: tuple[str, ...] = REPLAY_STRATEGIES) -> dict:
+           strategies: tuple[str, ...] = REPLAY_STRATEGIES,
+           fixed_wall_z: float | None = None) -> dict:
     """重放 harness（F10 反事实池态）：事件流时间序重放，各策略按自身
     反事实累计试验数重算 deflation——现价重算是纯函数，但墙用单因子
     解析式 b_N（行为策略的 CRN 采样器不可移植——诚实声明，方向一致性
     足够，绝对值近似）。主终点 = 每单位算力 deflated t 增益。
+
+    fixed_wall_z（B1 2026-11-01）：主墙 fixed 时代入固定主值——反事实
+    墙与主墙同源（增长墙会给固定墙时代的事件错误定价）。None = 旧口径。
 
     生成侧不可重放（红线排除）：策略只能选「事件流里真实 expand 过的
     派发」，未发生过的子代无结局数据——本实验测的是固定生成器下的
@@ -826,14 +839,17 @@ def replay(root, budgets: tuple[float, ...] = (0.5, 1.0),
                 chosen = sorted(pool, key=lambda x: (0 if x["near_miss"] else 1))
             else:  # marginal_value：按父态 A（行为侧边际价值打分的代理）
                 chosen = sorted(pool, key=lambda x: -(x["a_parent"] or -1e9))
-            # 反事实池态：该策略自己消费了 j 发 → 墙 = b_N(j)（单因子近似）
+            # 反事实池态：该策略自己消费了 j 发 → 墙 = b_N(j)（单因子近似；
+            # fixed 时代 = 固定主值，与主墙同源）
             gains, slots = [], 0
             for j, x in enumerate(chosen):
                 t_pi = dsr_t_from_stats(x["dsr"].get("sr"),
                                         x["dsr"].get("skew"),
                                         x["dsr"].get("kurt"),
                                         x["dsr"].get("n"),
-                                        b_wall(j + 2), x.get("pool_std"))
+                                        (float(fixed_wall_z)
+                                         if fixed_wall_z else b_wall(j + 2)),
+                                        x.get("pool_std"))
                 if t_pi is None:
                     continue
                 gains.append(t_pi)
